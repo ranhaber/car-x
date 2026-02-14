@@ -1,0 +1,1 @@
+from sunfounder_voice_assistant.voice_assistant import VoiceAssistant

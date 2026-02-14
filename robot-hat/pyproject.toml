@@ -1,0 +1,37 @@
+
+[build-system]
+requires = ["setuptools >= 61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot_hat"
+authors = [
+  { name="sunfounder", email="service@sunfounder.com" },
+]
+description = "Robot Hat Python library for Raspberry Pi"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+]
+keywords = ["robot_hat", "sunfounder"]
+dynamic = ["version"]
+
+dependencies = [
+  "sunfounder-voice-assistant @ git+https://github.com/sunfounder/sunfounder-voice-assistant.git",
+]
+
+[project.scripts]
+robot_hat = "robot_hat:__main__"
+
+[project.urls]
+Repository = "https://github.com/sunfounder/robot-hat/"
+Issues = "https://github.com/sunfounder/robot-hat/issues"
+
+[tool.setuptools]
+packages = ["robot_hat"]
+
+[tool.setuptools.dynamic]
+version = {attr = "robot_hat.version.__version__"}
