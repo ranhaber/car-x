@@ -1,0 +1,5 @@
+{
+  "max_steer_angle_deg": 25,
+  "min_turn_radius_cm": 40,
+  "notes": "Measure: max steer without tip-over; min radius when turning. Clamp steering to +/- max_steer_angle_deg."
+}

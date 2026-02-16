@@ -1,0 +1,8 @@
+{
+  "speed_to_cm_per_sec": {
+    "30": 12.0,
+    "50": 22.0,
+    "70": 32.0
+  },
+  "notes": "Replace with your measured values: run car at speed for 1s, measure distance (cm). speed = picar-x 0-100."
+}

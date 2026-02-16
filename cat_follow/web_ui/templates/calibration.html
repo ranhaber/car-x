@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cat Follow - Calibration</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #1a1a2e; color: #e0e0e0;
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      background: #16213e; padding: 12px 20px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 2px solid #0f3460;
+    }
+    header h1 { font-size: 1.3rem; color: #e94560; }
+    header nav a {
+      color: #a0a0c0; text-decoration: none; margin-left: 20px; font-size: 0.9rem;
+    }
+    header nav a:hover, header nav a.active { color: #e94560; }
+    main { flex: 1; padding: 20px; max-width: 700px; margin: 0 auto; width: 100%; }
+    .placeholder {
+      background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+      padding: 40px; text-align: center; color: #8888aa;
+    }
+    footer { text-align: center; padding: 10px; font-size: 0.7rem; color: #555; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Cat Follow</h1>
+    <nav>
+      <a href="/">Control</a>
+      <a href="/calibration" class="active">Calibration</a>
+    </nav>
+  </header>
+  <main>
+    <div class="placeholder">
+      <h2>Calibration</h2>
+      <p style="margin-top: 12px;">
+        Speed-time-distance, steering limits, and bbox-distance calibration will be available here.
+      </p>
+      <p style="margin-top: 8px; font-size: 0.85rem;">Coming soon.</p>
+    </div>
+  </main>
+  <footer>Cat Follow v{{ version }}</footer>
+</body>
+</html>

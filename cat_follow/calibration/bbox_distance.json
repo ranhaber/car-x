@@ -1,0 +1,11 @@
+{
+  "target_distance_cm": 15,
+  "area_to_cm": [
+    [50000, 50],
+    [100000, 35],
+    [150000, 25],
+    [200000, 20],
+    [300000, 15]
+  ],
+  "notes": "Calibrate: at known distances (cm), measure bbox area (w*h) in pixels. area_to_cm: [[area_px, distance_cm], ...]"
+}
