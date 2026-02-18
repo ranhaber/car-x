@@ -11,8 +11,11 @@ import time
 
 import numpy as np
 
+from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
+
+log = get_logger("thread.detector")
 
 
 def run_detector_loop(
@@ -45,6 +48,7 @@ def run_detector_loop(
     # Pre-allocate a buffer to receive the detector frame (no per-frame alloc)
     frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
     iteration = 0
+    log.info("Detector loop started (stub, every %d frames).", detect_every_k)
 
     while not stop_event.is_set():
         t0 = time.monotonic()

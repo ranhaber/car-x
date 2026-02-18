@@ -32,6 +32,12 @@
     .stream-container img {
       width: 100%; max-width: 640px; height: auto; display: block; margin: 0 auto;
     }
+    .ultrasonic-bar {
+      background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+      padding: 10px 16px; margin-bottom: 12px; font-size: 1rem;
+    }
+    .ultrasonic-label { color: #8888aa; text-transform: uppercase; font-size: 0.75rem; margin-right: 8px; }
+    .ultrasonic-value { font-weight: 600; color: #2ecc71; }
 
     .controls {
       display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; align-items: flex-end;
@@ -92,6 +98,12 @@
 </header>
 
 <main x-data="catFollow()" x-init="startPolling()">
+
+  <!-- Ultrasonic distance above stream -->
+  <div class="ultrasonic-bar" x-show="true">
+    <span class="ultrasonic-label">Ultrasonic:</span>
+    <span class="ultrasonic-value" x-text="status.ultrasonic_cm != null ? status.ultrasonic_cm.toFixed(1) + ' cm' : '—'"></span>
+  </div>
 
   <!-- Stream -->
   <div class="stream-container">
@@ -185,6 +197,7 @@ function catFollow() {
       state: 'idle',
       odometry: { x: 0, y: 0, heading_deg: 0 },
       bbox_tracker: { x: 0, y: 0, w: 0, h: 0, valid: 0 },
+      ultrasonic_cm: null,
       tracker_fps: 0,
       stream_fps: 0,
       app_version: '{{ version }}',

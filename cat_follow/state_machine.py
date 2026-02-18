@@ -24,6 +24,7 @@ class Event(Enum):
     CAT_LOST = "cat_lost"
     DISTANCE_AT_15CM = "distance_at_15cm"
     STOP_COMMAND = "stop_command"
+    SEARCH_CYCLE_DONE = "search_cycle_done"  # full circle done, no cat found
 
 
 # Transition table: (state, event) -> (new_state, payload_to_keep)
@@ -31,9 +32,11 @@ _TRANSITIONS = {
     (State.IDLE, Event.CAT_LOCATION_RECEIVED): State.GOTO_TARGET,
     (State.IDLE, Event.STOP_COMMAND): State.IDLE,
     (State.GOTO_TARGET, Event.AT_TARGET): State.SEARCH,
+    (State.GOTO_TARGET, Event.CAT_FOUND): State.APPROACH,
     (State.GOTO_TARGET, Event.TIMEOUT): State.SEARCH,
     (State.GOTO_TARGET, Event.STOP_COMMAND): State.IDLE,
     (State.SEARCH, Event.CAT_FOUND): State.APPROACH,
+    (State.SEARCH, Event.SEARCH_CYCLE_DONE): State.IDLE,
     (State.SEARCH, Event.STOP_COMMAND): State.IDLE,
     (State.APPROACH, Event.DISTANCE_AT_15CM): State.TRACK,
     (State.APPROACH, Event.CAT_LOST): State.LOST_SEARCH,
@@ -41,6 +44,7 @@ _TRANSITIONS = {
     (State.TRACK, Event.CAT_LOST): State.LOST_SEARCH,
     (State.TRACK, Event.STOP_COMMAND): State.IDLE,
     (State.LOST_SEARCH, Event.CAT_FOUND): State.APPROACH,
+    (State.LOST_SEARCH, Event.SEARCH_CYCLE_DONE): State.IDLE,
     (State.LOST_SEARCH, Event.TIMEOUT): State.SEARCH,
     (State.LOST_SEARCH, Event.STOP_COMMAND): State.IDLE,
 }

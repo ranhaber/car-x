@@ -11,8 +11,11 @@ import time
 
 import numpy as np
 
+from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
+
+log = get_logger("thread.tracker")
 
 
 def run_tracker_loop(
@@ -39,6 +42,7 @@ def run_tracker_loop(
     tick = 1.0 / target_fps
     # Pre-allocate a buffer to receive the frame (no per-frame alloc)
     frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
+    log.info("Tracker loop started (stub, %.0f FPS).", target_fps)
 
     while not stop_event.is_set():
         t0 = time.monotonic()

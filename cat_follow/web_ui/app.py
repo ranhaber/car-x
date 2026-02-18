@@ -16,9 +16,13 @@ import numpy as np
 from flask import Flask, Response, render_template, request, jsonify
 
 from cat_follow import __version__
+from cat_follow.logger import get_logger
 from cat_follow.commands import set_cat_location, set_stop_command
+from cat_follow import range_sensor
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
+
+_log = get_logger("web_ui")
 
 # ---------------------------------------------------------------------------
 # Stream resolution options
@@ -146,11 +150,13 @@ def create_app(
         except (KeyError, TypeError, ValueError):
             return jsonify({"error": "Need JSON with x and y (meters)"}), 400
         set_cat_location(x, y)
+        _log.info("API target received: (%.2f, %.2f) meters", x, y)
         return jsonify({"status": "ok", "x": x, "y": y})
 
     @app.route("/api/stop", methods=["POST"])
     def api_stop():
         set_stop_command()
+        _log.info("API stop received")
         return jsonify({"status": "ok"})
 
     # ------------------------------------------------------------------
@@ -164,6 +170,7 @@ def create_app(
         if _state_machine is not None:
             state_name = _state_machine.state.value
 
+        ultrasonic_cm = range_sensor.get_last_distance_cm()
         return jsonify({
             "state": state_name,
             "odometry": {"x": odom[0], "y": odom[1], "heading_deg": odom[2]},
@@ -172,6 +179,7 @@ def create_app(
                 "w": bbox[2], "h": bbox[3],
                 "valid": bbox[4],
             },
+            "ultrasonic_cm": round(ultrasonic_cm, 1) if ultrasonic_cm is not None else None,
             "tracker_fps": round(get_tracker_fps(), 1),
             "stream_fps": round(_stream_fps, 1),
             "app_version": __version__,
@@ -194,6 +202,7 @@ def create_app(
             }), 400
         with _stream_resolution_lock:
             _stream_resolution = res
+        _log.info("API stream resolution changed to %s", res)
         return jsonify({"status": "ok", "resolution": res})
 
     # ------------------------------------------------------------------

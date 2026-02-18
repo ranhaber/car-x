@@ -1,9 +1,9 @@
 """
 Car centers cat in frame (camera straight): bbox + image size -> steer, speed.
 Lateral: bbox center X vs image center X -> steering.
-Distance: bbox area -> forward/back to approach or hold ~15 cm (uses calibration).
+Distance: ultrasonic only (no bbox-based fallback). Forward/back to hold target_distance_cm.
 """
-from typing import Optional, Tuple
+from typing import Tuple
 
 from . import driver
 from . import limits
@@ -20,7 +20,7 @@ def center_cat_control(
 ) -> None:
     """
     Compute steer and forward/back so the cat stays in the middle of the frame.
-    Calls driver.set_steer(), driver.forward() or driver.backward().
+    Distance is from ultrasonic only; if no reading, we only steer and stop (no forward/back).
     """
     x, y, w, h = bbox
     cx_cat = x + w / 2
@@ -30,25 +30,19 @@ def center_cat_control(
 
     # Lateral: steer so cx_cat -> cx_img
     error_x = cx_cat - cx_img
-    # Normalize to degrees (tune gain as needed)
-    steer_deg = error_x * 0.08  # pixels -> rough degrees
+    steer_deg = error_x * 0.08
     steer_deg = limits.clamp_steer(steer_deg, calibration)
     driver.set_steer(steer_deg)
 
-    # Distance: use bbox area -> distance (if calibration has it)
-    area = w * h
-    dist_cm = None
-    if calibration is not None:
-        dist_cm = calibration.get_distance_cm_from_bbox_area(area)
+    # Distance: ultrasonic only (no bbox fallback)
+    try:
+        from cat_follow import range_sensor
+        dist_cm = range_sensor.get_distance_cm()
+    except Exception:
+        dist_cm = None
     if dist_cm is None:
-        # No calibration: drive forward slowly when bbox is small (far), else stop
-        if area < image_width * image_height * 0.1:
-            driver.forward(limits.clamp_speed(approach_speed))
-        else:
-            driver.stop()
+        driver.stop()
         return
-
-    # We have distance estimate
     if dist_cm > target_distance_cm + 5:
         driver.forward(limits.clamp_speed(approach_speed))
     elif dist_cm < target_distance_cm - 5:

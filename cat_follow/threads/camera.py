@@ -11,8 +11,11 @@ import time
 
 import numpy as np
 
+from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
+
+log = get_logger("thread.camera")
 
 # Pre-allocate one write buffer so the loop never allocates per frame.
 _write_buf: np.ndarray | None = None
@@ -50,6 +53,7 @@ def run_camera_loop(
     tick = 1.0 / target_fps
     buf = _get_write_buf()
     frame_index = 0
+    log.info("Camera loop started (stub, %.0f FPS).", target_fps)
 
     while not stop_event.is_set():
         t0 = time.monotonic()

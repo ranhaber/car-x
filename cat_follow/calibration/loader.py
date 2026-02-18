@@ -1,12 +1,19 @@
 """
 Load calibration from JSON files. Exposes speed->cm/s, max steer, optional bbox->distance.
 Calibration dir is next to this file.
+
+Bbox–distance: locked to 640×480. Values in bbox_distance.json are examples; replace
+with your calibration. A script/UI to log (area, distance) and build the table is planned.
 """
+
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 _CALIB_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Bbox area calibration is for this resolution only. Do not change without re-calibrating.
+CALIBRATION_IMAGE_SIZE: Tuple[int, int] = (640, 480)
 
 
 def _load_json(name: str) -> dict:
@@ -53,8 +60,9 @@ class Calibration:
         return float(self._steering.get("min_turn_radius_cm", 40.0))
 
     def get_distance_cm_from_bbox_area(self, bbox_area_px: float) -> Optional[float]:
-        """Optional: bbox area (pixels²) -> distance in cm. Returns None if not calibrated."""
-        # Expect format like {"area_to_cm": [[area1, cm1], [area2, cm2], ...]} or formula
+        """Bbox area (pixels²) -> distance in cm. Locked to 640×480. Returns None if not calibrated.
+        Values in bbox_distance.json are examples; replace with your calibration."""
+        # Format: {"area_to_cm": [[area1, cm1], [area2, cm2], ...]}
         table = self._bbox_dist.get("area_to_cm")
         if not table or not isinstance(table, list):
             return None
@@ -74,5 +82,5 @@ class Calibration:
         return float(sorted_pairs[-1][1])
 
     def get_target_distance_cm(self) -> float:
-        """Target distance to cat in TRACK (e.g. 15 cm)."""
+        """Closest physical distance (cm) the car may approach the cat. Configurable via bbox_distance.json."""
         return float(self._bbox_dist.get("target_distance_cm", 15.0))

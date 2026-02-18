@@ -42,6 +42,37 @@ def test_approach_to_track_on_distance_15cm():
     assert sm.state == State.TRACK
 
 
+def test_goto_to_approach_on_cat_found():
+    """Cat found while driving to target -> go straight to APPROACH."""
+    sm = StateMachine()
+    sm.dispatch(Event.CAT_LOCATION_RECEIVED, (1.0, 0.5))
+    assert sm.state == State.GOTO_TARGET
+    sm.dispatch(Event.CAT_FOUND, (200, 150, 60, 80))
+    assert sm.state == State.APPROACH
+    assert sm.last_bbox == (200, 150, 60, 80)
+
+
+def test_search_cycle_done_goes_to_idle():
+    """Full circle search with no cat -> stop (IDLE)."""
+    sm = StateMachine()
+    sm.dispatch(Event.CAT_LOCATION_RECEIVED, (0, 0))
+    sm.dispatch(Event.AT_TARGET)
+    assert sm.state == State.SEARCH
+    sm.dispatch(Event.SEARCH_CYCLE_DONE)
+    assert sm.state == State.IDLE
+
+
+def test_lost_search_cycle_done_goes_to_idle():
+    sm = StateMachine()
+    sm.dispatch(Event.CAT_LOCATION_RECEIVED, (0, 0))
+    sm.dispatch(Event.AT_TARGET)
+    sm.dispatch(Event.CAT_FOUND, (0, 0, 50, 50))
+    sm.dispatch(Event.CAT_LOST)
+    assert sm.state == State.LOST_SEARCH
+    sm.dispatch(Event.SEARCH_CYCLE_DONE)
+    assert sm.state == State.IDLE
+
+
 def test_stop_from_any_state_goes_to_idle():
     sm = StateMachine()
     sm.dispatch(Event.CAT_LOCATION_RECEIVED, (0, 0))

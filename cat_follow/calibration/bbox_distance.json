@@ -7,5 +7,5 @@
     [200000, 20],
     [300000, 15]
   ],
-  "notes": "Calibrate: at known distances (cm), measure bbox area (w*h) in pixels. area_to_cm: [[area_px, distance_cm], ...]"
+  "notes": "Bbox->distance calibration. LOCKED to 640×480 image resolution. area_to_cm values above are EXAMPLES — replace with your calibration. At known distances (cm), measure bbox area (w*h) in pixels; add [area_px, distance_cm] pairs. A small script/UI to log (area, distance) and build this table is planned for later. target_distance_cm = closest physical distance the car may approach the cat (not tracking-specific); configurable via this file."
 }
