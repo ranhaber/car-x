@@ -206,6 +206,32 @@ def create_app(
         return jsonify({"status": "ok", "resolution": res})
 
     # ------------------------------------------------------------------
+    # API: detector model selection
+    # ------------------------------------------------------------------
+    DETECTOR_OPTIONS = {
+        "ssd_mobilenet_v2": "SSD MobileNet V2 (320x320, quantized)",
+        "efficientdet_lite0": "EfficientDet-Lite0",
+    }
+
+    @app.route("/api/detector_model", methods=["GET"])
+    def api_detector_model_get():
+        current = _shared.get_detector_model() if _shared else None
+        return jsonify({
+            "current": current,
+            "options": DETECTOR_OPTIONS,
+        })
+
+    @app.route("/api/detector_model", methods=["POST"])
+    def api_detector_model_post():
+        data = request.get_json(silent=True) or {}
+        choice = data.get("model")
+        if choice not in DETECTOR_OPTIONS:
+            return jsonify({"error": f"Invalid model. Choose from: {list(DETECTOR_OPTIONS.keys())}"}), 400
+        _shared.set_detector_model(choice)
+        _log.info("Detector model changed to %s", choice)
+        return jsonify({"status": "ok", "model": choice})
+
+    # ------------------------------------------------------------------
     # API: calibration (stub)
     # ------------------------------------------------------------------
     @app.route("/api/calibration", methods=["GET"])

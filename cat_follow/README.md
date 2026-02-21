@@ -9,6 +9,9 @@ Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and dr
 - **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits, bbox–distance.
 - **motion/** — `driver` (stop, forward, backward, set_steer), `center_cat_control()`, `limits`.
 - **vision/** — Stub `get_cat_bbox()`; replace with vilib/TFLite.
+- **vision/** — Detector + tracker. Camera now writes into a small rotating
+	frame ring (pre-allocated) and tracker uses an OpenCV single-object
+	tracker with improved re-init logic (IoU, temporal confirmation).
 - **odometry.py** — Stub (x,y), heading; replace with time-based dead reckoning.
 - **main_loop.py** — Tick loop: commands → state machine → motion.
 
@@ -47,7 +50,7 @@ Or install pytest and run: `python -m pytest tests/ -v`
 2. Implement `motion/goto_xy.py` (drive toward target using odometry + calibration).
 3. Implement `motion/search.py` (arc using steering limits).
 4. Replace `vision/detector.get_cat_bbox()` with vilib COCO (class 16 = cat).
-5. Add 30 FPS tracker in `vision/tracker.py` (OpenCV KCF + detector every K frames).
+5. Add 30 FPS tracker in `vision/tracker.py` (OpenCV KCF/CSRT; detector every K frames).
 6. Replace odometry stub with time + speed + steer integration.
 
 Design: see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md** and **DESIGN_CAT_FOLLOW_STATE_MACHINE.md**.

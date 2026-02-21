@@ -12,6 +12,7 @@ from typing import Tuple
 import numpy as np
 
 from cat_follow.memory.pool import MemoryPool, BBOX_LEN, ODOM_LEN
+from cat_follow.memory.pool import FRAME_SHAPE
 
 
 class SharedState:
@@ -33,25 +34,45 @@ class SharedState:
         self._lock_bbox_detector = threading.Lock()
         self._lock_odometry = threading.Lock()
 
+        # Detector model selection (string key). Web UI toggles this value
+        # and the detector thread reads it to decide which .tflite to load.
+        self._lock_detector_model = threading.Lock()
+        # Default to SSD MobileNet V2 (key used by web UI and detector mapping)
+        self._detector_model = "ssd_mobilenet_v2"
+
+        # Ring buffer indices for rotating frame buffers. The camera writes
+        # into the slot returned by ``get_write_buffer()``, then calls
+        # ``publish_latest_from_write()`` to atomically publish that slot
+        # as the newest frame. Readers use ``get_frame_latest(dst)`` which
+        # copies from the currently published index.
+        self._ring_n = self._pool.frame_ring.shape[0]
+        self._write_idx = 0
+        self._latest_idx = -1
+
     # ── frame_latest ─────────────────────────────────────────────────
 
     def set_frame_latest(self, src: np.ndarray) -> None:
-        """Copy *src* into the pre-allocated ``frame_latest`` buffer.
+        """Copy *src* into the next write slot and publish it as latest.
 
-        The copy is done under ``_lock_frame`` so readers always see a
-        consistent frame (not half old / half new).
+        This convenience method keeps backward compatibility: it copies
+        into the current write buffer and then publishes that buffer as
+        the latest frame (rotating the write index).
         """
-        with self._lock_frame:
-            np.copyto(self._pool.frame_latest, src)
+        # Copy into current write buffer, then publish under lock.
+        write_buf = self.get_write_buffer()
+        np.copyto(write_buf, src)
+        self.publish_latest_from_write()
 
     def get_frame_latest(self, dst: np.ndarray) -> None:
-        """Copy the current ``frame_latest`` into caller-supplied *dst*.
+        """Copy the currently published latest frame into *dst*.
 
-        *dst* must have the same shape and dtype as ``frame_latest``.
-        Using a caller-supplied buffer avoids allocating a new array.
+        If no frame has been published yet, *dst* is zeroed.
         """
         with self._lock_frame:
-            np.copyto(dst, self._pool.frame_latest)
+            if self._latest_idx < 0:
+                dst.fill(0)
+            else:
+                np.copyto(dst, self._pool.frame_ring[self._latest_idx])
 
     def copy_latest_to_detector_frame(self) -> None:
         """Copy ``frame_latest`` → ``frame_for_detector`` under lock.
@@ -60,12 +81,37 @@ class SharedState:
         stable snapshot to work with.
         """
         with self._lock_frame:
-            np.copyto(self._pool.frame_for_detector, self._pool.frame_latest)
+            if self._latest_idx < 0:
+                # no frame yet
+                self._pool.frame_for_detector.fill(0)
+            else:
+                np.copyto(self._pool.frame_for_detector, self._pool.frame_ring[self._latest_idx])
 
     def get_frame_for_detector(self, dst: np.ndarray) -> None:
         """Copy the current ``frame_for_detector`` into *dst* under lock."""
         with self._lock_frame:
             np.copyto(dst, self._pool.frame_for_detector)
+
+    # ── ring helpers (camera use) ─────────────────────────────────────
+
+    def get_write_buffer(self) -> np.ndarray:
+        """Return a writable view into the pool's current write slot.
+
+        The caller (camera thread) may write the frame data into this
+        buffer (in-place). After writing, call
+        ``publish_latest_from_write()`` to make the frame visible to
+        readers.
+        """
+        return self._pool.frame_ring[self._write_idx]
+
+    def publish_latest_from_write(self) -> None:
+        """Atomically publish the buffer at the current write index as
+        the latest frame, then advance the write index.
+        """
+        with self._lock_frame:
+            self._latest_idx = self._write_idx
+            # advance write index for next frame
+            self._write_idx = (self._write_idx + 1) % self._ring_n
 
     # ── bbox_tracker ─────────────────────────────────────────────────
 
@@ -128,3 +174,14 @@ class SharedState:
         with self._lock_odometry:
             buf = self._pool.odometry_xyh
             return (float(buf[0]), float(buf[1]), float(buf[2]))
+
+    # ── detector model selection ──────────────────────────────────────
+    def set_detector_model(self, model_key: str) -> None:
+        """Set the active detector model key (e.g. 'ssd_mobilenet_v2')."""
+        with self._lock_detector_model:
+            self._detector_model = str(model_key)
+
+    def get_detector_model(self) -> str:
+        """Return the currently-selected detector model key."""
+        with self._lock_detector_model:
+            return str(self._detector_model)
