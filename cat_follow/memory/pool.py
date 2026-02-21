@@ -18,6 +18,10 @@ FRAME_C: int = 3
 FRAME_SHAPE: tuple = (FRAME_H, FRAME_W, FRAME_C)
 FRAME_NBYTES: int = FRAME_H * FRAME_W * FRAME_C  # 921 600
 
+# Number of rotating frame buffers the camera will write into. Keep small
+# (3 is usually enough to avoid reader/writer contention).
+FRAME_RING_N: int = 3
+
 # ---------------------------------------------------------------------------
 # Bbox layout: 5 floats  [x, y, w, h, valid]
 #   indices 0-3 : bounding-box (x, y, width, height) in pixels
@@ -40,8 +44,9 @@ class MemoryPool:
     the attributes (e.g. ``pool.frame_latest = new_array`` is forbidden).
     """
 
-    # Two full-frame buffers (uint8, H x W x 3)
-    frame_latest: np.ndarray
+    # Rotating ring of full-frame buffers (uint8, N x H x W x 3)
+    # Camera writes into one slot, readers read the latest published index.
+    frame_ring: np.ndarray
     frame_for_detector: np.ndarray
 
     # Two bbox arrays (float64, length 5 each)
@@ -58,8 +63,12 @@ def allocate_pool() -> MemoryPool:
     This function must be called exactly once, at application startup,
     before any thread is started.
     """
+    # Allocate a small ring of full-frame buffers so the camera can write
+    # into a rotating slot and readers can atomically publish the latest
+    # index without copying the whole frame twice.
+    frame_ring_shape = (FRAME_RING_N, FRAME_H, FRAME_W, FRAME_C)
     return MemoryPool(
-        frame_latest=np.zeros(FRAME_SHAPE, dtype=np.uint8),
+        frame_ring=np.zeros(frame_ring_shape, dtype=np.uint8),
         frame_for_detector=np.zeros(FRAME_SHAPE, dtype=np.uint8),
         bbox_tracker=np.zeros(BBOX_LEN, dtype=np.float64),
         bbox_detector=np.zeros(BBOX_LEN, dtype=np.float64),

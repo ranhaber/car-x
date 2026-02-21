@@ -131,6 +131,13 @@
         <option value="160x120">160x120</option>
       </select>
     </div>
+    <div class="control-group">
+      <label>Detector model</label>
+      <select x-model="detectorModel" @change="changeDetectorModel()">
+        <option value="ssd_mobilenet_v2">SSD MobileNet V2</option>
+        <option value="efficientdet_lite0">EfficientDet-Lite0</option>
+      </select>
+    </div>
   </div>
 
   <!-- Feedback -->
@@ -210,6 +217,7 @@ function catFollow() {
 
     startPolling() {
       this.fetchStatus();
+      this.fetchDetectorModel();
       this._pollTimer = setInterval(() => this.fetchStatus(), 1000);
     },
 
@@ -269,6 +277,34 @@ function catFollow() {
         }
       } catch (e) {
         this.showFeedback('Error changing resolution', false);
+      }
+    },
+
+    async fetchDetectorModel() {
+      try {
+        const res = await fetch('/api/detector_model');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.current) this.detectorModel = data.current;
+        }
+      } catch (e) { /* ignore */ }
+    },
+
+    async changeDetectorModel() {
+      try {
+        const res = await fetch('/api/detector_model', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: this.detectorModel }),
+        });
+        if (res.ok) {
+          this.showFeedback('Detector model: ' + this.detectorModel, true);
+        } else {
+          const data = await res.json();
+          this.showFeedback(data.error || 'Error changing model', false);
+        }
+      } catch (e) {
+        this.showFeedback('Network error', false);
       }
     },
 

@@ -25,13 +25,13 @@ This document lists **coding steps** to implement the [software architecture](DE
 
 - Add `cat_follow/memory/` package.
 - In `cat_follow/memory/pool.py`:
-  - Define constants: `FRAME_H`, `FRAME_W`, `FRAME_C = 3`, `FRAME_SHAPE`, `FRAME_NBYTES`.
+  - Define constants: `FRAME_H`, `FRAME_W`, `FRAME_C = 3`, `FRAME_SHAPE`, `FRAME_NBYTES`, and `FRAME_RING_N`.
   - Implement `allocate_pool()` that:
-    - Allocates `frame_latest` and `frame_for_detector` as `np.zeros(FRAME_SHAPE, dtype=np.uint8)`.
+    - Allocates a small rotating `frame_ring` with shape `(FRAME_RING_N, H, W, C)` plus `frame_for_detector`.
     - Allocates `bbox_tracker` and `bbox_detector` as arrays of 5 floats (x, y, w, h, valid).
     - Allocates `odometry_xyh` as 3 floats (x, y, heading).
     - Returns a simple namespace or dataclass holding these (no locks yet).
-  - Ensure no allocation happens inside any “get current frame” or “set bbox” logic; only pre-allocated buffers are written/read.
+  - Ensure no allocation happens inside any “get current frame” or “set bbox” logic; camera writes into a pre-allocated ring slot and calls `publish_latest_from_write()` to publish the newest index.
 
 **Testing:**
 
@@ -83,11 +83,11 @@ or
 - Add `cat_follow/threads/` package.
 - **Camera stub** in `cat_follow/threads/camera.py`:
   - Function `run_camera_loop(shared: SharedState, stop_event: threading.Event)`.
-  - Loop: while not stop_event: set a **known pattern** into `frame_latest` (e.g. fill with a value derived from frame index), then sleep(1/30). Uses `shared.set_frame_latest(...)` or direct write into shared pool’s buffer under lock.
+  - Loop: while not stop_event: capture into a pre-allocated write buffer (or produce a known pattern in mock mode), write into the pool's current ring slot (via `shared.get_write_buffer()`), then call `shared.publish_latest_from_write()` and sleep(1/30).
 - **Tracker stub** in `cat_follow/threads/tracker.py`:
-  - `run_tracker_loop(shared, stop_event)`: each iteration read `frame_latest`, and write a **stub bbox** to `bbox_tracker` (e.g. constant or based on a fake “tracker” state). Sleep(1/30).
+  - `run_tracker_loop(shared, stop_event)`: each iteration read `frame_latest` (via `get_frame_latest()`), run an OpenCV single-object tracker (KCF/CSRT/MOSSE), and write `bbox_tracker`. Tracker re-initialization uses detector outputs with IoU checks, temporal confirmation, smoothing, and a cooldown to avoid thrash.
 - **Detector stub** in `cat_follow/threads/detector.py`:
-  - `run_detector_loop(shared, stop_event)`: every K iterations (e.g. K=10), read `frame_for_detector`, write a **stub bbox** to `bbox_detector` (e.g. (100, 100, 50, 50, 1)). Sleep(1/30) so it runs at same rate but only “detects” every K.
+  - `run_detector_loop(shared, stop_event)`: every K iterations (e.g. K=10), read `frame_for_detector`, run detection (stub or TFLite) and write `bbox_detector`. Sleep(1/30) so it runs at same rate but only “detects” every K.
 
 **Testing:**
 
@@ -96,7 +96,7 @@ or
   2. Start camera thread (stub), tracker thread (stub), detector thread (stub).
   3. In main: repeatedly call `shared.copy_latest_to_detector_frame()` every K iterations (or have stub detector read `frame_latest` if you prefer), then sleep a bit.
   4. After a short run (e.g. 1–2 seconds), stop threads.
-  5. Assert that `get_frame_latest()` (or the buffer) was written (e.g. not all zeros, or matches the pattern the camera stub writes).
+  5. Assert that `get_frame_latest()` (or the buffer) was written (e.g. not all zeros, or matches the pattern the camera stub writes). For ring behavior test `tests/test_camera_ring.py` verifies rotating write slots and `copy_latest_to_detector_frame()`.
   6. Assert that `get_bbox_tracker()` and `get_bbox_detector()` were written (e.g. valid=1 and reasonable numbers). This verifies that threads can read/write shared state without crashing and that main sees their outputs.
 
 **How to run:**  
@@ -214,7 +214,7 @@ Optional: `python -m pytest tests/test_full_pipeline.py -v`
 | 2 | `test_shared_state.py` | Get/set correctness; concurrent read/write without corruption |
 | 3 | `test_thread_stubs.py` | Stub threads write to shared state; main reads their output |
 | 4 | `test_main_loop_shared_state.py` | Main loop uses shared bbox; state machine and motion still behave |
-| 5 | `test_camera_thread.py` | Camera (mock) fills frame_latest with expected pattern |
+| 5 | `test_camera_ring.py` | Camera ring publish and detector-copy behavior |
 | 6 | `test_tracker_thread.py` | Tracker produces bbox from frame (synthetic or static) |
 | 7 | `test_detector_thread.py` | Detector (stub or TFLite) writes bbox_detector |
 | 8 | Manual / `test_full_pipeline.py` | Full app runs; state transitions; no crash |
