@@ -21,20 +21,26 @@ MODELS_DIR = os.path.join(ROOT, "models")
 # Suggested model URLs. For robustness we keep a list of mirrors/variants
 # for each model. The script will try them in order and report failures.
 URLS = {
-    "ssd_mobilenet_v2": [
-        # TensorFlow hosting (may 403 on some environments)
+    # SSD MobileNet V2 FPNLite 320x320 (quantized) - multiple candidate URLs
+    "ssd_mobilenet_v2_fpnlite_320x320": [
         "https://storage.googleapis.com/download.tensorflow.org/models/tflite/ssd_mobilenet_v2_320x320_coco_quant_postprocess.tflite",
-        # Alternate upstream filename used by some examples
         "https://storage.googleapis.com/download.tensorflow.org/models/tflite/ssd_mobilenet_v2_fpnlite_320x320_coco25_postprocess.tflite",
+        # TF Model Zoo tarball (may contain a tflite inside the release archive)
+        "https://storage.googleapis.com/tfhub-modules/google/ssd_mobilenet_v2_fpnlite_320x320/1.tar.gz",
     ],
-    "efficientdet_lite0": [
-        "https://storage.googleapis.com/download.tensorflow.org/models/tflite/efficientdet_lite0.tflite",
+
+    # EfficientDet D0 512x512 (TF2 model zoo entry) - try tflite, then tarball
+    "efficientdet_d0_512x512": [
+        # Common standalone tflite link (may not exist for all exporters)
+        "https://storage.googleapis.com/download.tensorflow.org/models/tflite/efficientdet_d0_512x512.tflite",
+        # TF2 Detection Model Zoo tarball for D0 (may need manual extraction)
+        "https://storage.googleapis.com/download.tensorflow.org/models/tf2/efficientdet/efficientdet_d0_coco17_tpu-32.tar.gz",
     ],
 }
 
 MODEL_MAP = {
-    "ssd_mobilenet_v2": "ssd_mobilenet_v2_320x320.tflite",
-    "efficientdet_lite0": "efficientdet_lite0.tflite",
+    "ssd_mobilenet_v2_fpnlite_320x320": "ssd_mobilenet_v2_320x320.tflite",
+    "efficientdet_d0_512x512": "efficientdet_d0_512x512.tflite",
 }
 
 
