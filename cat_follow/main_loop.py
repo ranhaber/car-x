@@ -54,10 +54,21 @@ def main():
     location.reset(0, 0, 0)
     from picarx import Picarx
     px = Picarx()
+    # Let Picarx __init__ finish (reset_mcu + servo.angle); reduces jerk before we take over.
+    time.sleep(0.4)
     motion_driver.set_car(px)
     range_sensor.set_car(px)
-    # Center steering and stop motors immediately; Picarx() init can move servos.
     motion_driver.stop()
+    time.sleep(0.15)
+    motion_driver.set_steer(0)
+    # Optional: force steering calibration to 0 so angle is consistent between app restarts.
+    # Set env CAT_FOLLOW_STEER_CALIB_0=1 to enable (writes /opt/picar-x config).
+    if os.environ.get("CAT_FOLLOW_STEER_CALIB_0", "").strip() in ("1", "true", "yes"):
+        try:
+            px.dir_servo_calibrate(0)
+            log.info("Steering calibration forced to 0 for consistent restarts.")
+        except Exception as e:
+            log.warning("Could not set steering calibration: %s", e)
     log.info("Calibration loaded. State machine ready.")
 
     # ------------------------------------------------------------------

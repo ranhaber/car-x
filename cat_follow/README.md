@@ -33,6 +33,18 @@ set_cat_location(100, 50)   # state -> GOTO_TARGET then SEARCH
 
 Ctrl+C stops the loop.
 
+## Steering at startup (PiCar-X hardware)
+
+The SunFounder `Picarx()` constructor calls `reset_mcu()` and then moves the steering servo to the value in `/opt/picar-x/picar-x.conf` (`picarx_dir_servo`). That can cause a visible jerk and, if the config or user changes, the steering angle can differ between app restarts.
+
+- The main loop waits 0.4s after creating `Picarx()`, then stops motors and sets steering to 0 twice (with a short delay) to stabilize.
+- To **force steering calibration to 0** so the angle is the same every run (and the config is written with 0), set:
+  ```bash
+  export CAT_FOLLOW_STEER_CALIB_0=1
+  python -m cat_follow.main_loop
+  ```
+  If your car’s “straight” is not 0°, run SunFounder’s steering calibration once, then leave this env var unset.
+
 ## Tests (no pytest required)
 
 From **car-x** root:
