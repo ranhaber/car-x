@@ -53,7 +53,7 @@ def main():
     sm = StateMachine()
     location.reset(0, 0, 0)
     from picarx import Picarx
-    # px = Picarx()
+    px = Picarx()
     # # Safety: force steering to 0 and wait a bit to settle to avoid violent startup
     # px.set_dir_servo_angle(0)
     # time.sleep(0.5)
