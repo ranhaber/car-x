@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cat Follow - Calibration</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -22,30 +23,181 @@
     }
     header nav a:hover, header nav a.active { color: #e94560; }
     main { flex: 1; padding: 20px; max-width: 700px; margin: 0 auto; width: 100%; }
-    .placeholder {
+
+    .card {
       background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
-      padding: 40px; text-align: center; color: #8888aa;
+      padding: 20px; margin-bottom: 20px;
     }
+    .card h2 { font-size: 1.1rem; color: #e94560; margin-bottom: 14px; }
+    .form-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+    .form-row label { min-width: 100px; font-size: 0.85rem; color: #8888aa; }
+    .form-row input {
+      background: #0f0f23; border: 1px solid #0f3460; color: #e0e0e0;
+      padding: 8px 12px; border-radius: 4px; width: 100px; font-size: 0.95rem;
+    }
+    .speed-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    .speed-table th, .speed-table td {
+      padding: 8px 12px; text-align: left; border-bottom: 1px solid #0f3460;
+    }
+    .speed-table th { color: #8888aa; font-size: 0.75rem; text-transform: uppercase; }
+    .speed-table input {
+      background: #0f0f23; border: 1px solid #0f3460; color: #e0e0e0;
+      padding: 6px 10px; border-radius: 4px; width: 90px;
+    }
+    button {
+      padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer;
+      font-size: 0.95rem; font-weight: 600; transition: background 0.2s;
+    }
+    .btn-save { background: #0f3460; color: #e0e0e0; }
+    .btn-save:hover { background: #1a5276; }
+    .btn-add { background: #1e4620; color: #6bdb6b; font-size: 0.85rem; padding: 6px 12px; }
+    .btn-add:hover { background: #2a6b2e; }
+    .feedback {
+      margin-top: 12px; padding: 8px 12px; border-radius: 4px; font-size: 0.85rem;
+    }
+    .feedback.ok { background: #1e4620; color: #6bdb6b; }
+    .feedback.err { background: #4a1c1c; color: #e07070; }
+    .notes { font-size: 0.8rem; color: #666; margin-top: 8px; }
     footer { text-align: center; padding: 10px; font-size: 0.7rem; color: #555; }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Cat Follow</h1>
-    <nav>
-      <a href="/">Control</a>
-      <a href="/calibration" class="active">Calibration</a>
-    </nav>
-  </header>
-  <main>
-    <div class="placeholder">
-      <h2>Calibration</h2>
-      <p style="margin-top: 12px;">
-        Speed-time-distance, steering limits, and bbox-distance calibration will be available here.
-      </p>
-      <p style="margin-top: 8px; font-size: 0.85rem;">Coming soon.</p>
+
+<header>
+  <h1>Cat Follow</h1>
+  <nav>
+    <a href="/">Control</a>
+    <a href="/calibration" class="active">Calibration</a>
+  </nav>
+</header>
+
+<main x-data="calibrationApp()" x-init="load()">
+
+  <!-- Speed–time–distance (speed → cm/s) -->
+  <div class="card">
+    <h2>Speed–time–distance</h2>
+    <p class="notes">Map picar-x speed (0–100) to cm/s. Used for odometry and goto.</p>
+    <table class="speed-table">
+      <thead>
+        <tr><th>Speed (0–100)</th><th>cm/s</th><th></th></tr>
+      </thead>
+      <tbody>
+        <template x-for="(row, i) in speedRows" :key="i">
+          <tr>
+            <td><input type="number" min="0" max="100" x-model.number="row.speed" /></td>
+            <td><input type="number" step="0.1" min="0" x-model.number="row.cm_per_sec" /></td>
+            <td><button type="button" class="btn-add" @click="removeSpeedRow(i)">Remove</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div class="form-row" style="margin-top: 10px;">
+      <button type="button" class="btn-add" @click="addSpeedRow()">+ Add row</button>
     </div>
-  </main>
-  <footer>Cat Follow v{{ version }}</footer>
+  </div>
+
+  <!-- Steering limits -->
+  <div class="card">
+    <h2>Steering limits</h2>
+    <p class="notes">Max steering angle (degrees) and min turn radii (cm). Do not exceed max to avoid servo strain.</p>
+    <div class="form-row">
+      <label>Max steer (deg)</label>
+      <input type="number" step="1" min="1" max="45" x-model.number="maxSteer" />
+    </div>
+    <div class="form-row">
+      <label>Min radius left (cm)</label>
+      <input type="number" step="0.1" min="0" x-model.number="radiusLeft" />
+    </div>
+    <div class="form-row">
+      <label>Min radius right (cm)</label>
+      <input type="number" step="0.1" min="0" x-model.number="radiusRight" />
+    </div>
+  </div>
+
+  <div class="form-row">
+    <button type="button" class="btn-save" @click="save()">Save calibration</button>
+  </div>
+
+  <div class="feedback" :class="feedbackOk ? 'ok' : 'err'" x-show="feedback" x-text="feedback"></div>
+</main>
+
+<footer>Cat Follow v{{ version }}</footer>
+
+<script>
+function calibrationApp() {
+  return {
+    speedRows: [{ speed: 30, cm_per_sec: 12 }, { speed: 50, cm_per_sec: 22 }, { speed: 70, cm_per_sec: 32 }],
+    maxSteer: 30,
+    radiusLeft: 40,
+    radiusRight: 40,
+    bboxDist: {},
+    feedback: '',
+    feedbackOk: true,
+
+    load() {
+      fetch('/api/calibration')
+        .then(res => res.ok ? res.json() : Promise.reject(res))
+        .then(data => {
+          const speedObj = data.speed?.speed_to_cm_per_sec || {};
+          this.speedRows = Object.entries(speedObj).map(([k, v]) => ({ speed: parseInt(k, 10), cm_per_sec: parseFloat(v) }));
+          if (this.speedRows.length === 0) this.speedRows = [{ speed: 30, cm_per_sec: 12 }];
+          this.maxSteer = parseFloat(data.steering?.max_steer_angle_deg ?? 30);
+          const radii = data.steering?.min_turn_radius_cm;
+          if (radii && typeof radii === 'object') {
+            this.radiusLeft = parseFloat(radii.left ?? 40);
+            this.radiusRight = parseFloat(radii.right ?? 40);
+          } else if (typeof radii === 'number') {
+            this.radiusLeft = this.radiusRight = parseFloat(radii);
+          }
+          this.bboxDist = data.bbox_dist && typeof data.bbox_dist === 'object' ? { ...data.bbox_dist } : {};
+        })
+        .catch(() => { this.feedback = 'Could not load calibration'; this.feedbackOk = false; });
+    },
+
+    addSpeedRow() {
+      const last = this.speedRows[this.speedRows.length - 1];
+      this.speedRows.push({ speed: (last?.speed ?? 50) + 10, cm_per_sec: (last?.cm_per_sec ?? 20) + 5 });
+    },
+
+    removeSpeedRow(i) {
+      if (this.speedRows.length > 1) this.speedRows.splice(i, 1);
+    },
+
+    save() {
+      const speedToCm = {};
+      this.speedRows.forEach(r => { speedToCm[String(Number(r.speed))] = Number(r.cm_per_sec); });
+      const payload = {
+        speed: {
+          speed_to_cm_per_sec: speedToCm,
+          notes: 'Measured on flat floor; speed = picar-x 0-100'
+        },
+        steering: {
+          max_steer_angle_deg: Number(this.maxSteer),
+          min_turn_radius_cm: { left: Number(this.radiusLeft), right: Number(this.radiusRight) },
+          notes: 'Do not exceed max_steer to avoid servo strain.'
+        },
+        bbox_dist: this.bboxDist
+      };
+      fetch('/api/calibration', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+        .then(res => res.json().then(data => ({ res, data })))
+        .then(({ res, data }) => {
+          if (res.ok) {
+            this.feedback = 'Calibration saved.';
+            this.feedbackOk = true;
+          } else {
+            this.feedback = data.error || 'Save failed';
+            this.feedbackOk = false;
+          }
+        })
+        .catch(() => { this.feedback = 'Network error'; this.feedbackOk = false; });
+    }
+  };
+}
+</script>
+
 </body>
 </html>

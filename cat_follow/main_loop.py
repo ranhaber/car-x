@@ -56,6 +56,8 @@ def main():
     px = Picarx()
     motion_driver.set_car(px)
     range_sensor.set_car(px)
+    # Center steering and stop motors immediately; Picarx() init can move servos.
+    motion_driver.stop()
     log.info("Calibration loaded. State machine ready.")
 
     # ------------------------------------------------------------------

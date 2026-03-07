@@ -181,6 +181,10 @@
       <div class="value" x-text="status.cpu_temp >= 0 ? status.cpu_temp + '\u00B0C' : 'n/a'"></div>
     </div>
     <div class="status-item">
+      <div class="label">Battery</div>
+      <div class="value" x-text="status.battery_v >= 0 ? status.battery_v.toFixed(2) + ' V' : 'n/a'"></div>
+    </div>
+    <div class="status-item">
       <div class="label">Version</div>
       <div class="value" x-text="status.app_version"></div>
     </div>
@@ -211,6 +215,7 @@ function catFollow() {
       cpu_percent: -1,
       ram_percent: -1,
       cpu_temp: -1,
+      battery_v: -1,
     },
 
     _pollTimer: null,
