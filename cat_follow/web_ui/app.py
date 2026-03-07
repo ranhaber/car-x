@@ -59,20 +59,30 @@ def get_tracker_fps() -> float:
 # ---------------------------------------------------------------------------
 # System metrics helpers
 # ---------------------------------------------------------------------------
+_psutil_failed = False
+
 def _get_cpu_percent() -> float:
     """Return CPU usage percent (simple /proc/stat or fallback)."""
+    global _psutil_failed
     try:
         import psutil
         return psutil.cpu_percent(interval=0)
-    except ImportError:
+    except Exception as e:
+        if not _psutil_failed:
+            _log.warning("Could not get CPU/RAM stats. Is 'psutil' installed? Error: %s", e)
+            _psutil_failed = True
         return -1.0
 
 
 def _get_ram_percent() -> float:
+    global _psutil_failed
     try:
         import psutil
         return psutil.virtual_memory().percent
-    except ImportError:
+    except Exception as e:
+        if not _psutil_failed:
+            _log.warning("Could not get CPU/RAM stats. Is 'psutil' installed? Error: %s", e)
+            _psutil_failed = True
         return -1.0
 
 
@@ -81,16 +91,22 @@ def _get_cpu_temp() -> float:
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
             return int(f.read().strip()) / 1000.0
-    except (FileNotFoundError, ValueError, OSError):
+    except Exception:
         return -1.0
 
 
+_robot_hat_failed = False
+
 def _get_battery_voltage() -> float:
     """Read battery voltage from robot_hat (ADC A4) if available."""
+    global _robot_hat_failed
     try:
         from robot_hat import utils
         return round(utils.get_battery_voltage(), 2)
-    except (ImportError, OSError, Exception):
+    except Exception as e:
+        if not _robot_hat_failed:
+            _log.warning("Could not get battery voltage. Is 'robot_hat' installed and working? Error: %s", e)
+            _robot_hat_failed = True
         return -1.0
 
 
