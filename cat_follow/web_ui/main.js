@@ -28,6 +28,14 @@ document.addEventListener('DOMContentLoaded', () => {
         fetch('/api/status')
             .then(res => res.json())
             .then(data => {
+                // Alert on low battery (approx < 6.5V for 2S Li-ion)
+                if (data.battery_v && data.battery_v > 0 && data.battery_v < 6.5) {
+                    statusDisplay.style.border = "2px solid red";
+                    statusDisplay.style.color = "red";
+                } else {
+                    statusDisplay.style.border = "";
+                    statusDisplay.style.color = "";
+                }
                 statusDisplay.textContent = JSON.stringify(data, null, 2);
             })
             .catch(err => {

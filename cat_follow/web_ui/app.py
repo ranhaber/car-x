@@ -85,6 +85,15 @@ def _get_cpu_temp() -> float:
         return -1.0
 
 
+def _get_battery_voltage() -> float:
+    """Read battery voltage from robot_hat (ADC A4) if available."""
+    try:
+        from robot_hat import utils
+        return round(utils.get_battery_voltage(), 2)
+    except (ImportError, OSError, Exception):
+        return -1.0
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -199,6 +208,7 @@ def create_app(
             "cpu_percent": round(_get_cpu_percent(), 1),
             "ram_percent": round(_get_ram_percent(), 1),
             "cpu_temp": round(_get_cpu_temp(), 1),
+            "battery_v": _get_battery_voltage(),
         })
 
     # ------------------------------------------------------------------
