@@ -53,10 +53,10 @@ def main():
     sm = StateMachine()
     location.reset(0, 0, 0)
     # Optional: on Pi with hardware, uncomment to use motors + ultrasonic:
-    # from picarx import Picarx
-    # px = Picarx()
-    # motion_driver.set_car(px)
-    # range_sensor.set_car(px)
+    from picarx import Picarx
+    px = Picarx()
+    motion_driver.set_car(px)
+    range_sensor.set_car(px)
     log.info("Calibration loaded. State machine ready.")
 
     # ------------------------------------------------------------------
