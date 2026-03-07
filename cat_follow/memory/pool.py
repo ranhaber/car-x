@@ -41,7 +41,7 @@ class MemoryPool:
 
     Attributes are *references* to the underlying NumPy arrays.
     Callers write into these arrays in-place; they must never reassign
-    the attributes (e.g. ``pool.frame_latest = new_array`` is forbidden).
+    the attributes (e.g. ``pool.frame_ring = new_array`` is forbidden).
     """
 
     # Rotating ring of full-frame buffers (uint8, N x H x W x 3)
@@ -54,7 +54,7 @@ class MemoryPool:
     bbox_detector: np.ndarray
 
     # Odometry (float64, length 3)
-    odometry_xyh: np.ndarray
+    odometry: np.ndarray
 
 
 def allocate_pool() -> MemoryPool:
@@ -72,5 +72,5 @@ def allocate_pool() -> MemoryPool:
         frame_for_detector=np.zeros(FRAME_SHAPE, dtype=np.uint8),
         bbox_tracker=np.zeros(BBOX_LEN, dtype=np.float64),
         bbox_detector=np.zeros(BBOX_LEN, dtype=np.float64),
-        odometry_xyh=np.zeros(ODOM_LEN, dtype=np.float64),
+        odometry=np.zeros(ODOM_LEN, dtype=np.float64),
     )

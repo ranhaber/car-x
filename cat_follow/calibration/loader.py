@@ -23,15 +23,34 @@ def _load_json(name: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def _save_json(name: str, data: dict, calib_dir: str):
+    """Save dictionary to a JSON file."""
+    path = os.path.join(calib_dir, name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving calibration file {name}: {e}")
+
 
 class Calibration:
     """Single place for all calibration. Uses JSON files in calibration/."""
 
     def __init__(self, calib_dir: Optional[str] = None):
         self._dir = calib_dir or _CALIB_DIR
+        self.reload()
+
+    def reload(self):
+        """Re-read all calibration files from disk."""
         self._speed = _load_json("speed_time_distance.json")
         self._steering = _load_json("steering_limits.json")
         self._bbox_dist = _load_json("bbox_distance.json")
+
+    def save(self):
+        """Save current calibration values back to JSON files."""
+        _save_json("speed_time_distance.json", self._speed, self._dir)
+        _save_json("steering_limits.json", self._steering, self._dir)
+        _save_json("bbox_distance.json", self._bbox_dist, self._dir)
 
     def get_cm_per_sec(self, speed: int) -> float:
         """Speed (0-100) -> cm per second. Linear interpolation if between keys."""
@@ -55,9 +74,14 @@ class Calibration:
         """Max steering angle (symmetric), degrees. Clamp steer to ± this."""
         return float(self._steering.get("max_steer_angle_deg", 25.0))
 
-    def get_min_turn_radius_cm(self) -> float:
-        """Min turn radius in cm (max curvature)."""
-        return float(self._steering.get("min_turn_radius_cm", 40.0))
+    def get_min_turn_radii_cm(self) -> Tuple[float, float]:
+        """Min turn radii in cm (left, right) for max curvature."""
+        radii = self._steering.get("min_turn_radius_cm", {})
+        if isinstance(radii, (int, float)):  # backward compatibility
+            return (float(radii), float(radii))
+        left = float(radii.get("left", 40.0))
+        right = float(radii.get("right", 40.0))
+        return (left, right)
 
     def get_distance_cm_from_bbox_area(self, bbox_area_px: float) -> Optional[float]:
         """Bbox area (pixels²) -> distance in cm. Locked to 640×480. Returns None if not calibrated.
@@ -84,3 +108,22 @@ class Calibration:
     def get_target_distance_cm(self) -> float:
         """Closest physical distance (cm) the car may approach the cat. Configurable via bbox_distance.json."""
         return float(self._bbox_dist.get("target_distance_cm", 15.0))
+
+    # --- Setters for Web UI ---
+
+    def get_all_calibration_data(self) -> dict:
+        """Return all calibration data as a dictionary for the UI."""
+        return {
+            "speed": self._speed,
+            "steering": self._steering,
+            "bbox_dist": self._bbox_dist,
+        }
+
+    def set_all_calibration_data(self, data: dict):
+        """Update calibration from a dictionary (from UI)."""
+        if "speed" in data and isinstance(data["speed"], dict):
+            self._speed = data["speed"]
+        if "steering" in data and isinstance(data["steering"], dict):
+            self._steering = data["steering"]
+        if "bbox_dist" in data and isinstance(data["bbox_dist"], dict):
+            self._bbox_dist = data["bbox_dist"]

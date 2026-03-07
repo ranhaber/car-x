@@ -23,18 +23,6 @@ from cat_follow.memory.pool import FRAME_SHAPE
 
 log = get_logger("thread.camera")
 
-# Pre-allocate one write buffer so the loop never allocates per frame.
-_write_buf: np.ndarray | None = None
-
-
-def _get_write_buf() -> np.ndarray:
-    """Lazily allocate (once) a local buffer for building each frame."""
-    global _write_buf
-    if _write_buf is None:
-        _write_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
-    return _write_buf
-
-
 def run_camera_loop(
     shared: SharedState,
     stop_event: threading.Event,
@@ -101,16 +89,14 @@ def run_camera_loop(
                 pass
     else:
         # Fallback stub behavior (no cv2 available)
-        buf = _get_write_buf()
         log.info("Camera loop started (stub, %.0f FPS). cv2 not available.", target_fps)
         while not stop_event.is_set():
             t0 = time.monotonic()
 
-            # Stub: fill entire frame with a rolling value
-            buf[:] = frame_index % 256
-            # copy into the ring write slot and publish
+            # Get the next write buffer from the ring, fill it, and publish.
             write_buf = shared.get_write_buffer()
-            np.copyto(write_buf, buf)
+            # Stub: fill entire frame with a rolling value
+            write_buf[:] = frame_index % 256
             shared.publish_latest_from_write()
 
             frame_index += 1

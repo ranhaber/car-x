@@ -54,9 +54,11 @@ class SharedState:
     def set_frame_latest(self, src: np.ndarray) -> None:
         """Copy *src* into the next write slot and publish it as latest.
 
-        This convenience method keeps backward compatibility: it copies
-        into the current write buffer and then publishes that buffer as
-        the latest frame (rotating the write index).
+        This is a convenience method for tests or simple producers. The
+        high-performance camera loop should use the ``get_write_buffer()``
+        and ``publish_latest_from_write()`` pair to avoid an extra
+        copy if the camera driver can write directly into the shared
+        buffer.
         """
         # Copy into current write buffer, then publish under lock.
         write_buf = self.get_write_buffer()
@@ -68,6 +70,12 @@ class SharedState:
 
         If no frame has been published yet, *dst* is zeroed.
         """
+        # Basic shape checks to catch incorrect caller usage early.
+        if dst.shape != FRAME_SHAPE:
+            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
+        if dst.dtype != self._pool.frame_ring.dtype:
+            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_ring.dtype}")
+
         with self._lock_frame:
             if self._latest_idx < 0:
                 dst.fill(0)
@@ -89,6 +97,12 @@ class SharedState:
 
     def get_frame_for_detector(self, dst: np.ndarray) -> None:
         """Copy the current ``frame_for_detector`` into *dst* under lock."""
+        # Validate dst shape and dtype to make misuse obvious.
+        if dst.shape != FRAME_SHAPE:
+            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
+        if dst.dtype != self._pool.frame_for_detector.dtype:
+            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
+
         with self._lock_frame:
             np.copyto(dst, self._pool.frame_for_detector)
 
@@ -102,7 +116,15 @@ class SharedState:
         ``publish_latest_from_write()`` to make the frame visible to
         readers.
         """
-        return self._pool.frame_ring[self._write_idx]
+        # NOTE: This method intentionally does not acquire ``_lock_frame``.
+        # It is safe only when a single writer (the camera thread) uses it.
+        # Add a debug-time sanity check to catch accidental multi-writer use.
+        buf = self._pool.frame_ring[self._write_idx]
+        if __debug__:
+            # shape/dtype guard
+            assert buf.shape == FRAME_SHAPE, f"write buffer shape {buf.shape} != {FRAME_SHAPE}"
+            assert buf.dtype == self._pool.frame_ring.dtype
+        return buf
 
     def publish_latest_from_write(self) -> None:
         """Atomically publish the buffer at the current write index as
@@ -164,7 +186,7 @@ class SharedState:
     def set_odometry(self, x: float, y: float, heading_deg: float) -> None:
         """Write odometry into the pre-allocated array under lock."""
         with self._lock_odometry:
-            buf = self._pool.odometry_xyh
+            buf = self._pool.odometry
             buf[0] = x
             buf[1] = y
             buf[2] = heading_deg
@@ -172,7 +194,7 @@ class SharedState:
     def get_odometry(self) -> Tuple[float, float, float]:
         """Return a snapshot ``(x, y, heading_deg)`` under lock."""
         with self._lock_odometry:
-            buf = self._pool.odometry_xyh
+            buf = self._pool.odometry
             return (float(buf[0]), float(buf[1]), float(buf[2]))
 
     # ── detector model selection ──────────────────────────────────────

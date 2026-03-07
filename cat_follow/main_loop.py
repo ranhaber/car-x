@@ -186,7 +186,7 @@ def main():
                         heading = location.get_heading_deg()
                         tx_cm = target[0] * 100.0
                         ty_cm = target[1] * 100.0
-                        _, _, arrived = compute_goto(
+                        steer, speed, arrived = compute_goto(
                             pos[0], pos[1], heading, tx_cm, ty_cm, calib,
                         )
                         if arrived:
@@ -197,8 +197,6 @@ def main():
                             sm.dispatch(Event.CAT_FOUND, bbox_xywh)
                             lost_count = 0
                         else:
-                            cycle_sec = time.monotonic() - search_start_time
-                            steer, speed = compute_search_tick(cycle_sec, calib)
                             motion_driver.set_steer(steer)
                             motion_driver.forward(speed)
                             location.update(tick_sec, speed, steer, calib.get_cm_per_sec(speed))

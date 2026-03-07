@@ -22,6 +22,7 @@ from cat_follow.memory.pool import (
     FRAME_SHAPE,
     FRAME_NBYTES,
     BBOX_LEN,
+    FRAME_RING_N,
     ODOM_LEN,
 )
 
@@ -40,31 +41,32 @@ def test_constants_consistent():
     assert FRAME_NBYTES == FRAME_H * FRAME_W * FRAME_C
 
 
-def test_frame_latest_shape_and_dtype():
+def test_frame_ring_shape_and_dtype():
     pool = _make_pool()
-    assert pool.frame_latest.shape == (480, 640, 3)
-    assert pool.frame_latest.dtype == np.uint8
+    assert pool.frame_ring.shape == (FRAME_RING_N, FRAME_H, FRAME_W, FRAME_C)
+    assert pool.frame_ring.dtype == np.uint8
 
 
 def test_frame_for_detector_shape_and_dtype():
     pool = _make_pool()
-    assert pool.frame_for_detector.shape == (480, 640, 3)
+    assert pool.frame_for_detector.shape == FRAME_SHAPE
     assert pool.frame_for_detector.dtype == np.uint8
 
 
 def test_frame_nbytes():
     pool = _make_pool()
-    assert pool.frame_latest.nbytes == FRAME_NBYTES
+    # Test one frame from the ring
+    assert pool.frame_ring[0].nbytes == FRAME_NBYTES
     assert pool.frame_for_detector.nbytes == FRAME_NBYTES
 
 
 def test_frames_are_separate_buffers():
-    """frame_latest and frame_for_detector must be independent arrays."""
+    """frame_ring and frame_for_detector must be independent arrays."""
     pool = _make_pool()
-    assert pool.frame_latest is not pool.frame_for_detector
-    pool.frame_latest[:] = 42
+    assert pool.frame_ring.base is not pool.frame_for_detector.base
+    pool.frame_ring[0, :, :, :] = 42
     assert pool.frame_for_detector[0, 0, 0] == 0, (
-        "Writing to frame_latest must not affect frame_for_detector"
+        "Writing to frame_ring must not affect frame_for_detector"
     )
 
 
@@ -89,15 +91,15 @@ def test_bboxes_are_separate_buffers():
 
 def test_odometry_length_and_dtype():
     pool = _make_pool()
-    assert len(pool.odometry_xyh) == ODOM_LEN
-    assert pool.odometry_xyh.dtype == np.float64
+    assert len(pool.odometry) == ODOM_LEN
+    assert pool.odometry.dtype == np.float64
 
 
 def test_write_read_frame():
-    """Write a known value into frame_latest, read it back."""
+    """Write a known value into a frame buffer, read it back."""
     pool = _make_pool()
-    pool.frame_latest[:] = 128
-    assert np.all(pool.frame_latest == 128)
+    pool.frame_for_detector[:] = 128
+    assert np.all(pool.frame_for_detector == 128)
 
 
 def test_write_read_bbox_tracker():
@@ -109,37 +111,37 @@ def test_write_read_bbox_tracker():
 
 def test_write_read_odometry():
     pool = _make_pool()
-    pool.odometry_xyh[:] = [1.5, 2.5, 90.0]
-    assert pool.odometry_xyh[0] == 1.5
-    assert pool.odometry_xyh[2] == 90.0
+    pool.odometry[:] = [1.5, 2.5, 90.0]
+    assert pool.odometry[0] == 1.5
+    assert pool.odometry[2] == 90.0
 
 
 def test_no_realloc_on_repeated_writes():
     """Repeated in-place writes must reuse the same underlying buffer."""
     pool = _make_pool()
 
-    frame_id = id(pool.frame_latest)
+    frame_id = id(pool.frame_for_detector)
     bbox_id = id(pool.bbox_tracker)
-    odom_id = id(pool.odometry_xyh)
+    odom_id = id(pool.odometry)
 
     for i in range(10):
-        pool.frame_latest[:] = i
+        pool.frame_for_detector[:] = i
         pool.bbox_tracker[:] = [float(i)] * BBOX_LEN
-        pool.odometry_xyh[:] = [float(i)] * ODOM_LEN
+        pool.odometry[:] = [float(i)] * ODOM_LEN
 
-    assert id(pool.frame_latest) == frame_id, "frame_latest was reallocated"
+    assert id(pool.frame_for_detector) == frame_id, "frame_for_detector was reallocated"
     assert id(pool.bbox_tracker) == bbox_id, "bbox_tracker was reallocated"
-    assert id(pool.odometry_xyh) == odom_id, "odometry_xyh was reallocated"
+    assert id(pool.odometry) == odom_id, "odometry was reallocated"
 
 
 def test_all_buffers_start_at_zero():
     """Every buffer must be zero-initialized."""
     pool = _make_pool()
-    assert np.all(pool.frame_latest == 0)
+    assert np.all(pool.frame_ring == 0)
     assert np.all(pool.frame_for_detector == 0)
     assert np.all(pool.bbox_tracker == 0.0)
     assert np.all(pool.bbox_detector == 0.0)
-    assert np.all(pool.odometry_xyh == 0.0)
+    assert np.all(pool.odometry == 0.0)
 
 
 # ── run as script ────────────────────────────────────────────────────────

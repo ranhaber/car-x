@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PiCar-X Control</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 2em; background-color: #f8f9fa; color: #212529; }
+        .tabs { display: flex; border-bottom: 1px solid #dee2e6; }
+        .tab-button { padding: 10px 15px; cursor: pointer; border: 1px solid transparent; border-bottom: 0; background: none; font-size: 1em; }
+        .tab-button.active { border-color: #dee2e6; border-bottom: 1px solid #f8f9fa; margin-bottom: -1px; background-color: #f8f9fa; }
+        .tab-content { display: none; padding: 20px; border: 1px solid #dee2e6; border-top: 0; background-color: #fff; }
+        .tab-content.active { display: block; }
+        .form-group { margin-bottom: 1.5em; padding-bottom: 1em; border-bottom: 1px solid #eee; }
+        label { display: block; margin-bottom: 0.5em; font-weight: bold; }
+        input[type="number"], input[type="text"] { width: 120px; padding: 5px; }
+        button { padding: 8px 12px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        textarea { width: 98%; height: 200px; font-family: monospace; padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        .status { background: #e9ecef; padding: 1em; margin-top: 1em; border-radius: 4px; white-space: pre-wrap; font-family: monospace; }
+        #save-status { margin-top: 10px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>PiCar-X Control Panel</h1>
+
+    <div class="tabs">
+        <div class="tab-button active" onclick="openTab(event, 'status')">Status</div>
+        <div class="tab-button" onclick="openTab(event, 'calibration')">Calibration</div>
+    </div>
+
+    <div id="status" class="tab-content active">
+        <h2>Live Status</h2>
+        <div class="status" id="status-display">Loading...</div>
+    </div>
+
+    <div id="calibration" class="tab-content">
+        <h2>Movement Calibration</h2>
+        <p>Use these tools to measure and set the car's movement parameters.</p>
+        
+        <div class="form-group">
+            <h3>1. Run Physical Tests</h3>
+            <p>Place the car on a flat surface with plenty of space.</p>
+            <div>
+                <strong>Speed Test:</strong>
+                <label>Speed (0-100): <input type="number" id="speed-test-val" value="50"></label>
+                <button id="run-speed-test">Run Forward for 1s</button>
+                <p>After running, measure the distance traveled in cm.</p>
+            </div>
+            <hr>
+            <div>
+                <strong>Steering Test (Left):</strong>
+                <label>Steer Angle (-30 to 0): <input type="number" id="steer-test-left-val" value="-30"></label>
+                <button id="run-steer-test-left">Run Left Turn</button>
+                <p>After running, measure the diameter of the circle in cm. Radius = Diameter / 2.</p>
+            </div>
+            <hr>
+            <div>
+                <strong>Steering Test (Right):</strong>
+                <label>Steer Angle (0 to 30): <input type="number" id="steer-test-right-val" value="30"></label>
+                <button id="run-steer-test-right">Run Right Turn</button>
+                <p>After running, measure the diameter of the circle in cm. Radius = Diameter / 2.</p>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <h3>2. Enter and Save Values</h3>
+            <p>Edit the JSON below with your measured values and click Save.</p>
+            <label for="steering-json">steering_limits.json</label>
+            <textarea id="steering-json"></textarea>
+            <br>
+            <label for="speed-json">speed_time_distance.json</label>
+            <textarea id="speed-json"></textarea>
+            <br>
+            <button id="save-calibration">Save All Calibration Data</button>
+            <div id="save-status"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

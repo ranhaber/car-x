@@ -4,5 +4,5 @@
     "50": 22.0,
     "70": 32.0
   },
-  "notes": "Replace with your measured values: run car at speed for 1s, measure distance (cm). speed = picar-x 0-100."
+  "notes": "Measured on flat floor; speed = picar-x 0-100"
 }
