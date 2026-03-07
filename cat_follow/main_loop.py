@@ -55,6 +55,9 @@ def main():
     # Optional: on Pi with hardware, uncomment to use motors + ultrasonic:
     from picarx import Picarx
     px = Picarx()
+    # Safety: force steering to 0 and wait a bit to settle to avoid violent startup
+    px.set_dir_servo_angle(0)
+    time.sleep(0.5)
     motion_driver.set_car(px)
     range_sensor.set_car(px)
     log.info("Calibration loaded. State machine ready.")
