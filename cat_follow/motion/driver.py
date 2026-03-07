@@ -4,8 +4,11 @@ Uses calibration for steering clamp. Stub mode: no real hardware if px is None.
 """
 from typing import Optional
 
+from cat_follow.logger import get_logger
+
 # Optional: from picarx import Picarx
 _px = None  # set by main or test to real Picarx() for hardware
+log = get_logger("motion_driver")
 
 
 def set_car(car) -> None:
@@ -15,6 +18,7 @@ def set_car(car) -> None:
 
 
 def stop() -> None:
+    log.debug("CMD: stop")
     if _px is not None:
         _px.stop()
         # Also straighten the wheels
@@ -22,6 +26,7 @@ def stop() -> None:
 
 
 def forward(speed: int) -> None:
+    log.debug("CMD: forward speed=%s", speed)
     speed = max(0, min(100, int(speed)))
     if _px is not None:
         _px.forward(speed)
@@ -29,6 +34,7 @@ def forward(speed: int) -> None:
 
 
 def backward(speed: int) -> None:
+    log.debug("CMD: backward speed=%s", speed)
     speed = max(0, min(100, int(speed)))
     if _px is not None:
         _px.backward(speed)
@@ -37,6 +43,7 @@ def backward(speed: int) -> None:
 
 def set_steer(angle_deg: float) -> None:
     """Set steering angle in degrees (e.g. -25 to +25). Clamp is applied in limits."""
+    log.debug("CMD: set_steer angle=%.1f", angle_deg)
     if _px is not None:
         _px.set_dir_servo_angle(angle_deg)
     # else stub

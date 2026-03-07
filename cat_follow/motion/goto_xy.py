@@ -51,11 +51,11 @@ def compute_goto(
     steer = limits.clamp_steer(error, calib)
 
     # Speed control: slow down if turning sharply or close to target
-    base_speed = 40
+    base_speed = 30
     if abs(error) > 20:
-        speed = 30
+        speed = 20
     elif dist < 20:
-        speed = 25
+        speed = 20
     else:
         speed = base_speed
 

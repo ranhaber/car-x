@@ -165,6 +165,7 @@ def main():
             if obstacle_close:
                 # Stop and arc around: something is closer than 15 cm
                 if obstacle_arc_start_time <= 0:
+                    log.info("Obstacle detected! Distance: %.1f cm", ultrasonic_cm)
                     obstacle_arc_start_time = time.monotonic()
                 cycle_sec = time.monotonic() - obstacle_arc_start_time
                 steer, speed = compute_search_tick(cycle_sec, calib)
