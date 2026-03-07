@@ -1,4 +1,4 @@
 # Cat-follow feature: state machine, motion, vision, calibration.
 # See DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
