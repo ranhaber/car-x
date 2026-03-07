@@ -1,6 +1,9 @@
 """
-Motion logic to drive toward a target (x, y).
-Uses odometry (current x, y, heading) and calculates steering/speed.
+Goto motion logic used when calibrating the car's movement on a goto command.
+
+This module is for calibration runs (e.g. testing how the car drives toward a target
+when it receives a goto command). The main loop uses motion/goto_xy.py for actual
+operation; use this module when calibrating goto behavior (speed, steering, arrival).
 """
 
 import math

@@ -161,10 +161,9 @@ def create_app(
         return render_template("main.html", version=__version__)
 
     @app.route("/calibration")
-    def calibration_page_redirect():
-        """Redirect old /calibration links to the main page with tabs."""
-        from flask import redirect, url_for
-        return redirect(url_for('index'))
+    def calibration_page():
+        """Serve the Calibration tab page."""
+        return render_template("calibration.html", version=__version__)
 
     # ------------------------------------------------------------------
     # MJPEG stream

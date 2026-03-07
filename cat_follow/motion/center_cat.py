@@ -37,9 +37,13 @@ def center_cat_control(
     # Distance: ultrasonic only (no bbox fallback)
     try:
         from cat_follow import range_sensor
-        dist_cm = range_sensor.get_distance_cm()
-    except Exception:
+    except ImportError:
         dist_cm = None
+    else:
+        try:
+            dist_cm = range_sensor.get_distance_cm()
+        except (TypeError, ValueError, AttributeError, OSError):
+            dist_cm = None
     if dist_cm is None:
         driver.stop()
         return

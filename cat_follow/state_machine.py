@@ -2,7 +2,9 @@
 State machine for cat-follow behavior.
 States: IDLE, GOTO_TARGET, SEARCH, APPROACH, TRACK, LOST_SEARCH.
 Events drive transitions; no hardware dependency.
+Thread-safe: main loop dispatches; Flask reads state for status.
 """
+import threading
 from enum import Enum
 from typing import Optional, Tuple, Any
 
@@ -52,42 +54,48 @@ _TRANSITIONS = {
 
 
 class StateMachine:
-    """Single source of truth for cat-follow state. No hardware."""
+    """Single source of truth for cat-follow state. No hardware. Thread-safe."""
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._state = State.IDLE
         self._target_xy: Optional[Tuple[float, float]] = None  # from CAT_LOCATION_RECEIVED
         self._last_bbox: Optional[Tuple[float, float, float, float]] = None  # (x,y,w,h) from CAT_FOUND
 
     @property
     def state(self) -> State:
-        return self._state
+        with self._lock:
+            return self._state
 
     @property
     def target_xy(self) -> Optional[Tuple[float, float]]:
-        return self._target_xy
+        with self._lock:
+            return self._target_xy
 
     @property
     def last_bbox(self) -> Optional[Tuple[float, float, float, float]]:
-        return self._last_bbox
+        with self._lock:
+            return self._last_bbox
 
     def dispatch(self, event: Event, payload: Any = None) -> State:
         """
         Process event; update state and optional payload. Returns new state.
         Unknown (state, event) leaves state unchanged.
         """
-        key = (self._state, event)
-        new_state = _TRANSITIONS.get(key)
-        if new_state is not None:
-            self._state = new_state
-            if event == Event.CAT_LOCATION_RECEIVED and payload is not None:
-                self._target_xy = tuple(payload[:2])
-            if event == Event.CAT_FOUND and payload is not None:
-                self._last_bbox = tuple(payload[:4]) if len(payload) >= 4 else None
-        return self._state
+        with self._lock:
+            key = (self._state, event)
+            new_state = _TRANSITIONS.get(key)
+            if new_state is not None:
+                self._state = new_state
+                if event == Event.CAT_LOCATION_RECEIVED and payload is not None:
+                    self._target_xy = tuple(payload[:2])
+                if event == Event.CAT_FOUND and payload is not None:
+                    self._last_bbox = tuple(payload[:4]) if len(payload) >= 4 else None
+            return self._state
 
     def reset_to_idle(self) -> None:
         """Force IDLE and clear target/bbox."""
-        self._state = State.IDLE
-        self._target_xy = None
-        self._last_bbox = None
+        with self._lock:
+            self._state = State.IDLE
+            self._target_xy = None
+            self._last_bbox = None

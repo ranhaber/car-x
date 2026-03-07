@@ -2,6 +2,9 @@
 Load calibration from JSON files. Exposes speed->cm/s, max steer, optional bbox->distance.
 Calibration dir is next to this file.
 
+Calibration is loaded once at startup and updated only when the user saves from the Web UI
+(or explicitly reloads); it is not constantly reloaded during operation.
+
 Bbox–distance: locked to 640×480. Values in bbox_distance.json are examples; replace
 with your calibration. A script/UI to log (area, distance) and build the table is planned.
 """
@@ -10,7 +13,10 @@ import json
 import os
 from typing import Dict, Optional, Tuple
 
+from cat_follow.logger import get_logger
+
 _CALIB_DIR = os.path.dirname(os.path.abspath(__file__))
+_log = get_logger("calibration")
 
 # Bbox area calibration is for this resolution only. Do not change without re-calibrating.
 CALIBRATION_IMAGE_SIZE: Tuple[int, int] = (640, 480)
@@ -30,11 +36,15 @@ def _save_json(name: str, data: dict, calib_dir: str):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"Error saving calibration file {name}: {e}")
+        _log.warning("Error saving calibration file %s: %s", name, e)
 
 
 class Calibration:
-    """Single place for all calibration. Uses JSON files in calibration/."""
+    """Single place for all calibration. Uses JSON files in calibration/.
+
+    Loaded once at startup; updated only when the user saves from the Web UI (or reload()).
+    Not constantly reloaded during operation.
+    """
 
     def __init__(self, calib_dir: Optional[str] = None):
         self._dir = calib_dir or _CALIB_DIR
