@@ -19,6 +19,7 @@ from cat_follow import __version__
 from cat_follow.logger import get_logger
 from cat_follow.commands import set_cat_location, set_stop_command
 from cat_follow import range_sensor
+from cat_follow.motion.calibration_routines import run_speed_test, run_steer_test
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
 
@@ -89,12 +90,16 @@ def _get_cpu_temp() -> float:
 # ---------------------------------------------------------------------------
 # Module-level refs set by create_app; used by routes and stream generator.
 _shared: Optional[SharedState] = None
-_state_machine = None  # will be the StateMachine instance
+_state_machine = None
+_calibration = None
+_picarx = None
 
 
 def create_app(
     shared: SharedState,
     state_machine=None,
+    calibration=None,
+    picarx=None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -104,10 +109,16 @@ def create_app(
         Thread-safe wrapper around the pre-allocated memory pool.
     state_machine : StateMachine, optional
         The state machine instance (for status reporting).
+    calibration : Calibration, optional
+        The calibration object instance.
+    picarx : Picarx, optional
+        The Picarx hardware instance.
     """
-    global _shared, _state_machine
+    global _shared, _state_machine, _calibration, _picarx
     _shared = shared
     _state_machine = state_machine
+    _calibration = calibration
+    _picarx = picarx
 
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -123,10 +134,6 @@ def create_app(
     @app.route("/")
     def index():
         return render_template("main.html", version=__version__)
-
-    @app.route("/calibration")
-    def calibration_page():
-        return render_template("calibration.html", version=__version__)
 
     # ------------------------------------------------------------------
     # MJPEG stream
@@ -232,15 +239,49 @@ def create_app(
         return jsonify({"status": "ok", "model": choice})
 
     # ------------------------------------------------------------------
-    # API: calibration (stub)
+    # API: calibration
     # ------------------------------------------------------------------
     @app.route("/api/calibration", methods=["GET"])
-    def api_calibration_get():
-        return jsonify({"note": "Calibration tab not yet implemented."})
+    def get_calibration():
+        if not _calibration:
+            return jsonify({"error": "Calibration not initialized"}), 500
+        return jsonify(_calibration.get_all_calibration_data())
 
     @app.route("/api/calibration", methods=["POST"])
-    def api_calibration_post():
-        return jsonify({"note": "Calibration tab not yet implemented."}), 501
+    def save_calibration():
+        if not _calibration:
+            return jsonify({"error": "Calibration not initialized"}), 500
+        data = request.json
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+        _calibration.set_all_calibration_data(data)
+        _calibration.save()
+        return jsonify({"status": "ok", "message": "Calibration saved."})
+
+    @app.route('/api/calibrate/run_speed', methods=['POST'])
+    def api_run_speed_test():
+        if not _picarx:
+            return jsonify({"error": "Picarx not initialized"}), 500
+        data = request.json or {}
+        speed = int(data.get('speed', 30))
+        duration = float(data.get('duration', 1.0))
+        threading.Thread(target=run_speed_test, args=(_picarx, speed, duration)).start()
+        return jsonify({"status": "ok", "message": f"Running speed test at speed {speed}."})
+
+    @app.route('/api/calibrate/run_steer', methods=['POST'])
+    def api_run_steer_test():
+        if not _picarx:
+            return jsonify({"error": "Picarx not initialized"}), 500
+        data = request.json or {}
+        angle = int(data.get('angle', 0))
+        speed = int(data.get('speed', 30))
+        duration = float(data.get('duration', 4.0))
+        if not -40 < angle < 40:
+             return jsonify({"error": "Angle must be between -40 and 40"}), 400
+        threading.Thread(
+            target=run_steer_test, args=(_picarx, angle, speed, duration)
+        ).start()
+        return jsonify({"status": "ok", "message": f"Running steer test with angle {angle}."})
 
     return app
 

@@ -96,7 +96,7 @@ def main():
     # ------------------------------------------------------------------
     # 6. Start Web UI (Flask) in a background thread
     # ------------------------------------------------------------------
-    app = create_app(shared=shared, state_machine=sm)
+    app = create_app(shared=shared, state_machine=sm, calibration=calib, picarx=px)
 
     flask_thread = threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False),

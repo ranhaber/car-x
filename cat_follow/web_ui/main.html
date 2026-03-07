@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PiCar-X Control (v{{ version }})</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <h1>PiCar-X Control Panel</h1>
+
+    <div class="tabs">
+        <div class="tab-button active" onclick="openTab(event, 'main')">Main</div>
+        <div class="tab-button" onclick="openTab(event, 'calibration')">Calibration</div>
+    </div>
+
+    <!-- Main Tab -->
+    <div id="main" class="tab-content active">
+        <div class="container">
+            <div class="video-container">
+                <img id="stream" src="/stream" width="640" height="480" alt="Live stream">
+            </div>
+            <div class="controls-container">
+                <div class="form-group">
+                    <label>Send Target (meters)</label>
+                    <input type="number" id="target-x" placeholder="X" value="1.0" step="0.1">
+                    <input type="number" id="target-y" placeholder="Y" value="0.0" step="0.1">
+                    <button id="send-target">Send</button>
+                </div>
+                <div class="form-group">
+                    <button id="stop-car" class="stop-button">STOP</button>
+                </div>
+                <div class="form-group">
+                    <label for="resolution-select">Stream Resolution</label>
+                    <select id="resolution-select">
+                        <option value="640x480">640x480</option>
+                        <option value="320x240">320x240</option>
+                        <option value="160x120">160x120</option>
+                    </select>
+                </div>
+                <h3>Live Status</h3>
+                <div class="status" id="status-display">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Calibration Tab -->
+    <div id="calibration" class="tab-content">
+        <h2>Movement Calibration</h2>
+        <p>Use these tools to measure and set the car's movement parameters.</p>
+        
+        <div class="form-group">
+            <h3>1. Run Physical Tests</h3>
+            <p>Place the car on a flat surface with plenty of space.</p>
+            <div>
+                <strong>Speed Test:</strong>
+                <label>Speed (0-100): <input type="number" id="speed-test-val" value="40"></label>
+                <button id="run-speed-test">Run Forward for 1s</button>
+                <p>After running, measure the distance traveled in cm.</p>
+            </div>
+            <hr>
+            <div>
+                <strong>Steering Test:</strong>
+                <label>Steer Angle (-35 to 35): <input type="number" id="steer-test-val" value="30"></label>
+                <button id="run-steer-test">Run Turn</button>
+                <p>After running, measure the diameter of the circle in cm. Radius = Diameter / 2.</p>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <h3>2. Enter and Save Values</h3>
+            <p>Edit the JSON below with your measured values and click Save. The `bbox_dist` is for future use.</p>
+            
+            <label for="speed-json">speed_time_distance.json</label>
+            <textarea id="speed-json"></textarea>
+            <br>
+            <label for="steering-json">steering_limits.json</label>
+            <textarea id="steering-json"></textarea>
+            <br>
+            <label for="bbox-json">bbox_distance.json</label>
+            <textarea id="bbox-json"></textarea>
+            <br>
+            <button id="save-calibration">Save All Calibration Data</button>
+            <div id="save-status"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

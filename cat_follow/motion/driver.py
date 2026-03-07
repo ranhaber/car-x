@@ -17,7 +17,8 @@ def set_car(car) -> None:
 def stop() -> None:
     if _px is not None:
         _px.stop()
-    # else stub: no-op
+        # Also straighten the wheels
+        set_steer(0)
 
 
 def forward(speed: int) -> None:
