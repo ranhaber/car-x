@@ -95,8 +95,6 @@ def main():
     # ------------------------------------------------------------------
     # 6. Start Web UI (Flask) in a background thread
     # ------------------------------------------------------------------
-    while True:
-        log.info("Web UI started on http://0.0.0.0:5000")
     app = create_app(shared=shared, state_machine=sm, calibration=calib, picarx=px)
 
     flask_thread = threading.Thread(
