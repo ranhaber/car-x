@@ -31,7 +31,8 @@ class Event(Enum):
 _TRANSITIONS = {
     (State.IDLE, Event.CAT_LOCATION_RECEIVED): State.GOTO_TARGET,
     (State.IDLE, Event.STOP_COMMAND): State.IDLE,
-    (State.GOTO_TARGET, Event.AT_TARGET): State.SEARCH,
+    # On arrival at target, go to IDLE instead of starting a search.
+    (State.GOTO_TARGET, Event.AT_TARGET): State.IDLE,
     (State.GOTO_TARGET, Event.CAT_FOUND): State.APPROACH,
     (State.GOTO_TARGET, Event.TIMEOUT): State.SEARCH,
     (State.GOTO_TARGET, Event.STOP_COMMAND): State.IDLE,
