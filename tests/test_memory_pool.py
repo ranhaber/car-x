@@ -63,7 +63,7 @@ def test_frame_nbytes():
 def test_frames_are_separate_buffers():
     """frame_ring and frame_for_detector must be independent arrays."""
     pool = _make_pool()
-    assert pool.frame_ring.base is not pool.frame_for_detector.base
+    assert not np.shares_memory(pool.frame_ring, pool.frame_for_detector)
     pool.frame_ring[0, :, :, :] = 42
     assert pool.frame_for_detector[0, 0, 0] == 0, (
         "Writing to frame_ring must not affect frame_for_detector"

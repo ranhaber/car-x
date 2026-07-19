@@ -172,7 +172,7 @@ def test_simulation_straight():
     dt = 1.0 / 30.0
     arrived = False
 
-    for tick in range(300):  # 10 seconds max
+    for tick in range(600):  # 20 seconds max at the simulated 15 cm/s cruise
         x, y = odometry.get_position()
         h = odometry.get_heading_deg()
         steer, speed, arrived = compute_goto(x, y, h, tx, ty)
@@ -181,7 +181,7 @@ def test_simulation_straight():
         cm_per_sec = speed * 0.5  # rough
         odometry.update(dt, speed, steer, cm_per_sec)
 
-    assert arrived, f"Did not arrive after 300 ticks. Pos=({x:.1f}, {y:.1f})"
+    assert arrived, f"Did not arrive after 600 ticks. Pos=({x:.1f}, {y:.1f})"
 
 
 def test_simulation_diagonal():

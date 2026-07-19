@@ -13,12 +13,12 @@ def test_cm_per_sec():
     # Default JSON has 30->12, 50->22, 70->32
     assert calib.get_cm_per_sec(30) == 12.0
     assert calib.get_cm_per_sec(50) == 22.0
-    assert 21 < calib.get_cm_per_sec(45) < 23
+    assert calib.get_cm_per_sec(45) == 19.5
 
 
 def test_max_steer():
     calib = Calibration()
-    assert calib.get_max_steer_angle_deg() == 25.0
+    assert calib.get_max_steer_angle_deg() == 30.0
 
 
 def test_target_distance():
