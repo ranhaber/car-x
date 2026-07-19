@@ -1,0 +1,19 @@
+[Unit]
+Description=Cat Follow control runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=picarx
+Group=picarx
+SupplementaryGroups=i2c gpio
+WorkingDirectory=/opt/car-x
+EnvironmentFile=/etc/car-x/car-x.env
+ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

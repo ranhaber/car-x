@@ -11,6 +11,7 @@
 **********************************************************************
 '''
 import os
+import shutil
 from time import sleep
 
 
@@ -68,10 +69,17 @@ class fileDB(object):
 				with open(file_path, 'w') as f:
 					f.write("# robot-hat config and calibration value of robots\n\n")
 
-			if mode != None:
-				os.popen('sudo chmod %s %s'%(mode, file_path))
-			if owner != None:
-				os.popen('sudo chown -R %s:%s %s'%(owner, owner, dir))		
+			if mode is not None:
+				try:
+					os.chmod(file_path, int(str(mode), 8))
+				except PermissionError:
+					pass
+			if owner is not None:
+				try:
+					shutil.chown(file_path, user=owner, group=owner)
+					shutil.chown(dir, user=owner, group=owner)
+				except (LookupError, PermissionError):
+					pass
 		except Exception as e:
 			raise(e) 
 	
@@ -90,18 +98,15 @@ class fileDB(object):
 			conf = open(self.db,'r')
 			lines=conf.readlines()
 			conf.close()
-			file_len=len(lines)-1
-			flag = False
 			# Find the arguement and set the value
-			for i in range(file_len):
-				if lines[i][0] != '#':
-					if lines[i].split('=')[0].strip() == name:
-						value = lines[i].split('=')[1].replace(' ', '').strip()
-						flag = True
-			if flag:
-				return value
-			else:
-				return default_value
+			for line in lines:
+				line = line.strip()
+				if not line or line.startswith('#') or '=' not in line:
+					continue
+				key, value = line.split('=', 1)
+				if key.strip() == name:
+					return value.replace(' ', '').strip()
+			return default_value
 		except FileNotFoundError:
 			conf = open(self.db,'w')
 			conf.write("")
@@ -123,14 +128,15 @@ class fileDB(object):
 		conf = open(self.db,'r')
 		lines=conf.readlines()
 		conf.close()
-		file_len=len(lines)-1
 		flag = False
 		# Find the arguement and set the value
-		for i in range(file_len):
-			if lines[i][0] != '#':
-				if lines[i].split('=')[0].strip() == name:
-					lines[i] = '%s = %s\n' % (name, value)
-					flag = True
+		for i, line in enumerate(lines):
+			stripped = line.strip()
+			if not stripped or stripped.startswith('#') or '=' not in line:
+				continue
+			if line.split('=', 1)[0].strip() == name:
+				lines[i] = '%s = %s\n' % (name, value)
+				flag = True
 		# If arguement does not exist, create one
 		if not flag:
 			lines.append('%s = %s\n\n' % (name, value))
