@@ -8,7 +8,9 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 
 ## 2. Test Conditions
 - Environment: daylight only, synthetic grass, configured perimeter active.
-- Hardware: PiCar-X, RPi 4B, Lidar C1 (Slamtec RPLIDAR C1), ultrasonic (HC-SR04), onboard camera, overhead camera link. _(TMF8829 dToF is on hold.)_
+- Hardware: PiCar-X, Radxa ROCK 4D, Robot HAT, ultrasonic (HC-SR04),
+  onboard camera, overhead camera link, and Slamtec RPLIDAR C1 when available.
+  _(TMF8829 dToF is on hold; C1 and camera validation are pending.)_
 - Build: release-equivalent runtime configuration.
 - Safety posture: conservative.
 
@@ -50,6 +52,19 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | VM-18 | Obstacle too close | Place obstacle <10 cm from car | Enters `FAILSAFE` with `obstacle_too_close` reason | Hard-stop executed; no collision |
 | VM-19 | Precedence audit | Inject simultaneous pursuit and hazard commands | Arbitration order maintained | No cycle violates precedence rule |
 | VM-20 | Endurance run | 20-minute mixed scenario run | Stable operation without unsafe event | No collision, no unhandled exception, deterministic recovery |
+
+### 5.1 ROCK 4D platform bring-up evidence (2026-07-19)
+
+| Test | Result | Evidence |
+|------|--------|----------|
+| I2C8 / Robot HAT MCU | Pass | `0x14` detected; non-root ADC transaction completed |
+| Direct GPIO | Pass | Motor direction, MCU reset, ultrasonic trigger/echo verified |
+| MCU PWM | Pass | P0/P1/P2 servos and P12/P13 motors exercised |
+| Motor backend | Pass | Elevated-wheel forward, reverse, stop, and emergency stop completed |
+| Runtime service | Pass | Real `PiCarXBackend` service started and stopped cleanly |
+| Power stability | Pass (bench) | Dual-rail test completed without ROCK reset |
+| MIPI camera | Pending | Camera hardware/software bring-up not yet run |
+| RPLidar C1 | Pending | Hardware not yet available |
 
 ## 6. Quantitative Thresholds
 - Stage transition reaction target: <= 250 ms unless timeout-governed.

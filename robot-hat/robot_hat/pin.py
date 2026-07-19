@@ -1,7 +1,97 @@
 #!/usr/bin/env python3
+import os
+
 from .basic import _Basic_class
-import gpiozero  # https://gpiozero.readthedocs.io/en/latest/installing.html
-from gpiozero import OutputDevice, InputDevice, Button
+
+_GPIO_BACKEND = os.environ.get(
+    "ROBOT_HAT_GPIO_BACKEND", "gpiozero"
+).strip().lower()
+
+if _GPIO_BACKEND == "rock4d":
+    import gpiod
+elif _GPIO_BACKEND == "gpiozero":
+    import gpiozero  # https://gpiozero.readthedocs.io/en/latest/installing.html
+    from gpiozero import OutputDevice, InputDevice, Button
+else:
+    raise ValueError(
+        "ROBOT_HAT_GPIO_BACKEND must be either 'gpiozero' or 'rock4d'"
+    )
+
+
+# Raspberry Pi BCM number -> ROCK 4D gpiochip and line offset. The mappings
+# follow the common 40-pin header's physical pin positions.
+_ROCK4D_GPIO_MAP = {
+    4: (1, 19),   # physical pin 7
+    5: (3, 2),    # physical pin 29, Robot HAT MCU reset
+    6: (1, 17),   # physical pin 31
+    8: (1, 15),   # physical pin 24
+    12: (1, 29),  # physical pin 32
+    13: (1, 18),  # physical pin 33
+    16: (1, 28),  # physical pin 36
+    17: (1, 20),  # physical pin 11
+    19: (1, 26),  # physical pin 35
+    20: (1, 27),  # physical pin 38
+    21: (1, 24),  # physical pin 40
+    22: (1, 21),  # physical pin 15, ultrasonic echo
+    23: (2, 14),  # physical pin 16, left motor direction
+    24: (2, 15),  # physical pin 18, right motor direction
+    25: (2, 31),  # physical pin 22
+    26: (3, 3),   # physical pin 37
+    27: (2, 16),  # physical pin 13, ultrasonic trigger
+}
+
+
+class _Rock4dDevice:
+    """Small gpiozero-compatible wrapper around libgpiod v1."""
+
+    def __init__(self, pin, output, pull=None, active_state=None):
+        if pin not in _ROCK4D_GPIO_MAP:
+            raise ValueError(f"BCM GPIO {pin} has no ROCK 4D mapping")
+
+        chip_num, offset = _ROCK4D_GPIO_MAP[pin]
+        self.pin = pin
+        self._active_high = active_state is not False
+        self._chip = gpiod.Chip(f"gpiochip{chip_num}")
+        self._line = self._chip.get_line(offset)
+
+        if output:
+            self._line.request(
+                consumer="robot_hat",
+                type=gpiod.LINE_REQ_DIR_OUT,
+                default_vals=[0],
+            )
+        else:
+            flags = 0
+            if pull == Pin.PULL_UP:
+                flags = getattr(gpiod, "LINE_REQ_FLAG_BIAS_PULL_UP", 0)
+            elif pull == Pin.PULL_DOWN:
+                flags = getattr(gpiod, "LINE_REQ_FLAG_BIAS_PULL_DOWN", 0)
+            elif pull is None:
+                flags = getattr(gpiod, "LINE_REQ_FLAG_BIAS_DISABLE", 0)
+            self._line.request(
+                consumer="robot_hat",
+                type=gpiod.LINE_REQ_DIR_IN,
+                flags=flags,
+            )
+
+    @property
+    def value(self):
+        raw = self._line.get_value()
+        return raw if self._active_high else 1 - raw
+
+    def on(self):
+        self._line.set_value(1 if self._active_high else 0)
+
+    def off(self):
+        self._line.set_value(0 if self._active_high else 1)
+
+    def close(self):
+        if self._line is not None:
+            self._line.release()
+            self._line = None
+        if self._chip is not None:
+            self._chip.close()
+            self._chip = None
 
 
 class Pin(_Basic_class):
@@ -101,7 +191,8 @@ class Pin(_Basic_class):
 
     def deinit(self):
         self.gpio.close()
-        self.gpio.pin_factory.close()
+        if _GPIO_BACKEND == "gpiozero":
+            self.gpio.pin_factory.close()
 
     def setup(self, mode, pull=None, active_state=None):
         """
@@ -130,7 +221,14 @@ class Pin(_Basic_class):
             if self.gpio.pin != None:
                 self.gpio.close()
         #
-        if mode in [None, self.OUT]:
+        if _GPIO_BACKEND == "rock4d":
+            self.gpio = _Rock4dDevice(
+                self._pin_num,
+                output=mode in [None, self.OUT],
+                pull=pull,
+                active_state=active_state,
+            )
+        elif mode in [None, self.OUT]:
             self.gpio = OutputDevice(self._pin_num)
         else:
             if pull == self.PULL_UP:
@@ -242,6 +340,11 @@ class Pin(_Basic_class):
         :param bouncetime: interrupt bouncetime in miliseconds
         :type bouncetime: int
         """
+        if _GPIO_BACKEND == "rock4d":
+            raise NotImplementedError(
+                "GPIO edge callbacks are not implemented for the ROCK 4D backend"
+            )
+
         # check trigger
         if trigger not in [
                 self.IRQ_FALLING, self.IRQ_RISING, self.IRQ_RISING_FALLING

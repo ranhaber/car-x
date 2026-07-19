@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+
 from .basic import _Basic_class
 from .utils import run_command
 from smbus2 import SMBus
@@ -28,16 +30,21 @@ class I2C(_Basic_class):
 
     # i2c_lock = multiprocessing.Value('i', 0)
 
-    def __init__(self, address=None, bus=1, *args, **kwargs):
+    def __init__(self, address=None, bus=None, *args, **kwargs):
         """
         Initialize the I2C bus
 
         :param address: I2C device address
         :type address: int
-        :param bus: I2C bus number
-        :type bus: int
+        :param bus: I2C bus number. If omitted, use ROBOT_HAT_I2C_BUS or 1.
+        :type bus: int or None
         """
         super().__init__(*args, **kwargs)
+        if bus is None:
+            try:
+                bus = int(os.environ.get("ROBOT_HAT_I2C_BUS", "1"))
+            except ValueError as exc:
+                raise ValueError("ROBOT_HAT_I2C_BUS must be an integer") from exc
         self._bus = bus
         self._smbus = SMBus(self._bus)
         if isinstance(address, list):
