@@ -162,6 +162,47 @@ picarx_dir_motor = [1, 1]
 Using `[1, -1]` would double-invert the right motor when driving through
 `Picarx.forward()` or `PiCarXBackend`.
 
+### 4.6 Validated deployment
+
+The live ROCK 4D deployment uses:
+
+| Item | Path / value |
+|------|--------------|
+| Application source | `/opt/car-x` |
+| Python environment | `/opt/car-x/venv` |
+| Hardware environment | `/etc/car-x/car-x.env` |
+| PiCar-X calibration | `/opt/picar-x/picar-x.conf` |
+| systemd unit | `/etc/systemd/system/cat-follow.service` |
+| GPIO permissions | `/etc/udev/rules.d/99-rock4d-gpio.rules` |
+
+The environment file sets:
+
+```text
+ROBOT_HAT_GPIO_BACKEND=rock4d
+ROBOT_HAT_I2C_BUS=8
+PYTHONPATH=/opt/car-x
+PYTHONUNBUFFERED=1
+```
+
+The persisted hardware calibration is:
+
+```text
+picarx_dir_motor = [1, 1]
+picarx_dir_servo = -6
+picarx_cam_pan_servo = 8
+picarx_cam_tilt_servo = -3
+```
+
+The service was successfully started with the real `PiCarXBackend`, observed
+active, and stopped cleanly. It remains deliberately **disabled** until camera
+and floor-drive validation are complete:
+
+```bash
+sudo systemctl start cat-follow.service
+sudo systemctl status cat-follow.service
+sudo systemctl stop cat-follow.service
+```
+
 ## 5. ROS 2 navigation stack
 
 ### 5.1 Packages
@@ -295,7 +336,7 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 ## 9. Software milestones
 
 ### M4a — Platform bring-up
-- [ ] Armbian Ubuntu 24.04 vendor image flashed.
+- [x] Armbian Ubuntu 24.04 vendor image flashed.
 - [x] I2C MCU `0x14` detected.
 - [x] `robot_hat` port: GPIO + I2C verified with motors disconnected.
 - [x] `picarx` and `PiCarXBackend` forward/stop on elevated bench.

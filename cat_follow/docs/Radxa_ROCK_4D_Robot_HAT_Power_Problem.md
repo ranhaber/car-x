@@ -60,9 +60,16 @@ should be included in this power budget.
 
 ## Status
 
+- The working arrangement powers the ROCK 4D from USB-C and the Robot HAT
+  from its battery, with common ground and no HAT 5 V feed into ROCK header
+  pins 2 or 4.
+- HAT-only power through the 40-pin header is rejected for this installation:
+  the ROCK 4D repeatedly failed to finish boot, consistent with a brownout.
 - I2C bus 8 is enabled on the ROCK 4D using the `rk3576-i2c8-m1` overlay.
 - `/dev/i2c-8` is present.
 - A scan with the HAT unpowered correctly showed no devices.
 - With both boards powered correctly, the Robot HAT MCU is detected at `0x14`.
 - A non-root Python `smbus2` transaction on bus 8 successfully read the HAT's
   battery ADC, confirming bidirectional I2C communication.
+- Servo, ultrasonic, individual motor, simultaneous motor, and
+  `PiCarXBackend` tests completed without a ROCK 4D reset.

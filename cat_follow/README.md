@@ -32,6 +32,39 @@ set_cat_location(100, 50)   # state -> GOTO_TARGET then SEARCH
 
 Ctrl+C stops the loop.
 
+## ROCK 4D hardware deployment
+
+The validated ROCK 4D installation uses:
+
+- application: `/opt/car-x`
+- virtual environment: `/opt/car-x/venv`
+- runtime environment: `/etc/car-x/car-x.env`
+- calibration: `/opt/picar-x/picar-x.conf`
+- service: `/etc/systemd/system/cat-follow.service`
+
+Run the real-hardware contract runtime manually:
+
+```bash
+cd /opt/car-x
+set -a
+. /etc/car-x/car-x.env
+set +a
+/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx
+```
+
+The systemd unit is installed but intentionally disabled until camera and
+floor-drive testing are complete. Start and stop it explicitly:
+
+```bash
+sudo systemctl start cat-follow.service
+sudo systemctl status cat-follow.service
+sudo systemctl stop cat-follow.service
+```
+
+See `docs/Hardware_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`,
+`docs/Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`, and
+`docs/Radxa_ROCK_4D_Robot_HAT_Power_Problem.md`.
+
 ## Calibration (save and load)
 
 - **Web UI → Calibration tab:** Run speed/steer tests (Start/Stop), measure distance or radius, enter values in the table/fields, then click **Save calibration** to write to disk.
@@ -51,7 +84,7 @@ Or install pytest and run: `python -m pytest tests/ -v`
 
 ## Next steps
 
-1. **Run on hardware** — Test on Pi with real Picar-X, camera, and ultrasonic; tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
+1. **Complete ROCK 4D validation** — Bring up the MIPI camera, run floor-drive and thermal tests, and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
 2. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
 3. **Optional** — Add tests for `vision.get_cat_bbox()` with a fixture image; extend calibration UI if you add more steering/speed parameters.
 

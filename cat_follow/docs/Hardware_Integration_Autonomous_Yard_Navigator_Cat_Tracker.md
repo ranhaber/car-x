@@ -3,7 +3,7 @@
 **Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis  
 **Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic  
 **Version:** 1.0  
-**Status:** Integration baseline (pre-bring-up)
+**Status:** ROCK 4D bring-up validated; camera, lidar, grayscale, and thermal tests pending
 
 ## 1. Purpose
 This document defines how PiCar-X hardware connects to the Radxa ROCK 4D for
@@ -127,9 +127,9 @@ ROS 2 + lidar + camera is **more sensitive**.
 
 | Strategy | When | Wiring |
 |----------|------|--------|
-| **A — Bench bring-up** | GPIO/I2C/motor tests | Wall **5 V / 4 A** USB-C → ROCK 4D; battery → HAT for motors only |
-| **B — Dual rail (recommended)** | Autonomous runs | Battery → HAT (motors/servos); **separate 5 V / 3 A+ buck** → ROCK USB-C |
-| **C — HAT 5 V only** | Minimal tests | Stack HAT on ROCK; monitor `dmesg` for undervoltage; no Nav2 + lidar peaks |
+| **A — Bench bring-up (validated)** | GPIO/I2C/motor tests | Wall **5 V / 4 A** USB-C → ROCK 4D; battery → HAT for motors only; isolate header pins 2 & 4 |
+| **B — Dual rail (recommended)** | Autonomous runs | Battery → HAT (motors/servos); **separate 5 V / 3 A+ buck** → ROCK USB-C; common ground |
+| **C — HAT 5 V only (rejected)** | Do not use on this build | ROCK failed to finish boot; observed behavior is consistent with brownout |
 
 If ROCK 4D board revision is **v1.12+**, the dedicated external 5 V input
 may be used instead of USB-C ([Radxa power header](https://docs.radxa.com/en/rock4/rock4d/hardware-use/power_header)).
@@ -181,19 +181,19 @@ Best long-term if power and GPIO port succeed.
 ## 8. Hardware bring-up checklist
 
 ### Phase H1 — Power and I2C
-- [ ] Flash OS (see Software Integration doc).
-- [ ] Enable I2C on header pins 3 & 5 (device-tree overlay).
-- [ ] `i2cdetect` shows MCU at **0x14**.
-- [ ] Pulse MCURST (phys pin 29); MCU re-enumerates.
+- [x] Flash Armbian Ubuntu 24.04 (see Software Integration doc).
+- [x] Enable I2C8_M1 on header pins 3 & 5.
+- [x] `i2cdetect -y 8` shows MCU at **0x14**.
+- [x] Pulse MCURST (phys pin 29); MCU re-enumerates.
 
 ### Phase H2 — GPIO
-- [ ] Configure D2, D3, D4, D5, MCURST as libgpiod lines.
-- [ ] Ultrasonic returns plausible distance.
-- [ ] Motor direction pins toggle (wheels off ground).
+- [x] Configure D2, D3, D4, D5, MCURST as libgpiod lines.
+- [x] Ultrasonic returns a plausible distance.
+- [x] Motor direction pins toggle (wheels off ground).
 
 ### Phase H3 — PWM via MCU
-- [ ] Servo P0/P1/P2 respond (pan, tilt, steer).
-- [ ] Motor PWM P12/P13 spin wheels at low speed.
+- [x] Servo P0/P1/P2 respond (pan, tilt, steer).
+- [x] Motor PWM P12/P13 spin wheels at low speed.
 
 ### Phase H4 — Sensors
 - [ ] C1 publishes scan on USB.
@@ -201,8 +201,18 @@ Best long-term if power and GPIO port succeed.
 - [ ] Grayscale A0–A2 read (if used).
 
 ### Phase H5 — Integrated drive
-- [ ] Combined motor + servo + I2C under battery load without brownout.
+- [x] Combined motor + servo + I2C bench test under dual-rail power without brownout.
 - [ ] Thermal: heatsink/fan on ROCK 4D; monitor throttle.
+
+### Verified calibration
+| Setting | Value |
+|---------|-------|
+| Motor direction | `[1, 1]` |
+| Steering center | `-6°` |
+| Camera pan center | `+8°` |
+| Camera tilt center | `-3°` |
+
+The values are stored in `/opt/picar-x/picar-x.conf`.
 
 ## 9. Mechanical and safety
 - Secure ROCK 4D stack; vibration affects lidar mount and USB connectors.
