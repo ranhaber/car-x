@@ -18,6 +18,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import pytest
+import cat_follow.threads.camera as camera_module
+import cat_follow.threads.detector as detector_module
 from cat_follow.memory.pool import allocate_pool, FRAME_SHAPE
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.threads.camera import run_camera_loop
@@ -26,6 +29,13 @@ from cat_follow.threads.detector import run_detector_loop
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _force_deterministic_stubs(monkeypatch):
+    """Keep integration tests independent of host camera/model availability."""
+    monkeypatch.setattr(camera_module, "_HAS_CV2", False)
+    monkeypatch.setattr(detector_module, "make_interpreter", lambda _: None)
+
 
 def _run_threads_for(seconds: float = 1.0):
     """Start all three stub threads, run for *seconds*, stop, return shared."""
@@ -44,6 +54,7 @@ def _run_threads_for(seconds: float = 1.0):
         ),
         threading.Thread(
             target=run_detector_loop, args=(shared, stop),
+            kwargs={"target_fps": 1.0},
             name="detector-stub", daemon=True,
         ),
     ]
@@ -121,6 +132,7 @@ def test_copy_latest_to_detector_during_run():
         ),
         threading.Thread(
             target=run_detector_loop, args=(shared, stop),
+            kwargs={"target_fps": 1.0},
             name="detector-stub", daemon=True,
         ),
     ]
@@ -163,6 +175,7 @@ def test_no_exceptions_during_run():
         ),
         threading.Thread(
             target=run_detector_loop, args=(shared, stop),
+            kwargs={"target_fps": 1.0},
             name="detector-stub", daemon=True,
         ),
     ]
