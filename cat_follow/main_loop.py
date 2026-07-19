@@ -41,6 +41,11 @@ from cat_follow.web_ui.app import create_app, set_tracker_fps
 
 log = get_logger("main_loop")
 
+# Main loop tunables
+LOST_THRESHOLD = 15          # frames without bbox before CAT_LOST
+DETECT_EVERY_K = 10          # run detector every K frames
+APPROACH_TRACK_MARGIN_CM = 5.0  # transition APPROACH -> TRACK when distance <= target_cm + this
+
 # Suppress noisy Flask/werkzeug access logs (they still go to the file)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
@@ -54,21 +59,8 @@ def main():
     location.reset(0, 0, 0)
     from picarx import Picarx
     px = Picarx()
-    # Let Picarx __init__ finish (reset_mcu + servo.angle); reduces jerk before we take over.
-    time.sleep(0.4)
     motion_driver.set_car(px)
     range_sensor.set_car(px)
-    motion_driver.stop()
-    time.sleep(0.15)
-    motion_driver.set_steer(0)
-    # Optional: force steering calibration to 0 so angle is consistent between app restarts.
-    # Set env CAT_FOLLOW_STEER_CALIB_0=1 to enable (writes /opt/picar-x config).
-    if os.environ.get("CAT_FOLLOW_STEER_CALIB_0", "").strip() in ("1", "true", "yes"):
-        try:
-            px.dir_servo_calibrate(0)
-            log.info("Steering calibration forced to 0 for consistent restarts.")
-        except Exception as e:
-            log.warning("Could not set steering calibration: %s", e)
     log.info("Calibration loaded. State machine ready.")
 
     # ------------------------------------------------------------------
@@ -123,16 +115,14 @@ def main():
     image_width, image_height = CALIBRATION_IMAGE_SIZE
     tick_sec = 1.0 / 30.0
     lost_count = 0
-    lost_threshold = 15
     frame_count = 0
-    detect_every_k = 10
     tracker_fps_counter = 0
     tracker_fps_timer = time.monotonic()
     prev_state = sm.state
     search_start_time = 0.0  # set when entering GOTO_TARGET, SEARCH, or LOST_SEARCH
     search_prev_heading = None  # for full-circle accumulated turn
     search_accumulated_deg = 0.0
-    obstacle_arc_start_time = 0.0  # when ultrasonic < 15 cm we arc until clear
+    obstacle_arc_start_time = 0.0  # when ultrasonic < target_cm we arc until clear
 
     def on_cat_location(x: float, y: float):
         sm.dispatch(Event.CAT_LOCATION_RECEIVED, (x, y))
@@ -154,7 +144,7 @@ def main():
 
             # Copy frame to detector every K frames
             frame_count += 1
-            if frame_count % detect_every_k == 0:
+            if frame_count % DETECT_EVERY_K == 0:
                 shared.copy_latest_to_detector_frame()
 
             # Read bbox from shared state (from tracker thread)
@@ -175,7 +165,7 @@ def main():
             )
 
             if obstacle_close:
-                # Stop and arc around: something is closer than 15 cm
+                # Stop and arc around: something closer than target_cm
                 if obstacle_arc_start_time <= 0:
                     log.info("Obstacle detected! Distance: %.1f cm", ultrasonic_cm)
                     obstacle_arc_start_time = time.monotonic()
@@ -253,11 +243,11 @@ def main():
                         )
                         # Only transition to TRACK when ultrasonic distance <= target (no bbox fallback)
                         if state == State.APPROACH:
-                            if ultrasonic_cm is not None and ultrasonic_cm <= target_cm + 5.0:
+                            if ultrasonic_cm is not None and ultrasonic_cm <= target_cm + APPROACH_TRACK_MARGIN_CM:
                                 sm.dispatch(Event.DISTANCE_AT_15CM)
                     else:
                         lost_count += 1
-                        if lost_count >= lost_threshold:
+                        if lost_count >= LOST_THRESHOLD:
                             sm.dispatch(Event.CAT_LOST)
                             motion_driver.stop()
 

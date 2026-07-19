@@ -1,6 +1,11 @@
 """
 Functions to physically run the car for calibration measurements.
 These are called by the web UI and command-line scripts.
+
+When picarx is not installed (e.g. on a PC), a mock Picarx is used so that
+scripts or tests can import and call run_speed_test/run_steer_test without hardware.
+main_loop imports picarx directly and will fail on PC; use this module for
+standalone calibration scripts.
 """
 import time
 

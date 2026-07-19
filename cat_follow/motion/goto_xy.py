@@ -8,6 +8,46 @@ from typing import Tuple
 
 from . import limits
 
+ARRIVAL_THRESHOLD_CM = 10.0
+GOTO_ARRIVAL_CM = ARRIVAL_THRESHOLD_CM
+KP = 1.0
+CRUISE_SPEED = 30
+SLOW_SPEED = 20
+SLOW_ERROR_DEG = 20.0
+
+
+def compute_bearing_deg(
+    current_x: float,
+    current_y: float,
+    target_x: float,
+    target_y: float,
+) -> float:
+    """Return the bearing from the current point to the target in degrees."""
+    return math.degrees(math.atan2(target_y - current_y, target_x - current_x))
+
+
+def normalize_angle(angle_deg: float) -> float:
+    """Normalize an angle to the inclusive-low range [-180, 180)."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def compute_heading_error(
+    desired_heading: float,
+    current_heading: float,
+) -> float:
+    """Return the shortest signed turn from current to desired heading."""
+    return normalize_angle(desired_heading - current_heading)
+
+
+def compute_distance(
+    current_x: float,
+    current_y: float,
+    target_x: float,
+    target_y: float,
+) -> float:
+    """Return Euclidean distance between current and target coordinates."""
+    return math.hypot(target_x - current_x, target_y - current_y)
+
 
 def compute_goto(
     current_x: float,
@@ -15,7 +55,7 @@ def compute_goto(
     current_heading: float,
     target_x: float,
     target_y: float,
-    calib
+    calib=None,
 ) -> Tuple[float, float, bool]:
     """
     Calculate steering and speed to drive toward target.
@@ -32,31 +72,27 @@ def compute_goto(
         speed: motor speed value (0-100).
         arrived: True if within threshold distance.
     """
-    dx = target_x - current_x
-    dy = target_y - current_y
-    dist = math.sqrt(dx * dx + dy * dy)
+    dist = compute_distance(current_x, current_y, target_x, target_y)
 
-    # Arrival threshold (e.g. 10 cm)
-    if dist < 10.0:
+    if dist < ARRIVAL_THRESHOLD_CM:
         return 0.0, 0.0, True
 
-    # Calculate desired heading
-    desired_heading = math.degrees(math.atan2(dy, dx))
+    desired_heading = compute_bearing_deg(
+        current_x,
+        current_y,
+        target_x,
+        target_y,
+    )
+    error = compute_heading_error(desired_heading, current_heading)
 
-    # Calculate heading error (shortest path)
-    error = desired_heading - current_heading
-    while error > 180: error -= 360
-    while error < -180: error += 360
-
-    steer = limits.clamp_steer(error, calib)
+    steer = limits.clamp_steer(error * KP, calib)
 
     # Speed control: slow down if turning sharply or close to target
-    base_speed = 30
-    if abs(error) > 20:
-        speed = 20
+    if abs(error) > SLOW_ERROR_DEG:
+        speed = SLOW_SPEED
     elif dist < 20:
-        speed = 20
+        speed = SLOW_SPEED
     else:
-        speed = base_speed
+        speed = CRUISE_SPEED
 
     return steer, limits.clamp_speed(speed), False

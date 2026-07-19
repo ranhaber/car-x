@@ -52,6 +52,15 @@
     .btn-save:hover { background: #1a5276; }
     .btn-add { background: #1e4620; color: #6bdb6b; font-size: 0.85rem; padding: 6px 12px; }
     .btn-add:hover { background: #2a6b2e; }
+    .btn-start { background: #0f3460; color: #e0e0e0; font-size: 0.85rem; padding: 8px 16px; }
+    .btn-start:hover { background: #1a5276; }
+    .btn-stop { background: #e94560; color: #fff; font-size: 0.85rem; padding: 8px 16px; }
+    .btn-stop:hover { background: #c0392b; }
+    .run-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid #0f3460; }
+    .run-row .control-group { display: flex; flex-direction: column; gap: 4px; }
+    .run-row .control-group label { font-size: 0.75rem; color: #8888aa; }
+    .run-row .control-group input { width: 70px; }
+    code { font-size: 0.8em; background: #0f0f23; padding: 2px 6px; border-radius: 4px; }
     .feedback {
       margin-top: 12px; padding: 8px 12px; border-radius: 4px; font-size: 0.85rem;
     }
@@ -72,6 +81,12 @@
 </header>
 
 <main x-data="calibrationApp()" x-init="load()">
+
+  <div class="card" style="background: #0f0f23;">
+    <p class="notes" style="margin: 0;">
+      <strong>Save &amp; load:</strong> Run a test → measure distance or radius → enter values in the table/fields below → click <strong>Save calibration</strong> to write to disk. After restart, calibration is loaded from <code>cat_follow/calibration/*.json</code> and used for distance (odometry, goto) and steering.
+    </p>
+  </div>
 
   <!-- Speed–time–distance (speed → cm/s) -->
   <div class="card">
@@ -94,6 +109,19 @@
     <div class="form-row" style="margin-top: 10px;">
       <button type="button" class="btn-add" @click="addSpeedRow()">+ Add row</button>
     </div>
+    <div class="run-row">
+      <span class="notes" style="margin-right: 8px;">Run distance calibration (drive straight):</span>
+      <div class="control-group">
+        <label>Speed</label>
+        <input type="number" min="0" max="100" x-model.number="runSpeedVal" />
+      </div>
+      <div class="control-group">
+        <label>Duration (s)</label>
+        <input type="number" step="0.5" min="0.5" x-model.number="runSpeedDuration" />
+      </div>
+      <button type="button" class="btn-start" @click="runSpeedTest()">Start</button>
+      <button type="button" class="btn-stop" @click="runStop()">Stop</button>
+    </div>
   </div>
 
   <!-- Steering limits -->
@@ -111,6 +139,27 @@
     <div class="form-row">
       <label>Min radius right (cm)</label>
       <input type="number" step="0.1" min="0" x-model.number="radiusRight" />
+    </div>
+    <div class="form-row">
+      <label>Target approach distance (cm)</label>
+      <input type="number" step="1" min="5" max="50" x-model.number="targetDistanceCm" />
+    </div>
+    <div class="run-row">
+      <span class="notes" style="margin-right: 8px;">Run radius calibration (drive in circle):</span>
+      <div class="control-group">
+        <label>Angle (°)</label>
+        <input type="number" min="-40" max="40" x-model.number="runSteerAngle" />
+      </div>
+      <div class="control-group">
+        <label>Speed</label>
+        <input type="number" min="0" max="100" x-model.number="runSteerSpeed" />
+      </div>
+      <div class="control-group">
+        <label>Duration (s)</label>
+        <input type="number" step="0.5" min="0.5" x-model.number="runSteerDuration" />
+      </div>
+      <button type="button" class="btn-start" @click="runSteerTest()">Start</button>
+      <button type="button" class="btn-stop" @click="runStop()">Stop</button>
     </div>
   </div>
 
@@ -130,9 +179,14 @@ function calibrationApp() {
     maxSteer: 30,
     radiusLeft: 40,
     radiusRight: 40,
-    bboxDist: {},
+    targetDistanceCm: 15,
     feedback: '',
     feedbackOk: true,
+    runSpeedVal: 30,
+    runSpeedDuration: 1.0,
+    runSteerAngle: 15,
+    runSteerSpeed: 30,
+    runSteerDuration: 4.0,
 
     load() {
       fetch('/api/calibration')
@@ -149,7 +203,7 @@ function calibrationApp() {
           } else if (typeof radii === 'number') {
             this.radiusLeft = this.radiusRight = parseFloat(radii);
           }
-          this.bboxDist = data.bbox_dist && typeof data.bbox_dist === 'object' ? { ...data.bbox_dist } : {};
+          this.targetDistanceCm = parseFloat(data.steering?.target_distance_cm ?? 15);
         })
         .catch(() => { this.feedback = 'Could not load calibration'; this.feedbackOk = false; });
     },
@@ -174,9 +228,9 @@ function calibrationApp() {
         steering: {
           max_steer_angle_deg: Number(this.maxSteer),
           min_turn_radius_cm: { left: Number(this.radiusLeft), right: Number(this.radiusRight) },
+          target_distance_cm: Number(this.targetDistanceCm),
           notes: 'Do not exceed max_steer to avoid servo strain.'
-        },
-        bbox_dist: this.bboxDist
+        }
       };
       fetch('/api/calibration', {
         method: 'POST',
@@ -194,6 +248,69 @@ function calibrationApp() {
           }
         })
         .catch(() => { this.feedback = 'Network error'; this.feedbackOk = false; });
+    },
+
+    async runSpeedTest() {
+      try {
+        const res = await fetch('/api/calibrate/run_speed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ speed: this.runSpeedVal, duration: this.runSpeedDuration })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          this.feedback = data.message || 'Speed test started.';
+          this.feedbackOk = true;
+        } else {
+          this.feedback = data.error || 'Failed to start speed test';
+          this.feedbackOk = false;
+        }
+      } catch (e) {
+        this.feedback = 'Network error';
+        this.feedbackOk = false;
+      }
+    },
+
+    async runSteerTest() {
+      try {
+        const res = await fetch('/api/calibrate/run_steer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            angle: this.runSteerAngle,
+            speed: this.runSteerSpeed,
+            duration: this.runSteerDuration
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          this.feedback = data.message || 'Steer test started.';
+          this.feedbackOk = true;
+        } else {
+          this.feedback = data.error || 'Failed to start steer test';
+          this.feedbackOk = false;
+        }
+      } catch (e) {
+        this.feedback = 'Network error';
+        this.feedbackOk = false;
+      }
+    },
+
+    async runStop() {
+      try {
+        const res = await fetch('/api/stop', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          this.feedback = 'Stop sent. Car should stop.';
+          this.feedbackOk = true;
+        } else {
+          this.feedback = data.error || 'Stop failed';
+          this.feedbackOk = false;
+        }
+      } catch (e) {
+        this.feedback = 'Network error';
+        this.feedbackOk = false;
+      }
     }
   };
 }

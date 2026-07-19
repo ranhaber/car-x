@@ -7,13 +7,17 @@ px.get_distance(). When no car (stub) or invalid read, returns None.
 Read interval: we throttle to MIN_READ_INTERVAL_SEC (60 ms) between hardware
 pings to avoid interference (HC-SR04 typically needs ~60 ms between readings).
 Within that interval we return the last cached value.
+
+Thread-safe: main loop writes, status API reads; all access to cache is under _lock.
 """
 
+import threading
 import time
 from typing import Optional
 
 # Same car instance as motion.driver when on hardware
 _car = None
+_lock = threading.Lock()
 _last_distance_cm: Optional[float] = None
 _last_read_time: float = 0.0
 
@@ -38,31 +42,35 @@ def get_distance_cm() -> Optional[float]:
     """
     global _last_distance_cm, _last_read_time
     now = time.monotonic()
-    if _car is not None and (now - _last_read_time) < MIN_READ_INTERVAL_SEC and _last_distance_cm is not None:
-        return _last_distance_cm
-    if _car is None:
-        _last_distance_cm = None
-        return None
+    with _lock:
+        if _car is not None and (now - _last_read_time) < MIN_READ_INTERVAL_SEC and _last_distance_cm is not None:
+            return _last_distance_cm
+        if _car is None:
+            _last_distance_cm = None
+            return None
     try:
         d = _car.get_distance()
     except Exception:
-        _last_distance_cm = None
+        with _lock:
+            _last_distance_cm = None
+            _last_read_time = now
+        return None
+    with _lock:
         _last_read_time = now
-        return None
-    _last_read_time = now
-    if d is None or not isinstance(d, (int, float)):
-        _last_distance_cm = None
-        return None
-    if d < 0:
-        _last_distance_cm = None
-        return None  # timeout/error
-    if d < MIN_CM or d > MAX_CM:
-        _last_distance_cm = None
-        return None  # out of range
-    _last_distance_cm = float(d)
-    return _last_distance_cm
+        if d is None or not isinstance(d, (int, float)):
+            _last_distance_cm = None
+            return None
+        if d < 0:
+            _last_distance_cm = None
+            return None  # timeout/error
+        if d < MIN_CM or d > MAX_CM:
+            _last_distance_cm = None
+            return None  # out of range
+        _last_distance_cm = float(d)
+        return _last_distance_cm
 
 
 def get_last_distance_cm() -> Optional[float]:
-    """Last valid distance (cm) from ultrasonic, for display. No hardware read."""
-    return _last_distance_cm
+    """Last valid distance (cm) from ultrasonic, for display. No hardware read. Thread-safe."""
+    with _lock:
+        return _last_distance_cm
