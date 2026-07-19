@@ -4,5 +4,6 @@
     "left": 40.0,
     "right": 40.0
   },
-  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle."
+  "target_distance_cm": 15,
+  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle. target_distance_cm = closest approach distance (cm) for obstacle/approach logic."
 }

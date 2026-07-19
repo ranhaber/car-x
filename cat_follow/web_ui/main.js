@@ -60,7 +60,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Calibration Tab Logic ---
     const speedJsonText = document.getElementById('speed-json');
     const steeringJsonText = document.getElementById('steering-json');
-    const bboxJsonText = document.getElementById('bbox-json');
     const saveStatus = document.getElementById('save-status');
 
     const loadCalibration = () => {
@@ -69,7 +68,6 @@ document.addEventListener('DOMContentLoaded', () => {
             .then(data => {
                 speedJsonText.value = JSON.stringify(data.speed || {}, null, 2);
                 steeringJsonText.value = JSON.stringify(data.steering || {}, null, 2);
-                bboxJsonText.value = JSON.stringify(data.bbox_dist || {}, null, 2);
             })
             .catch(err => {
                 saveStatus.textContent = `Error loading calibration: ${err}`;
@@ -81,12 +79,10 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const speedData = JSON.parse(speedJsonText.value);
             const steeringData = JSON.parse(steeringJsonText.value);
-            const bboxData = JSON.parse(bboxJsonText.value);
 
             const payload = {
                 speed: speedData,
                 steering: steeringData,
-                bbox_dist: bboxData,
             };
 
             saveStatus.textContent = 'Saving...';

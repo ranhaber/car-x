@@ -27,7 +27,7 @@ from cat_follow.logger import get_logger
 log = get_logger("odometry")
 
 # ---------------------------------------------------------------------------
-# State (module-level; single car)
+# State (module-level; single-threaded: only main loop calls update/get)
 # ---------------------------------------------------------------------------
 _x: float = 0.0          # cm
 _y: float = 0.0          # cm

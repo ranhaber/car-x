@@ -6,14 +6,13 @@ Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and dr
 
 - **state_machine.py** — States and events; `dispatch(event, payload)`.
 - **commands.py** — Stub: `set_cat_location(x,y)`, `set_stop_command()`; `poll_commands(on_cat_location, on_stop)`.
-- **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits, bbox–distance.
-- **motion/** — `driver` (stop, forward, backward, set_steer), `center_cat_control()`, `limits`.
-- **vision/** — Stub `get_cat_bbox()`; replace with vilib/TFLite.
-- **vision/** — Detector + tracker. Camera now writes into a small rotating
-	frame ring (pre-allocated) and tracker uses an OpenCV single-object
-	tracker with improved re-init logic (IoU, temporal confirmation).
-- **odometry.py** — Stub (x,y), heading; replace with time-based dead reckoning.
+- **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits (incl. target approach distance). Stored in `cat_follow/calibration/*.json`; loaded once at startup.
+- **motion/** — `driver`, `center_cat_control()`, `limits`, `goto_xy` (runtime goto), `search`. Runtime goto uses **motion/goto_xy.py**; **calibration/goto_xy.py** is for calibration runs only.
+- **vision/** — `get_cat_bbox(image)` uses TFLite (`tflite_common.py` + `detector.py`). Optional API for single-frame detection.
+- **threads/** — Camera, tracker (OpenCV single-object tracker, re-init via IoU), detector (TFLite loop; writes to SharedState). Camera writes into a pre-allocated frame ring; main loop copies to detector frame every K frames.
+- **odometry.py** — Bicycle-model dead reckoning (position, heading). Used via **location/** facade.
 - **main_loop.py** — Tick loop: commands → state machine → motion.
+- **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`; static assets in `web_ui/static/`.
 
 ## Run (stub mode, no hardware)
 
@@ -33,17 +32,11 @@ set_cat_location(100, 50)   # state -> GOTO_TARGET then SEARCH
 
 Ctrl+C stops the loop.
 
-## Steering at startup (PiCar-X hardware)
+## Calibration (save and load)
 
-The SunFounder `Picarx()` constructor calls `reset_mcu()` and then moves the steering servo to the value in `/opt/picar-x/picar-x.conf` (`picarx_dir_servo`). That can cause a visible jerk and, if the config or user changes, the steering angle can differ between app restarts.
-
-- The main loop waits 0.4s after creating `Picarx()`, then stops motors and sets steering to 0 twice (with a short delay) to stabilize.
-- To **force steering calibration to 0** so the angle is the same every run (and the config is written with 0), set:
-  ```bash
-  export CAT_FOLLOW_STEER_CALIB_0=1
-  python -m cat_follow.main_loop
-  ```
-  If your car’s “straight” is not 0°, run SunFounder’s steering calibration once, then leave this env var unset.
+- **Web UI → Calibration tab:** Run speed/steer tests (Start/Stop), measure distance or radius, enter values in the table/fields, then click **Save calibration** to write to disk.
+- **Storage:** `cat_follow/calibration/speed_time_distance.json`, `steering_limits.json`.
+- **On startup:** `main_loop` creates `Calibration()`, which loads these JSONs. Odometry and goto use `get_cm_per_sec(speed)`; steering uses `get_max_steer_angle_deg()` and turn radii. Saving from the Web UI also updates the in-memory calibration for the current run (no restart needed for that session).
 
 ## Tests (no pytest required)
 
@@ -58,11 +51,8 @@ Or install pytest and run: `python -m pytest tests/ -v`
 
 ## Next steps
 
-1. Wire real picar-x in `main_loop` (uncomment `set_car(Picarx())`).
-2. Implement `motion/goto_xy.py` (drive toward target using odometry + calibration).
-3. Implement `motion/search.py` (arc using steering limits).
-4. Replace `vision/detector.get_cat_bbox()` with vilib COCO (class 16 = cat).
-5. Add 30 FPS tracker in `vision/tracker.py` (OpenCV KCF/CSRT; detector every K frames).
-6. Replace odometry stub with time + speed + steer integration.
+1. **Run on hardware** — Test on Pi with real Picar-X, camera, and ultrasonic; tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
+2. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
+3. **Optional** — Add tests for `vision.get_cat_bbox()` with a fixture image; extend calibration UI if you add more steering/speed parameters.
 
 Design: see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md** and **DESIGN_CAT_FOLLOW_STATE_MACHINE.md**.

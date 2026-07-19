@@ -16,83 +16,14 @@ from typing import Optional
 
 import numpy as np
 
-try:
-    from tflite_runtime.interpreter import Interpreter as _TFLiteInterpreter
-    _HAS_TFLITE = True
-except Exception:
-    try:
-        from tensorflow.lite import Interpreter as _TFLiteInterpreter
-        _HAS_TFLITE = True
-    except Exception:
-        _HAS_TFLITE = False
-
 import cv2
 
 from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.memory.pool import FRAME_SHAPE
+from cat_follow.vision.tflite_common import make_interpreter, parse_tflite_outputs
 
 log = get_logger("thread.detector")
-
-
-def _make_interpreter(model_path: str):
-    if not _HAS_TFLITE:
-        return None
-    try:
-        interp = _TFLiteInterpreter(model_path)
-        interp.allocate_tensors()
-        return interp
-    except Exception:
-        return None
-
-
-def _parse_tflite_outputs(outputs, frame_h, frame_w, score_thresh: float = 0.5):
-    # Try common SSD-style outputs: boxes, classes, scores, num
-    # boxes: [1, N, 4] (ymin, xmin, ymax, xmax) normalized
-    if len(outputs) >= 4:
-        boxes = outputs[0]
-        scores = outputs[2]
-        if isinstance(boxes, np.ndarray):
-            boxes = np.squeeze(boxes)
-        if isinstance(scores, np.ndarray):
-            scores = np.squeeze(scores)
-        if boxes.ndim == 2 and scores.ndim == 1:
-            best_idx = int(np.argmax(scores))
-            if float(scores[best_idx]) >= score_thresh:
-                bymin, bxmin, bymax, bxmax = boxes[best_idx]
-                # normalized -> pixel coords
-                xmin = int(bxmin * frame_w)
-                ymin = int(bymin * frame_h)
-                xmax = int(bxmax * frame_w)
-                ymax = int(bymax * frame_h)
-                w = max(0, xmax - xmin)
-                h = max(0, ymax - ymin)
-                return (float(xmin), float(ymin), float(w), float(h), 1.0)
-    # Fallback: single-box output length 4
-    for out in outputs:
-        arr = np.array(out).squeeze()
-        if arr.size == 4:
-            # assume either normalized or pixel coords
-            a0, a1, a2, a3 = arr.tolist()
-            if max(arr) <= 1.01:
-                # normalized ymin,xmin,ymax,xmax
-                xmin = int(a1 * frame_w)
-                ymin = int(a0 * frame_h)
-                xmax = int(a3 * frame_w)
-                ymax = int(a2 * frame_h)
-                w = max(0, xmax - xmin)
-                h = max(0, ymax - ymin)
-                return (float(xmin), float(ymin), float(w), float(h), 1.0)
-            else:
-                # already pixels, convert to x,y,w,h
-                xmin = int(min(a0, a2))
-                ymin = int(min(a1, a3))
-                xmax = int(max(a0, a2))
-                ymax = int(max(a1, a3))
-                w = max(0, xmax - xmin)
-                h = max(0, ymax - ymin)
-                return (float(xmin), float(ymin), float(w), float(h), 1.0)
-    return (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def run_detector_loop(
@@ -129,7 +60,7 @@ def run_detector_loop(
 
     # If the caller supplied an explicit model_path, prefer that initially
     if model_path is not None:
-        interp = _make_interpreter(model_path)
+        interp = make_interpreter(model_path)
         if interp is None:
             log.warning("Failed to create TFLite interpreter for %s", model_path)
         else:
@@ -159,7 +90,7 @@ def run_detector_loop(
             # Attempt to load the interpreter for the new choice
             mp = MODEL_MAP.get(choice)
             if mp is not None:
-                new_interp = _make_interpreter(mp)
+                new_interp = make_interpreter(mp)
                 if new_interp is not None:
                     interp = new_interp
                     idet = interp.get_input_details()[0]
@@ -192,7 +123,7 @@ def run_detector_loop(
 
                 interp.invoke()
                 outputs = [interp.get_tensor(o["index"]) for o in interp.get_output_details()]
-                det = _parse_tflite_outputs(outputs, frame_h, frame_w, score_threshold)
+                det = parse_tflite_outputs(outputs, frame_h, frame_w, score_threshold)
                 shared.set_bbox_detector(det[0], det[1], det[2], det[3], det[4])
             except Exception as e:
                 log.warning("Detector inference failed: %s", e)
