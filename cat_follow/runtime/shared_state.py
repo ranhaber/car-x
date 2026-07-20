@@ -74,6 +74,7 @@ class SharedState:
         self._lock_home = threading.Lock()
         self._lock_vision = threading.Lock()
         self._lock_range = threading.Lock()
+        self._lock_lidar = threading.Lock()
         self._lock_navigation = threading.Lock()
         self._lock_system = threading.Lock()
         self._lock_fsm = threading.Lock()
@@ -86,6 +87,8 @@ class SharedState:
         # ``_range`` matches the contract group name ``range``.  It shadows
         # the Python builtin only inside this attribute scope.
         self._range: RangeState = RangeState()
+        # Lidar (C1) obstacle channel, written by the ROS bridge.
+        self._lidar: RangeState = RangeState()
         self._navigation: NavigationState = NavigationState()
         self._system: SystemState = SystemState()
         self._fsm: FSMSnapshot = FSMSnapshot()
@@ -131,6 +134,16 @@ class SharedState:
     def get_range(self) -> RangeState:
         with self._lock_range:
             return self._range
+
+    # ── lidar (ROS bridge, C1) ──────────────────────────────────────
+
+    def update_lidar_range(self, new: RangeState) -> None:
+        with self._lock_lidar:
+            self._lidar = new
+
+    def get_lidar_range(self) -> RangeState:
+        with self._lock_lidar:
+            return self._lidar
 
     # ── navigation (Navigation) ─────────────────────────────────────
 
@@ -202,6 +215,8 @@ class SharedState:
             vision = self._vision
         with self._lock_range:
             range_ = self._range
+        with self._lock_lidar:
+            lidar = self._lidar
         with self._lock_navigation:
             navigation = self._navigation
         with self._lock_system:
@@ -218,6 +233,7 @@ class SharedState:
             home=home,
             vision=vision,
             range=range_,
+            lidar=lidar,
             navigation=navigation,
             system=system,
             fsm=fsm,

@@ -40,10 +40,31 @@ class CameraConfig:
     backend: str = "default"
     fps: float = 30.0
 
+    # Optional second (lores) stream from a hardware ISP self-path. When set,
+    # the camera opens it in addition to the main stream and publishes a
+    # hardware-scaled gray frame for motion detection, so the CPU never has to
+    # downscale full frames. Empty ``lores_device`` keeps single-stream mode.
+    lores_device: str = ""
+    lores_width: int = 320
+    lores_height: int = 240
+    lores_pixel_format: str = ""
+
     @property
     def source(self) -> int | str:
         """Return numeric OpenCV indexes as integers and paths unchanged."""
         return int(self.device) if self.device.isdecimal() else self.device
+
+    @property
+    def lores_source(self) -> int | str:
+        return (
+            int(self.lores_device)
+            if self.lores_device.isdecimal()
+            else self.lores_device
+        )
+
+    @property
+    def lores_enabled(self) -> bool:
+        return bool(self.lores_device)
 
 
 def load_camera_config() -> CameraConfig:
@@ -58,9 +79,15 @@ def load_camera_config() -> CameraConfig:
     if pixel_format and len(pixel_format) != 4:
         raise ValueError(f"{_PREFIX}PIXEL_FORMAT must be a four-character code")
 
+    lores_pixel_format = os.getenv(f"{_PREFIX}LORES_PIXEL_FORMAT", "").strip().upper()
+    if lores_pixel_format and len(lores_pixel_format) != 4:
+        raise ValueError(f"{_PREFIX}LORES_PIXEL_FORMAT must be a four-character code")
+
     device = os.getenv(f"{_PREFIX}DEVICE", "0").strip()
     if not device:
         device = "0"
+
+    lores_device = os.getenv(f"{_PREFIX}LORES_DEVICE", "").strip()
 
     return CameraConfig(
         device=device,
@@ -69,4 +96,8 @@ def load_camera_config() -> CameraConfig:
         pixel_format=pixel_format,
         backend=backend,
         fps=_positive_float("FPS", 30.0),
+        lores_device=lores_device,
+        lores_width=_positive_int("LORES_WIDTH", 320),
+        lores_height=_positive_int("LORES_HEIGHT", 240),
+        lores_pixel_format=lores_pixel_format,
     )

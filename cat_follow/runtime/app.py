@@ -61,6 +61,8 @@ class App:
     prototype_perception_threads: Tuple[threading.Thread, ...] = field(
         default_factory=tuple
     )
+    ros_nav: bool = False
+    ros_bridge_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         self.logger.start()
@@ -70,11 +72,33 @@ class App:
             self.vision_adapter.start()
         if self.range_adapter is not None:
             self.range_adapter.start()
+        if self.ros_nav:
+            self._start_ros_bridge()
         self.control_loop.start()
         if self.udp_receiver is not None:
             self.udp_receiver.start()
 
+    def _start_ros_bridge(self) -> None:
+        try:
+            from cat_follow.navigation.ros_bridge import spin_in_thread
+
+            self.ros_bridge_thread = spin_in_thread(self.shared_state)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"warning: --ros-nav requested but the ROS bridge could not "
+                f"start ({exc!r}); navigation constraints will be inactive\n"
+            )
+
     def stop(self, timeout: float = 2.0) -> None:
+        if self.ros_nav:
+            try:
+                from cat_follow.navigation.ros_bridge import request_shutdown
+
+                request_shutdown()
+                if self.ros_bridge_thread is not None:
+                    self.ros_bridge_thread.join(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                pass
         if self.udp_receiver is not None:
             self.udp_receiver.stop(timeout=timeout)
         self.control_loop.stop(timeout=timeout)
@@ -110,6 +134,7 @@ def build_app(
     range_read_distance: Optional[Callable[[], Optional[float]]] = None,
     prototype_perception_threads: Tuple[threading.Thread, ...] = (),
     prototype_perception_stop_event: Optional[threading.Event] = None,
+    ros_nav: bool = False,
 ) -> App:
     """Construct the runtime stack without starting any threads.
 
@@ -226,6 +251,7 @@ def build_app(
         range_adapter=range_adapter,
         prototype_perception_threads=prototype_perception_threads,
         prototype_perception_stop_event=prototype_perception_stop_event,
+        ros_nav=ros_nav,
     )
 
 
@@ -416,6 +442,15 @@ def main(argv: Optional[list] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--ros-nav",
+        action="store_true",
+        help=(
+            "Start the ROS 2 navigation bridge (rclpy) on a background thread, "
+            "feeding NavigationState + lidar RangeState from /scan, /odom and "
+            "Nav2 /cmd_vel into the DecisionEngine.  Requires ROS 2 Jazzy."
+        ),
+    )
+    parser.add_argument(
         "--udp-listen-host",
         type=str,
         default=None,
@@ -468,6 +503,7 @@ def main(argv: Optional[list] = None) -> int:
         "udp_listen_port": args.udp_listen_port,
         "udp_target_host": args.udp_target_host,
         "udp_target_port": args.udp_target_port,
+        "ros_nav": args.ros_nav,
     }
     if proto is not None:
         app_kwargs.update(

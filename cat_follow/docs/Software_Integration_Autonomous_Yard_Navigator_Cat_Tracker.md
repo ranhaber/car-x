@@ -3,7 +3,7 @@
 **Compute target:** Radxa ROCK 4D (primary)  
 **Navigation:** ROS 2 Jazzy hybrid (Nav2 + slam_toolbox) + `cat_follow` runtime  
 **Version:** 1.0  
-**Status:** Integration baseline (pre-implementation)
+**Status:** ROS 2 stack deployed; C1 hardware validation pending
 
 ## 1. Purpose
 This document defines how software components integrate on the ROCK 4D:
@@ -79,15 +79,37 @@ sudo install -m 0644 cat_follow/scripts/99-rock4d-gpio.rules \
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=gpio
 
-# ROS 2 Jazzy (follow official Ubuntu 24.04 debs guide)
-sudo apt install -y ros-jazzy-ros-base ros-jazzy-sllidar-ros2 \
-  ros-jazzy-slam-toolbox ros-jazzy-nav2-bringup
+# ROS 2 Jazzy (after adding the official Ubuntu 24.04 ROS repository)
+sudo apt install -y ros-jazzy-ros-base ros-jazzy-slam-toolbox \
+  ros-jazzy-nav2-bringup ros-dev-tools
+
+# Jazzy ARM64 does not publish ros-jazzy-sllidar-ros2; build the official
+# Slamtec driver from source.
+source /opt/ros/jazzy/setup.bash
+mkdir -p ~/ros2_ws/src
+git clone --depth 1 https://github.com/Slamtec/sllidar_ros2.git \
+  ~/ros2_ws/src/sllidar_ros2
+sudo rosdep init                    # omit if already initialized
+rosdep update
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --packages-select sllidar_ros2
+source ~/ros2_ws/install/setup.bash
 
 # Optional: disable WiFi power save (DDS stability)
 # /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf → wifi.powersave = 2
 ```
 
-### 3.5 NPU / RKNN (later milestone)
+### 3.5 Deployment progress (2026-07-20)
+- [x] ROS 2 Jazzy `ros-base` installed on ROCK 4D.
+- [x] `slam_toolbox` and Nav2 bringup installed.
+- [x] Official `sllidar_ros2` built successfully in `~/ros2_ws`.
+- [x] ROS and workspace setup added to the `picarx` user's `.bashrc`.
+- [x] `picarx` user confirmed in the `dialout` group.
+- [ ] Connect the C1 and install/verify the `/dev/rplidar` udev rule.
+- [ ] Launch the C1 at 460800 baud and verify `/scan`.
+
+### 3.6 NPU / RKNN (later milestone)
 If adding NPU-accelerated vision on native Ubuntu 24.04:
 - Use **Python 3.11 venv** (Miniforge) for RKNN-Toolkit-Lite2 wheels.
 - Add udev rule for `/dev/rknpu` group access.
@@ -342,28 +364,44 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 - [x] `picarx` and `PiCarXBackend` forward/stop on elevated bench.
 
 ### M4b — Lidar
-- [ ] `sllidar_ros2` C1 launch on USB.
-- [ ] `/scan` visible; RViz on PC optional.
+- [x] ROS 2 Jazzy, Nav2, and `slam_toolbox` installed on the ROCK 4D.
+- [x] Official `sllidar_ros2` built from source in `~/ros2_ws`.
+- [x] `sllidar_ros2` C1 launch authored (`cat_follow_bringup/launch/sllidar_c1.launch.py`, 460800, `/dev/rplidar` udev symlink).
+- [ ] Install/verify the `/dev/rplidar` udev rule on hardware. _(pending C1 connection)_
+- [ ] `/scan` visible on hardware; RViz on PC optional. _(pending C1 connection)_
 
 ### M4c — Mapping session
-- [ ] Teleop map yard with `slam_toolbox` online_async.
-- [ ] Save `yard_map.yaml` + pgms.
-- [ ] Document map origin alignment with overhead yard frame.
+- [x] `slam_toolbox` online_async mapping launch + params authored (`mapping.launch.py`, `config/slam_mapper.yaml`).
+- [ ] Teleop-map the yard and save `yard_map.yaml` + pgm into `cat_follow_bringup/maps/`. _(pending C1)_
+- [x] Map origin alignment procedure documented (`cat_follow_bringup/maps/README.md`).
 
 ### M4d — Navigation
-- [ ] Localize on saved map.
-- [ ] Nav2 composed bringup reaches goals in yard.
-- [ ] Dead-end recovery observed (backup / replan).
+- [x] Nav2 composed bringup + embedded-tuned params authored (`rock4d_nav.launch.py`, `config/nav2_params.yaml`, `config/slam_localization.yaml`).
+- [ ] Localize on saved map; Nav2 reaches goals; dead-end recovery observed. _(pending C1)_
 
 ### M4e — cat_follow bridge
-- [ ] `ros_bridge` publishes `NavigationState`.
-- [ ] `DecisionEngine` consumes constraints in GOTO / CHASE_A.
-- [ ] Validation: VM entries for lidar-assisted navigation (extend Validation Matrix).
+- [x] `navigation/ros_bridge.py` publishes `NavigationState` + lidar `RangeState` (LIDAR_C1); `navigation/odom_publisher.py` publishes `/odom` + `odom->base_link`.
+- [x] `DecisionEngine` fuses `path_correction`/`speed_limit` and a lidar-critical veto in GOTO / CHASE_A (precedence unchanged).
+- [x] `--ros-nav` runtime flag starts the bridge + odom publisher in-process.
+- [x] Validation Matrix extended (VM-21 scan health, VM-22 lidar veto, VM-23 lidar-assisted nav, VM-24 headless efficiency).
 
 ### M4f — Production hardening
-- [ ] WiFi power save off for DDS.
+- [x] WiFi power-save-off config authored (`scripts/default-wifi-powersave-off.conf`).
+- [x] systemd units authored (`scripts/ros-nav.service`, `scripts/cat-follow-ros.service`).
 - [ ] Thermal/fan policy documented.
-- [ ] JSONL telemetry includes navigation + scan health.
+- [ ] JSONL telemetry includes navigation + scan health end-to-end on hardware.
+
+### Deployment units (added in 0.5.0)
+| Unit | Role |
+|------|------|
+| `scripts/ros-nav.service` | External ROS stack: C1 lidar + slam_toolbox localization + Nav2 composed |
+| `scripts/cat-follow-ros.service` | cat_follow runtime + in-process `--ros-nav` bridge/odom (use instead of `cat-follow.service` when navigating) |
+| `scripts/99-rplidar.rules` | Stable `/dev/rplidar` symlink for the C1 |
+| `scripts/default-wifi-powersave-off.conf` | Disable WiFi power save for DDS stability |
+
+The venv must expose `rclpy` for `--ros-nav` (create with
+`python3 -m venv --system-site-packages /opt/car-x/venv` and keep
+`/opt/ros/jazzy` sourced in the unit).
 
 ## 10. Dual-board fallback (Option A software)
 If `robot_hat` port is delayed:

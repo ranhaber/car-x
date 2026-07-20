@@ -1,0 +1,24 @@
+[Unit]
+# ROS 2 navigation stack for the ROCK 4D: C1 lidar + slam_toolbox localization
+# + Nav2 (composed). Runs as separate ROS processes; cat_follow bridges topics
+# only (see cat-follow-ros.service with --ros-nav). Publishes /scan, /map,
+# Nav2 /cmd_vel; consumes /odom from the cat_follow ros_bridge.
+Description=Cat Follow ROS 2 navigation bringup (C1 lidar + slam + Nav2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=picarx
+Group=picarx
+SupplementaryGroups=dialout
+EnvironmentFile=/etc/car-x/car-x.env
+# Wait for the deterministic lidar symlink from 99-rplidar.rules.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e "$CAT_FOLLOW_LIDAR_PORT" ] && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/picarx/ros2_ws/install/setup.bash && exec ros2 launch cat_follow_bringup rock4d_nav.launch.py'
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

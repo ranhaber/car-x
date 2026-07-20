@@ -41,6 +41,32 @@ _tracker_fps: float = 0.0
 _tracker_fps_lock = threading.Lock()
 _stream_fps_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Stream client counter — lets the processing/encoding paths skip expensive
+# annotation + JPEG/H.264 work when nobody is watching (headless efficiency).
+# ---------------------------------------------------------------------------
+_stream_clients: int = 0
+_stream_clients_lock = threading.Lock()
+
+
+def inc_stream_clients() -> int:
+    global _stream_clients
+    with _stream_clients_lock:
+        _stream_clients += 1
+        return _stream_clients
+
+
+def dec_stream_clients() -> int:
+    global _stream_clients
+    with _stream_clients_lock:
+        _stream_clients = max(0, _stream_clients - 1)
+        return _stream_clients
+
+
+def get_stream_clients() -> int:
+    with _stream_clients_lock:
+        return _stream_clients
+
 
 def set_tracker_fps(fps: float) -> None:
     """Called by the main loop or tracker thread to report current tracker FPS."""
@@ -161,6 +187,9 @@ def create_app(
     ctx.get_ram_percent = _get_ram_percent
     ctx.get_cpu_temp = _get_cpu_temp
     ctx.get_battery_voltage = _get_battery_voltage
+    ctx.inc_stream_clients = inc_stream_clients
+    ctx.dec_stream_clients = dec_stream_clients
+    ctx.get_stream_clients = get_stream_clients
 
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -185,6 +214,15 @@ def create_app(
     init_stream_config_routes(ctx)
     init_detector_routes(ctx)
     init_calibration_routes(ctx)
+
+    # Optional hardware H.264 WebSocket stream (guarded: no-op if flask-sock /
+    # GStreamer mpph264enc are unavailable).
+    try:
+        from cat_follow.web_ui.routes_h264 import init_h264_routes
+
+        init_h264_routes(ctx, app)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("H.264 route registration skipped: %s", exc)
 
     app.register_blueprint(pages_bp)
     app.register_blueprint(streaming_bp)

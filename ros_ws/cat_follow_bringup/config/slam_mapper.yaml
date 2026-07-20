@@ -1,0 +1,37 @@
+# slam_toolbox online_async mapping parameters for the yard survey.
+#
+# Used once (mapping day) with teleop to build yard_map.  Tuned for the C1's
+# ~12 m range and an embedded CPU budget: low-ish update rates, no on-board
+# RViz.  Do NOT run this during a cat chase — use localization on the saved map.
+slam_toolbox:
+  ros__parameters:
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    mode: mapping
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    use_scan_matching: true
+    use_scan_barycenter: true
+
+    # Rates kept modest for the PiCar-X's slow speed and limited CPU.
+    map_update_interval: 2.0
+    resolution: 0.05
+    max_laser_range: 12.0
+    minimum_time_interval: 0.5
+    transform_timeout: 0.3
+    tf_buffer_duration: 10.0
+
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45

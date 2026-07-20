@@ -15,6 +15,8 @@ from cat_follow.camera_config import CameraConfig, load_camera_config
 from cat_follow.logger import get_logger
 from cat_follow.memory.pool import FRAME_SHAPE
 from cat_follow.memory.shared_state import SharedState
+from cat_follow.perception.tuning import apply_affinity
+from cat_follow.perception_config import load_perception_config
 
 log = get_logger("thread.camera")
 
@@ -32,6 +34,31 @@ def _open_capture(config: CameraConfig):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
     cap.set(cv2.CAP_PROP_FPS, config.fps)
     return cap
+
+
+def _open_lores_capture(config: CameraConfig):
+    """Open the optional hardware-scaled lores stream (RKISP self-path)."""
+    backend = cv2.CAP_V4L2 if config.backend == "v4l2" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(config.lores_source, backend)
+    if config.lores_pixel_format:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*config.lores_pixel_format))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.lores_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.lores_height)
+    cap.set(cv2.CAP_PROP_FPS, config.fps)
+    return cap
+
+
+def _lores_to_gray(frame: np.ndarray, config: CameraConfig) -> np.ndarray:
+    """Extract a single-channel gray/luma image from a lores frame.
+
+    For NV12 the luma (Y) plane is the top ``height`` rows, so no color
+    conversion is needed — the cheapest possible motion source.
+    """
+    if frame.ndim == 2 and config.lores_pixel_format == "NV12":
+        return frame[: config.lores_height, : config.lores_width]
+    if frame.ndim == 3:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return frame
 
 
 def _prepare_frame(frame: np.ndarray, config: CameraConfig) -> np.ndarray:
@@ -85,17 +112,26 @@ def run_camera_loop(
     tick = 1.0 / target_fps
     frame_index = 0
 
+    try:
+        perception = load_perception_config()
+        if perception.affinity_enabled:
+            apply_affinity(perception.camera_cores)
+    except Exception as exc:  # noqa: BLE001 - tuning must never be fatal
+        log.debug("camera affinity/tuning skipped: %s", exc)
+
     if _HAS_CV2:
         cap = None
+        lores_cap = None
         failed_reads = 0
         log.info(
-            "Camera loop started (device=%s, %dx%d %s, backend=%s, %.0f FPS).",
+            "Camera loop started (device=%s, %dx%d %s, backend=%s, %.0f FPS, lores=%s).",
             config.device,
             config.width,
             config.height,
             config.pixel_format or "driver-default",
             config.backend,
             target_fps,
+            config.lores_device or "off",
         )
 
         try:
@@ -111,6 +147,17 @@ def run_camera_loop(
                         cap = None
                         stop_event.wait(1.0)
                         continue
+
+                if config.lores_enabled and lores_cap is None:
+                    lores_cap = _open_lores_capture(config)
+                    if not lores_cap.isOpened():
+                        log.warning(
+                            "Unable to open lores stream %s; motion will use the "
+                            "main frame.",
+                            config.lores_device,
+                        )
+                        lores_cap.release()
+                        lores_cap = None
 
                 t0 = time.monotonic()
 
@@ -142,12 +189,23 @@ def run_camera_loop(
                 np.copyto(write_buf, frame)
                 shared.publish_latest_from_write()
 
+                # Publish a hardware-scaled lores gray frame for motion.
+                if lores_cap is not None:
+                    lret, lframe = lores_cap.read()
+                    if lret and lframe is not None:
+                        try:
+                            shared.set_lores_gray(_lores_to_gray(lframe, config))
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("lores gray publish skipped: %s", exc)
+
                 frame_index += 1
                 elapsed = time.monotonic() - t0
                 time.sleep(max(0.0, tick - elapsed))
         finally:
             if cap is not None:
                 cap.release()
+            if lores_cap is not None:
+                lores_cap.release()
     else:
         # Fallback stub behavior (no cv2 available)
         log.info("Camera loop started (stub, %.0f FPS). cv2 not available.", target_fps)

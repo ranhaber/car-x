@@ -1,0 +1,26 @@
+# slam_toolbox localization on the saved yard_map (every chase session).
+#
+# Publishes the map->odom transform and /map by scan-matching against the saved
+# serialized map.  Point map_file_name at the saved map's base path (without
+# extension) after running the mapping session.
+slam_toolbox:
+  ros__parameters:
+    mode: localization
+
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+
+    # Set to the saved map basename, e.g.
+    #   /home/picarx/ros2_ws/install/cat_follow_bringup/share/cat_follow_bringup/maps/yard_map
+    map_file_name: ""
+    map_start_at_dock: true
+
+    resolution: 0.05
+    max_laser_range: 12.0
+    minimum_time_interval: 0.5
+    transform_timeout: 0.3
+    tf_buffer_duration: 10.0
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2

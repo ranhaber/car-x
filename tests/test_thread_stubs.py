@@ -32,9 +32,37 @@ from cat_follow.threads.detector import run_detector_loop
 
 @pytest.fixture(autouse=True)
 def _force_deterministic_stubs(monkeypatch):
-    """Keep integration tests independent of host camera/model availability."""
+    """Keep integration tests independent of host camera/model availability.
+
+    The camera falls back to its no-cv2 stub, and the detector's backend
+    factory is forced to report "no usable model" so the detector runs its
+    deterministic bbox stub regardless of what is installed on the host.
+    """
     monkeypatch.setattr(camera_module, "_HAS_CV2", False)
-    monkeypatch.setattr(detector_module, "make_interpreter", lambda _: None)
+
+    class _UnavailableBackend:
+        loaded = False
+
+        def available(self):
+            return False
+
+        def load(self):
+            return False
+
+        def unload(self):
+            return None
+
+        def warmup(self):
+            return None
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _UnavailableBackend(),
+    )
 
 
 def _run_threads_for(seconds: float = 1.0):

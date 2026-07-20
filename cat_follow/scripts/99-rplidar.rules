@@ -1,0 +1,14 @@
+# Stable symlink for the Slamtec RPLIDAR C1 USB-serial adapter.
+#
+# The C1 ships with a Silicon Labs CP210x bridge (10c4:ea60). This rule gives
+# it a deterministic /dev/rplidar node so the sllidar launch never guesses the
+# ttyUSB index, and grants dialout access without sudo.
+#
+# Install on the ROCK 4D:
+#   sudo install -m 0644 cat_follow/scripts/99-rplidar.rules \
+#     /etc/udev/rules.d/99-rplidar.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# If your unit enumerates with a different bridge, confirm with:
+#   udevadm info -a -n /dev/ttyUSB0 | grep -E 'idVendor|idProduct'
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE="0660", GROUP="dialout", SYMLINK+="rplidar"

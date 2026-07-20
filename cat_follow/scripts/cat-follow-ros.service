@@ -1,0 +1,30 @@
+[Unit]
+# ROS-enabled variant of cat-follow.service: same perception + control runtime,
+# plus the in-process ROS bridge (--ros-nav) that spins the ros_bridge and odom
+# publisher on a background thread, feeding NavigationState + lidar RangeState
+# into the DecisionEngine. Use this INSTEAD of cat-follow.service when the full
+# navigation stack (ros-nav.service) is deployed.
+#
+# Requires rclpy to be importable by the venv Python. Create the venv with
+# --system-site-packages so the apt-installed ros-jazzy rclpy is visible:
+#   python3 -m venv --system-site-packages /opt/car-x/venv
+# and keep /opt/ros/jazzy sourced (below) so the ROS libraries resolve.
+Description=Cat Follow control runtime (with ROS 2 navigation bridge)
+After=network-online.target ros-nav.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=picarx
+Group=picarx
+SupplementaryGroups=i2c gpio video dialout
+WorkingDirectory=/opt/car-x
+EnvironmentFile=/etc/car-x/car-x.env
+ExecStartPre=-/usr/bin/v4l2-ctl -d ${CAT_FOLLOW_CAMERA_SENSOR_DEVICE} --set-ctrl=exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && exec /opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --ros-nav'
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

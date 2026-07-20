@@ -44,10 +44,18 @@ OBSTACLE_TOO_CLOSE_CM = 10.0
 OVERHEAD_STALE_WARNING_MS = 300
 OVERHEAD_STALE_FAILSAFE_MS = 700
 
+# Normalized full-scale speed used when navigation drives the chassis. Speeds
+# and steering are normalized to [0, 1] and [-1, 1] respectively.
+MAX_SPEED = 1.0
+
 # Chase-state set used by stage logic and overhead-freshness rules.
 _CHASE_STATES = frozenset(
     {FsmState.CHASE_A, FsmState.TRACK_B, FsmState.BRAKE}
 )
+
+# States where a fresh NavigationState (from Nav2 via the ros_bridge) is
+# allowed to drive path_correction / speed_limit into the motion command.
+_NAV_DRIVE_STATES = frozenset({FsmState.CHASE_A, FsmState.GOTO})
 
 
 # Mapping of accepted command -> (FSM event, reason code) used to translate
@@ -93,14 +101,18 @@ class DecisionEngine:
     def tick(self, decision_input: DecisionInput) -> DecisionOutput:
         constraints: List[str] = []
 
-        # 1. Hard failsafe: range obstacle within ``OBSTACLE_TOO_CLOSE_CM``.
-        if self._range_obstacle_too_close(decision_input):
+        # 1. Hard failsafe: range/lidar obstacle within ``OBSTACLE_TOO_CLOSE_CM``.
+        range_close = self._range_obstacle_too_close(decision_input)
+        lidar_close = self._lidar_obstacle_too_close(decision_input)
+        if range_close or lidar_close:
             self._fsm.apply(
                 FsmEvent.OBSTACLE_TOO_CLOSE,
                 reason=ReasonCode.OBSTACLE_TOO_CLOSE,
                 now_ms=decision_input.now_ms,
             )
             constraints.append("obstacle_too_close")
+            if lidar_close:
+                constraints.append("lidar_obstacle")
             return self._safe_stop_output(
                 decision_input,
                 reason=ReasonCode.OBSTACLE_TOO_CLOSE,
@@ -108,17 +120,22 @@ class DecisionEngine:
                 brake=True,
             )
 
-        # 2. Critical obstacle veto (severity-based).
-        if (
-            decision_input.range.fresh
-            and decision_input.range.obstacle_critical
-        ):
+        # 2. Critical obstacle veto (severity-based), from ultrasonic or lidar.
+        range_critical = (
+            decision_input.range.fresh and decision_input.range.obstacle_critical
+        )
+        lidar_critical = (
+            decision_input.lidar.fresh and decision_input.lidar.obstacle_critical
+        )
+        if range_critical or lidar_critical:
             self._fsm.apply(
                 FsmEvent.FAILSAFE_TRIGGERED,
                 reason=ReasonCode.OBSTACLE_VETO,
                 now_ms=decision_input.now_ms,
             )
             constraints.append("obstacle_veto")
+            if lidar_critical:
+                constraints.append("lidar_veto")
             return self._safe_stop_output(
                 decision_input,
                 reason=ReasonCode.OBSTACLE_VETO,
@@ -167,10 +184,20 @@ class DecisionEngine:
                 brake=True,
             )
 
-        # All other states: emit zero-motion shell output with a
-        # state-appropriate reason.  Real pursuit math lands in later
-        # milestones once VisionTracker, Navigation, and CommsManager are
-        # wired in.
+        # 6. Navigation-assisted drive (CHASE_A / GOTO) when Nav2 is publishing
+        #    fresh constraints via the ros_bridge.  Safety precedence above is
+        #    already enforced (failsafe > obstacle veto > this).
+        if (
+            current_state in _NAV_DRIVE_STATES
+            and decision_input.navigation.fresh
+        ):
+            return self._navigation_drive_output(
+                decision_input, current_state, constraints
+            )
+
+        # All other states (or no fresh navigation): emit zero-motion shell
+        # output with a state-appropriate reason.  Real pursuit math lands in
+        # later milestones once VisionTracker pursuit control is wired in.
         reason = _STATE_DEFAULT_REASON.get(current_state, ReasonCode.INIT)
         return self._safe_stop_output(
             decision_input,
@@ -228,6 +255,61 @@ class DecisionEngine:
             return False
         return rs.distance_cm < OBSTACLE_TOO_CLOSE_CM
 
+    @staticmethod
+    def _lidar_obstacle_too_close(decision_input: DecisionInput) -> bool:
+        ls = decision_input.lidar
+        if not ls.fresh:
+            return False
+        if ls.distance_cm is None:
+            return False
+        return ls.distance_cm < OBSTACLE_TOO_CLOSE_CM
+
+    def _navigation_drive_output(
+        self,
+        decision_input: DecisionInput,
+        current_state: FsmState,
+        constraints: List[str],
+    ) -> DecisionOutput:
+        """Blend Nav2 constraints into the motion command.
+
+        ``final_steer = clamp(pursuit_steer + path_correction)`` and
+        ``final_speed = min(pursuit_speed, speed_limit * MAX_SPEED)``.  The V1
+        shell has no pursuit term yet, so pursuit_steer = 0 and pursuit_speed =
+        MAX_SPEED, i.e. Nav2 drives directly while safety precedence is owned
+        by the checks above.
+        """
+        nav = decision_input.navigation
+        pursuit_steer = 0.0
+        pursuit_speed = MAX_SPEED
+
+        final_steer = max(-1.0, min(1.0, pursuit_steer + nav.path_correction))
+        final_speed = max(0.0, min(pursuit_speed, nav.speed_limit * MAX_SPEED))
+
+        constraints.append("navigation")
+        if nav.no_progress:
+            constraints.append("no_progress")
+        if nav.dead_end:
+            constraints.append("dead_end")
+
+        target_source = (
+            TargetSource.GO_TO
+            if current_state == FsmState.GOTO
+            else TargetSource.CAT_GLOBAL
+        )
+        return DecisionOutput(
+            timestamp_ms=decision_input.now_ms,
+            requested_state=self._fsm.state,
+            speed=final_speed,
+            steering=final_steer,
+            brake=False,
+            reason=_STATE_DEFAULT_REASON.get(current_state, ReasonCode.INIT),
+            active_constraints=tuple(constraints),
+            target_x=None,
+            target_y=None,
+            target_source=target_source,
+            rejected_transition=False,
+        )
+
     def _safe_stop_output(
         self,
         decision_input: DecisionInput,
@@ -253,6 +335,7 @@ class DecisionEngine:
 
 __all__ = [
     "DecisionEngine",
+    "MAX_SPEED",
     "OBSTACLE_TOO_CLOSE_CM",
     "OVERHEAD_STALE_FAILSAFE_MS",
     "OVERHEAD_STALE_WARNING_MS",

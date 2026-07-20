@@ -314,6 +314,10 @@ class SharedSnapshot:
     home: HomeState = field(default_factory=HomeState)
     vision: VisionState = field(default_factory=VisionState)
     range: RangeState = field(default_factory=RangeState)
+    # Separate lidar range channel (backend=LIDAR_C1) so the C1 and the
+    # ultrasonic sensor are fused in DecisionEngine rather than clobbering one
+    # shared group.  Defaults stale (fresh=False) until the ros_bridge runs.
+    lidar: RangeState = field(default_factory=RangeState)
     navigation: NavigationState = field(default_factory=NavigationState)
     system: SystemState = field(default_factory=SystemState)
     fsm: FSMSnapshot = field(default_factory=FSMSnapshot)
@@ -334,6 +338,9 @@ class DecisionInput:
     system: SystemState
     fsm: FSMSnapshot
     command: CommandState
+    # Lidar (C1) obstacle channel, fused with `range` in DecisionEngine.
+    # Defaulted so existing construction sites remain valid.
+    lidar: RangeState = field(default_factory=RangeState)
 
 
 @dataclass(frozen=True)

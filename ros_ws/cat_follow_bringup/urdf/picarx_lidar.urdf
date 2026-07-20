@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  Minimal URDF for the PiCar-X + RPLIDAR C1 + Radxa Camera 4K.
+
+  Frames follow ROS REP-103 (base_link: +X forward, +Y left, +Z up) so that
+  slam_toolbox and Nav2 behave correctly.  The overhead *yard* frame from the
+  Interface Specification (+X right, +Y forward) is a separate map-level
+  convention; the map<->yard alignment is applied in cat_follow's ros_bridge,
+  not here.
+
+  base_link is placed at the rear axle center to match cat_follow/odometry.py
+  (bicycle model integrates the rear-axle pose).  Offsets are approximate for
+  the stock PiCar-X chassis and should be refined by measurement.
+-->
+<robot name="picarx_lidar">
+
+  <link name="base_link"/>
+
+  <!-- Chassis reference (visual only, no collision needed for 2D nav). -->
+  <link name="chassis"/>
+  <joint name="base_to_chassis" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis"/>
+    <origin xyz="0.057 0.0 0.0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- RPLIDAR C1: mounted centered above the chassis, ~8 cm up. -->
+  <link name="laser"/>
+  <joint name="base_to_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="0.057 0.0 0.085" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Radxa Camera 4K (IMX415): front of the chassis, ~5 cm up. -->
+  <link name="camera_link"/>
+  <joint name="base_to_camera" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.114 0.0 0.05" rpy="0 0 0"/>
+  </joint>
+
+</robot>

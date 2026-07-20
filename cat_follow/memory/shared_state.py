@@ -49,6 +49,11 @@ class SharedState:
         self._write_idx = 0
         self._latest_idx = -1
 
+        # Optional hardware-scaled lores gray frame (motion source). Allocated
+        # lazily on first publish so single-stream setups pay nothing.
+        self._lock_lores = threading.Lock()
+        self._lores_gray = None
+
     # ── frame_latest ─────────────────────────────────────────────────
 
     def set_frame_latest(self, src: np.ndarray) -> None:
@@ -196,6 +201,26 @@ class SharedState:
         with self._lock_odometry:
             buf = self._pool.odometry
             return (float(buf[0]), float(buf[1]), float(buf[2]))
+
+    # ── lores gray frame (optional hardware-scaled motion source) ─────
+
+    def set_lores_gray(self, gray: np.ndarray) -> None:
+        """Publish a single-channel lores gray frame for motion detection.
+
+        The backing buffer is allocated on first use (and reallocated if the
+        lores geometry changes), then reused in-place for every later frame.
+        """
+        with self._lock_lores:
+            if self._lores_gray is None or self._lores_gray.shape != gray.shape:
+                self._lores_gray = np.empty(gray.shape, dtype=np.uint8)
+            np.copyto(self._lores_gray, gray)
+
+    def get_lores_gray(self) -> "np.ndarray | None":
+        """Return a copy of the latest lores gray frame, or None if unset."""
+        with self._lock_lores:
+            if self._lores_gray is None:
+                return None
+            return self._lores_gray.copy()
 
     # ── detector model selection ──────────────────────────────────────
     def set_detector_model(self, model_key: str) -> None:

@@ -52,6 +52,10 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | VM-18 | Obstacle too close | Place obstacle <10 cm from car | Enters `FAILSAFE` with `obstacle_too_close` reason | Hard-stop executed; no collision |
 | VM-19 | Precedence audit | Inject simultaneous pursuit and hazard commands | Arbitration order maintained | No cycle violates precedence rule |
 | VM-20 | Endurance run | 20-minute mixed scenario run | Stable operation without unsafe event | No collision, no unhandled exception, deterministic recovery |
+| VM-21 | Lidar scan health | Launch `sllidar_c1.launch.py`; observe `/scan` | `/scan` publishes at ~10 Hz with valid ranges in the C1 FoV | `ros2 topic hz /scan` steady; no dropouts >1 s over 2 min |
+| VM-22 | Lidar obstacle veto | Place obstacle <10 cm in the front sector during `CHASE_A`/`GOTO` | Lidar `RangeState` (LIDAR_C1) drives `FAILSAFE` alongside ultrasonic | `obstacle_too_close` + `lidar_obstacle` constraints logged; hard-stop; no collision |
+| VM-23 | Lidar-assisted navigation | `go_to` target with Nav2 running and fresh `NavigationState` | Steering follows `path_correction`; speed capped by `speed_limit` | Reaches target tolerance; `navigation` constraint logged; precedence preserved |
+| VM-24 | Perception headless efficiency | Stop MJPEG stream / disconnect browser | Detection + tracking continue; model unloads after idle; CPU drops | Detection events continue with no viewer; idle CPU reduced vs. streaming |
 
 ### 5.1 ROCK 4D platform bring-up evidence (2026-07-19)
 
@@ -64,6 +68,8 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | Runtime service | Pass | Real `PiCarXBackend` service started and stopped cleanly |
 | Power stability | Pass (bench) | Dual-rail test completed without ROCK reset |
 | MIPI camera | Pass | Radxa Camera 4K / IMX415 detected at I2C5 `0x1a`; RKISP captured 30 frames at 30 FPS and produced a visible image |
+| Perception optimization | Pass (host) | Motion-gated detector, lazy/idle-unload backend, adaptive OpenCV threads + affinity, and hardware-lores motion path landed; 274 unit tests green |
+| ROS 2 / Nav2 / C1 integration | Ready (pending HW) | `cat_follow_bringup` package (lidar/TF/URDF/slam/Nav2 launch + params), `ros_bridge`/`odom_publisher`, `--ros-nav`, and DecisionEngine fusion implemented; awaiting C1 hardware for VM-21..VM-23 |
 | RPLidar C1 | Pending | Hardware not yet available |
 
 ## 6. Quantitative Thresholds

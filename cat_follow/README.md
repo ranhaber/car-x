@@ -1,6 +1,6 @@
 # cat_follow
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 
 Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and drives to keep the cat in the middle of the frame.
 
@@ -82,6 +82,19 @@ sudo systemctl status cat-follow.service
 sudo systemctl stop cat-follow.service
 ```
 
+### ROS 2 deployment status
+
+ROS 2 Jazzy, `slam_toolbox`, and Nav2 are installed on the ROCK 4D. Because
+the Jazzy ARM64 repository does not publish `ros-jazzy-sllidar-ros2`, the
+official Slamtec `sllidar_ros2` driver was built successfully from source in
+`~/ros2_ws`. Both `/opt/ros/jazzy/setup.bash` and the workspace setup are
+loaded from the `picarx` user's `.bashrc`, and that user belongs to the
+`dialout` group.
+
+Hardware validation remains pending: the C1 was not connected during
+installation, so the stable `/dev/rplidar` udev symlink and `/scan` output
+have not yet been verified.
+
 See `docs/Hardware_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`,
 `docs/Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`, and
 `docs/Radxa_ROCK_4D_Robot_HAT_Power_Problem.md`.
@@ -105,12 +118,24 @@ Or install pytest and run: `python -m pytest tests/ -v`
 
 ## Next steps
 
-1. **Complete ROCK 4D validation** — Bring up the MIPI camera, run floor-drive and thermal tests, and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
-2. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
-3. **Optional** — Add tests for `vision.get_cat_bbox()` with a fixture image; extend calibration UI if you add more steering/speed parameters.
+1. **Validate the C1 lidar** — Connect it over USB, install/verify the `/dev/rplidar` udev rule, launch `sllidar_ros2` at 460800 baud, and confirm `/scan`.
+2. **Complete ROCK 4D validation** — Run floor-drive and thermal tests and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
+3. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
 
 ## 📝 Version History
 
+- **0.5.0** — Perception resource optimization + ROS 2 navigation integration.
+  Added motion-gated detection with a perception phase FSM, a pluggable
+  detection backend (CPU TFLite / RK3576 NPU RKNN) with lazy load, boot warmup
+  and idle unload (`malloc_trim` reclaim), adaptive OpenCV threads and CPU
+  affinity, an optional hardware-scaled RKISP lores motion stream, decoupled
+  MJPEG (encode only with viewers, `simplejpeg` when available), and an
+  optional Rockchip MPP H.264 WebSocket stream. Added the ROS 2 Jazzy track:
+  `ros_ws/cat_follow_bringup` (C1 lidar, TF/URDF, slam_toolbox mapping +
+  localization, Nav2 composed launch and embedded-tuned params), a
+  `navigation.ros_bridge` + `odom_publisher`, a `--ros-nav` runtime flag, and
+  DecisionEngine fusion of `NavigationState` (path_correction / speed_limit)
+  and a lidar-critical obstacle veto — safety precedence unchanged.
 - **0.4.0** — Added environment-configured V4L2 capture for the ROCK 4D
   Radxa Camera 4K (IMX415), including NV12 conversion/downscaling, camera
   permissions and startup controls, and headless perception service startup.

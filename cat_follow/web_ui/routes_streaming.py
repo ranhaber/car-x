@@ -17,6 +17,15 @@ streaming_bp = Blueprint("streaming", __name__)
 # Set by init_streaming_routes
 _ctx = None
 
+# Optional libjpeg-turbo encoder (NEON-accelerated on ARM). Falls back to cv2.
+try:
+    import simplejpeg as _simplejpeg
+
+    _HAS_SIMPLEJPEG = True
+except Exception:  # pragma: no cover - optional dependency
+    _simplejpeg = None
+    _HAS_SIMPLEJPEG = False
+
 
 def init_streaming_routes(ctx):
     """Register streaming routes. ctx must have: shared, state_machine, get_stream_resolution, resolution_options, set_stream_fps."""
@@ -31,8 +40,25 @@ def init_streaming_routes(ctx):
         )
 
 
+def _encode_jpeg(cv2, display) -> bytes:
+    """Encode a BGR frame to JPEG, preferring simplejpeg (libjpeg-turbo)."""
+    if _HAS_SIMPLEJPEG:
+        # simplejpeg wants a contiguous array; colorspace BGR matches OpenCV.
+        return _simplejpeg.encode_jpeg(
+            np.ascontiguousarray(display), quality=80, colorspace="BGR"
+        )
+    _, jpeg = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return jpeg.tobytes()
+
+
 def _generate_mjpeg():
-    """Yield MJPEG frames at ~10 FPS with bbox rectangle and state overlay."""
+    """Yield MJPEG frames at ~10 FPS with bbox rectangle and state overlay.
+
+    Annotation and JPEG encoding only run while this generator is alive, i.e.
+    while a browser is connected.  The generator registers itself in the
+    shared stream-client counter so the rest of the system can cheaply tell
+    whether anyone is watching (detection never depends on this).
+    """
     try:
         import cv2
         _has_cv2 = True
@@ -40,56 +66,64 @@ def _generate_mjpeg():
         _has_cv2 = False
 
     frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
+    display = np.empty(FRAME_SHAPE, dtype=np.uint8)
     target_fps = 10.0
     tick = 1.0 / target_fps
     fps_counter = 0
     fps_timer = time.monotonic()
 
-    while True:
-        t0 = time.monotonic()
-        if _ctx is None or _ctx.shared is None:
-            time.sleep(tick)
-            continue
+    if _ctx is not None and getattr(_ctx, "inc_stream_clients", None):
+        _ctx.inc_stream_clients()
 
-        _ctx.shared.get_frame_latest(frame_buf)
-        bbox = _ctx.shared.get_bbox_tracker()
-        state_name = "unknown"
-        if _ctx.state_machine is not None:
-            state_name = _ctx.state_machine.state.value
+    try:
+        while True:
+            t0 = time.monotonic()
+            if _ctx is None or _ctx.shared is None:
+                time.sleep(tick)
+                continue
 
-        res_key = _ctx.get_stream_resolution()
-        target_w, target_h = _ctx.resolution_options[res_key]
+            _ctx.shared.get_frame_latest(frame_buf)
+            bbox = _ctx.shared.get_bbox_tracker()
+            state_name = "unknown"
+            if _ctx.state_machine is not None:
+                state_name = _ctx.state_machine.state.value
 
-        if _has_cv2:
-            display = frame_buf.copy()
-            if bbox[4] > 0:
-                x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                label = f"cat ({w}x{h})"
-                cv2.putText(display, label, (x, max(y - 8, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.putText(display, f"State: {state_name}", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            src_h, src_w = display.shape[:2]
-            if (target_w, target_h) != (src_w, src_h):
-                display = cv2.resize(display, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            _, jpeg = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            frame_bytes = jpeg.tobytes()
-        else:
-            frame_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+            res_key = _ctx.get_stream_resolution()
+            target_w, target_h = _ctx.resolution_options[res_key]
 
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-        )
+            if _has_cv2:
+                np.copyto(display, frame_buf)
+                if bbox[4] > 0:
+                    x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    label = f"cat ({w}x{h})"
+                    cv2.putText(display, label, (x, max(y - 8, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(display, f"State: {state_name}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                out = display
+                src_h, src_w = display.shape[:2]
+                if (target_w, target_h) != (src_w, src_h):
+                    out = cv2.resize(display, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                frame_bytes = _encode_jpeg(cv2, out)
+            else:
+                frame_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
 
-        fps_counter += 1
-        now = time.monotonic()
-        if now - fps_timer >= 1.0:
-            if _ctx.set_stream_fps:
-                _ctx.set_stream_fps(fps_counter / (now - fps_timer))
-            fps_counter = 0
-            fps_timer = now
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+            )
 
-        elapsed = time.monotonic() - t0
-        time.sleep(max(0.0, tick - elapsed))
+            fps_counter += 1
+            now = time.monotonic()
+            if now - fps_timer >= 1.0:
+                if _ctx.set_stream_fps:
+                    _ctx.set_stream_fps(fps_counter / (now - fps_timer))
+                fps_counter = 0
+                fps_timer = now
+
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, tick - elapsed))
+    finally:
+        if _ctx is not None and getattr(_ctx, "dec_stream_clients", None):
+            _ctx.dec_stream_clients()

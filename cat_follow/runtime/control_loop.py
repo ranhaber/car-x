@@ -121,6 +121,7 @@ class ControlLoop:
             home=snapshot.home,
             vision=snapshot.vision,
             range=snapshot.range,
+            lidar=snapshot.lidar,
             navigation=snapshot.navigation,
             system=snapshot.system,
             fsm=snapshot.fsm,
