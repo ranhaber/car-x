@@ -15,7 +15,7 @@ SupplementaryGroups=dialout
 EnvironmentFile=/etc/car-x/car-x.env
 # Wait for the deterministic lidar symlink from 99-rplidar.rules.
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e "$CAT_FOLLOW_LIDAR_PORT" ] && exit 0; sleep 1; done; exit 1'
-ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/picarx/ros2_ws/install/setup.bash && exec ros2 launch cat_follow_bringup rock4d_nav.launch.py'
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/car-x/ros_ws/install/setup.bash && exec ros2 launch cat_follow_bringup rock4d_nav.launch.py'
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10

@@ -83,30 +83,46 @@ sudo udevadm trigger --subsystem-match=gpio
 sudo apt install -y ros-jazzy-ros-base ros-jazzy-slam-toolbox \
   ros-jazzy-nav2-bringup ros-dev-tools
 
-# Jazzy ARM64 does not publish ros-jazzy-sllidar-ros2; build the official
-# Slamtec driver from source.
+# Jazzy ARM64 does not publish ros-jazzy-sllidar-ros2. Build the official
+# Slamtec driver in the application workspace.
 source /opt/ros/jazzy/setup.bash
-mkdir -p ~/ros2_ws/src
-git clone --depth 1 https://github.com/Slamtec/sllidar_ros2.git \
-  ~/ros2_ws/src/sllidar_ros2
+cd /opt/car-x/ros_ws
+git clone https://github.com/Slamtec/sllidar_ros2.git sllidar_ros2
 sudo rosdep init                    # omit if already initialized
 rosdep update
-cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install --packages-select sllidar_ros2
-source ~/ros2_ws/install/setup.bash
+rosdep install --from-paths . --ignore-src -r -y --rosdistro jazzy
+colcon build --symlink-install
+source /opt/car-x/ros_ws/install/setup.bash
 
-# Optional: disable WiFi power save (DDS stability)
-# /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf → wifi.powersave = 2
+# Install runtime configuration. Preserve the previous environment first.
+sudo install -d /etc/car-x /etc/NetworkManager/conf.d
+sudo cp /etc/car-x/car-x.env /etc/car-x/car-x.env.pre-ros
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/car-x.env \
+  /etc/car-x/car-x.env
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/99-rplidar.rules \
+  /etc/udev/rules.d/99-rplidar.rules
+sudo install -m 0644 \
+  /opt/car-x/cat_follow/scripts/default-wifi-powersave-off.conf \
+  /etc/NetworkManager/conf.d/default-wifi-powersave-off.conf
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/ros-nav.service \
+  /etc/systemd/system/ros-nav.service
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/cat-follow-ros.service \
+  /etc/systemd/system/cat-follow-ros.service
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+
+# Keep both units disabled until the C1 is connected and the map exists.
+sudo systemctl disable ros-nav.service cat-follow-ros.service
 ```
 
 ### 3.5 Deployment progress (2026-07-20)
 - [x] ROS 2 Jazzy `ros-base` installed on ROCK 4D.
 - [x] `slam_toolbox` and Nav2 bringup installed.
-- [x] Official `sllidar_ros2` built successfully in `~/ros2_ws`.
-- [x] ROS and workspace setup added to the `picarx` user's `.bashrc`.
+- [x] Official `sllidar_ros2` and `cat_follow_bringup` built successfully in `/opt/car-x/ros_ws`.
+- [x] ROS environment, udev rule, WiFi tuning, and systemd units deployed.
+- [x] Launch-file argument loading and systemd unit syntax validated.
 - [x] `picarx` user confirmed in the `dialout` group.
-- [ ] Connect the C1 and install/verify the `/dev/rplidar` udev rule.
+- [ ] Connect the C1 and verify that the installed udev rule creates `/dev/rplidar`.
 - [ ] Launch the C1 at 460800 baud and verify `/scan`.
 
 ### 3.6 NPU / RKNN (later milestone)
@@ -365,9 +381,10 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 
 ### M4b — Lidar
 - [x] ROS 2 Jazzy, Nav2, and `slam_toolbox` installed on the ROCK 4D.
-- [x] Official `sllidar_ros2` built from source in `~/ros2_ws`.
+- [x] Official `sllidar_ros2` built from source in `/opt/car-x/ros_ws`.
 - [x] `sllidar_ros2` C1 launch authored (`cat_follow_bringup/launch/sllidar_c1.launch.py`, 460800, `/dev/rplidar` udev symlink).
-- [ ] Install/verify the `/dev/rplidar` udev rule on hardware. _(pending C1 connection)_
+- [x] `/dev/rplidar` udev rule installed on the ROCK 4D.
+- [ ] Verify that the rule creates `/dev/rplidar`. _(pending C1 connection)_
 - [ ] `/scan` visible on hardware; RViz on PC optional. _(pending C1 connection)_
 
 ### M4c — Mapping session
@@ -402,6 +419,23 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 The venv must expose `rclpy` for `--ros-nav` (create with
 `python3 -m venv --system-site-packages /opt/car-x/venv` and keep
 `/opt/ros/jazzy` sourced in the unit).
+
+The deployed units are intentionally disabled until the C1 is connected and a
+yard map has been saved. After connecting the lidar, reload udev and validate
+the device before starting ROS:
+
+```bash
+sudo udevadm trigger
+ls -l /dev/rplidar
+source /opt/ros/jazzy/setup.bash
+source /opt/car-x/ros_ws/install/setup.bash
+ros2 launch cat_follow_bringup sllidar_c1.launch.py
+# In another shell:
+ros2 topic hz /scan
+```
+
+Only after `/scan` is healthy should `ros-nav.service` and
+`cat-follow-ros.service` be enabled or started.
 
 ## 10. Dual-board fallback (Option A software)
 If `robot_hat` port is delayed:

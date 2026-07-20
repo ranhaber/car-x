@@ -87,13 +87,27 @@ sudo systemctl stop cat-follow.service
 ROS 2 Jazzy, `slam_toolbox`, and Nav2 are installed on the ROCK 4D. Because
 the Jazzy ARM64 repository does not publish `ros-jazzy-sllidar-ros2`, the
 official Slamtec `sllidar_ros2` driver was built successfully from source in
-`~/ros2_ws`. Both `/opt/ros/jazzy/setup.bash` and the workspace setup are
-loaded from the `picarx` user's `.bashrc`, and that user belongs to the
-`dialout` group.
+`/opt/car-x/ros_ws`, together with `cat_follow_bringup`. The udev rule, WiFi
+power-save configuration, runtime environment, and systemd units have been
+installed. Both ROS services remain disabled and inactive until the C1 is
+connected and a yard map exists.
 
 Hardware validation remains pending: the C1 was not connected during
-installation, so the stable `/dev/rplidar` udev symlink and `/scan` output
-have not yet been verified.
+installation. The stable `/dev/rplidar` rule is installed, but device creation
+and `/scan` output cannot be verified until the hardware arrives.
+
+Build or rebuild the ROS workspace:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd /opt/car-x/ros_ws
+rosdep install --from-paths . --ignore-src -r -y --rosdistro jazzy
+colcon build --symlink-install
+source /opt/car-x/ros_ws/install/setup.bash
+```
+
+Detailed installation, service deployment, and first-lidar validation commands
+are in `docs/Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`.
 
 See `docs/Hardware_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`,
 `docs/Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`, and
