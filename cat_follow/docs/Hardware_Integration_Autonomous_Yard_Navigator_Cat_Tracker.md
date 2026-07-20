@@ -3,7 +3,7 @@
 **Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis  
 **Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic  
 **Version:** 1.0  
-**Status:** ROCK 4D bring-up validated; camera, lidar, grayscale, and thermal tests pending
+**Status:** ROCK 4D and Radxa Camera 4K bring-up validated; lidar, grayscale, and thermal tests pending
 
 ## 1. Purpose
 This document defines how PiCar-X hardware connects to the Radxa ROCK 4D for
@@ -158,8 +158,48 @@ Use a **powered USB hub** for the C1 only if the main 5 V rail has headroom.
 - C1 baud rate: follow `sllidar_ros2` / SDK launch file (model-specific).
 
 ### 6.2 Camera
-Pi Camera Module ribbon is **not** plug-compatible with ROCK 4D MIPI CSI.
-Source a Radxa-supported camera module and cable for RK3576 boards.
+The validated onboard camera is the **Radxa Camera 4K**, connected to the
+ROCK 4D **31-pin CSI connector**. It uses a Sony IMX415 sensor and a four-lane
+MIPI CSI-2 interface.
+
+#### Sensor specification
+- Sensor: Sony IMX415
+- Optical format: diagonal 6.43 mm (Type 1/2.8)
+- Effective resolution: 8.29 megapixels
+- Unit-cell size: 1.45 µm horizontal × 1.45 µm vertical
+
+#### Sensor output
+- Interface: MIPI CSI-2, four serial data lanes
+- Raw formats: RAW10 and RAW12
+
+#### Lens specification
+- Mount/interface: M12 × P0.5
+- Effective focal length (EFL): 2.95 mm ±5%
+- Back focal length (BFL): 4.64 mm
+- Flange back length (FBL): 4.00 mm
+- Single-lens operating temperature: −40 °C to +85 °C
+
+#### Optical field of view
+- Diagonal: 88.2° ±5°
+- Horizontal: 75° ±3°
+- Vertical: 59° ±2°
+- Chief ray angle (CRA): 15°
+
+#### Validated ROCK 4D interface
+- Sensor control: I2C5, address `0x1a`
+- Native sensor mode: 3864×2192, SGBRG10
+- Runtime capture: RKISP main path `/dev/video11`
+- Runtime format: 640×480 NV12 at 30 FPS, converted to 640×480 BGR
+- Device-tree overlay: `rock-4d-radxa-camera-4k`
+
+The overlay routes the sensor through
+`csi2_dphy0 → mipi1_csi2 → rkcif_mipi_lvds1 → rkisp_vir1`.
+The IMX415 was detected with chip ID `0x0000e0`, streamed 30 frames without
+errors, and produced a visible image on Armbian.
+
+The original PiCar-X OV5647 module is not used on the ROCK 4D. Its Pi ribbon
+and control-voltage requirements are not compatible with this validated
+31-pin IMX415 integration.
 
 ## 7. Integration options
 
@@ -197,7 +237,7 @@ Best long-term if power and GPIO port succeed.
 
 ### Phase H4 — Sensors
 - [ ] C1 publishes scan on USB.
-- [ ] MIPI camera captures frames.
+- [x] Radxa Camera 4K captures frames through RKISP at 30 FPS.
 - [ ] Grayscale A0–A2 read (if used).
 
 ### Phase H5 — Integrated drive

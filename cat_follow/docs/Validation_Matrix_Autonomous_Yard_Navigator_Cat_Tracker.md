@@ -10,7 +10,7 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 - Environment: daylight only, synthetic grass, configured perimeter active.
 - Hardware: PiCar-X, Radxa ROCK 4D, Robot HAT, ultrasonic (HC-SR04),
   onboard camera, overhead camera link, and Slamtec RPLIDAR C1 when available.
-  _(TMF8829 dToF is on hold; C1 and camera validation are pending.)_
+  _(TMF8829 dToF is on hold; C1 validation is pending.)_
 - Build: release-equivalent runtime configuration.
 - Safety posture: conservative.
 
@@ -63,7 +63,7 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | Motor backend | Pass | Elevated-wheel forward, reverse, stop, and emergency stop completed |
 | Runtime service | Pass | Real `PiCarXBackend` service started and stopped cleanly |
 | Power stability | Pass (bench) | Dual-rail test completed without ROCK reset |
-| MIPI camera | Pending | Camera hardware/software bring-up not yet run |
+| MIPI camera | Pass | Radxa Camera 4K / IMX415 detected at I2C5 `0x1a`; RKISP captured 30 frames at 30 FPS and produced a visible image |
 | RPLidar C1 | Pending | Hardware not yet available |
 
 ## 6. Quantitative Thresholds

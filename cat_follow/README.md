@@ -1,5 +1,7 @@
 # cat_follow
 
+**Version:** 0.4.0
+
 Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and drives to keep the cat in the middle of the frame.
 
 ## Layout
@@ -49,8 +51,27 @@ cd /opt/car-x
 set -a
 . /etc/car-x/car-x.env
 set +a
-/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx
+/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception
 ```
+
+The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
+
+- sensor: Sony IMX415, Type 1/2.8, 8.29 MP, 1.45 µm pixels
+- output: four-lane MIPI CSI-2, RAW10/RAW12
+- lens: M12 × P0.5, 2.95 mm EFL
+- field of view: 88.2° diagonal, 75° horizontal, 59° vertical; 15° CRA
+- capture device: `/dev/video11` (RKISP main path)
+- capture format: 640×480 NV12 at 30 FPS, scaled by RKISP in hardware
+- processing format: converted to the existing 640×480 BGR frame pool
+- sensor controls: `/dev/v4l-subdev2`, exposure 900, analogue gain 48
+
+Full sensor, lens, and optical specifications are recorded in
+`docs/Hardware_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
+These values live in `scripts/car-x.env`. The service applies the sensor
+controls once before startup and launches the headless camera, tracker, and
+detector threads with `--with-prototype-perception`. The web UI remains
+optional.
 
 The systemd unit is installed but intentionally disabled until camera and
 floor-drive testing are complete. Start and stop it explicitly:
@@ -87,5 +108,13 @@ Or install pytest and run: `python -m pytest tests/ -v`
 1. **Complete ROCK 4D validation** — Bring up the MIPI camera, run floor-drive and thermal tests, and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
 2. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
 3. **Optional** — Add tests for `vision.get_cat_bbox()` with a fixture image; extend calibration UI if you add more steering/speed parameters.
+
+## 📝 Version History
+
+- **0.4.0** — Added environment-configured V4L2 capture for the ROCK 4D
+  Radxa Camera 4K (IMX415), including NV12 conversion/downscaling, camera
+  permissions and startup controls, and headless perception service startup.
+- **0.3.0** — Established the standalone control runtime and prototype
+  perception-thread integration.
 
 Design: see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md** and **DESIGN_CAT_FOLLOW_STATE_MACHINE.md**.
