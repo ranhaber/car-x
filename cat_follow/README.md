@@ -1,6 +1,6 @@
 # cat_follow
 
-**Version:** 0.5.0
+**Version:** 0.5.2
 
 Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and drives to keep the cat in the middle of the frame.
 
@@ -14,7 +14,7 @@ Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and dr
 - **threads/** — Camera, tracker (OpenCV single-object tracker, re-init via IoU), detector (TFLite loop; writes to SharedState). Camera writes into a pre-allocated frame ring; main loop copies to detector frame every K frames.
 - **odometry.py** — Bicycle-model dead reckoning (position, heading). Used via **location/** facade.
 - **main_loop.py** — Tick loop: commands → state machine → motion.
-- **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`; static assets in `web_ui/static/`.
+- **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`. Starts from `main_loop` or `runtime.app --web-ui`.
 
 ## Run (stub mode, no hardware)
 
@@ -53,6 +53,19 @@ set -a
 set +a
 /opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception
 ```
+
+Optional monitoring UI (non-authoritative) on the contract runtime:
+
+```bash
+/opt/car-x/venv/bin/python -m cat_follow.runtime.app \
+  --picarx --with-prototype-perception --web-ui --web-ui-port 5000
+```
+
+Then open `http://<rock-ip>:5000/`. The Control page shows contract FSM,
+DecisionEngine constraints, lidar/ultrasonic, navigation fusion, perception
+phase, a live occupancy map + robot pose (from ROS `/map` + TF when
+`--ros-nav` is running), and optional H.264 when Rockchip MPP is available.
+Disconnecting the browser stops stream encode (VM-24) while detection continues.
 
 The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
 
@@ -138,6 +151,16 @@ Or install pytest and run: `python -m pytest tests/ -v`
 
 ## 📝 Version History
 
+- **0.5.2** — Live ROS occupancy map in the web UI. `ros_bridge` subscribes to
+  `/map` and TF `map→base_link` (odom fallback), publishes a downsampled
+  snapshot with scan-ray overlay; Control page polls `/api/map` and draws the
+  grid + robot pose on a canvas.
+- **0.5.1** — Contract-runtime web UI adaptation. Added `--web-ui` /
+  `--web-ui-port` to `runtime.app`, extended `/api/status` with SharedSnapshot
+  (FSM, DecisionEngine constraints, lidar, navigation, vision) plus perception
+  phase diagnostics, stream capabilities / H.264 toggle, CommsManager command
+  routing from the Control page, and a read-only config panel. Removed orphaned
+  legacy `web_ui/main.html` / `main.js` / `style.css`.
 - **0.5.0** — Perception resource optimization + ROS 2 navigation integration.
   Added motion-gated detection with a perception phase FSM, a pluggable
   detection backend (CPU TFLite / RK3576 NPU RKNN) with lazy load, boot warmup

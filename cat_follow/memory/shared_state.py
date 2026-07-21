@@ -222,6 +222,11 @@ class SharedState:
                 return None
             return self._lores_gray.copy()
 
+    def has_lores_gray(self) -> bool:
+        """Return True if a lores gray frame has been published."""
+        with self._lock_lores:
+            return self._lores_gray is not None
+
     # ── detector model selection ──────────────────────────────────────
     def set_detector_model(self, model_key: str) -> None:
         """Set the active detector model key (e.g. 'ssd_mobilenet_v2')."""

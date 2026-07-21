@@ -12,6 +12,8 @@ WorkingDirectory=/opt/car-x
 EnvironmentFile=/etc/car-x/car-x.env
 ExecStartPre=-/usr/bin/v4l2-ctl -d ${CAT_FOLLOW_CAMERA_SENSOR_DEVICE} --set-ctrl=exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}
 ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception
+# Optional monitoring UI (non-authoritative). Uncomment to enable:
+# ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --web-ui --web-ui-port 5000
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=5

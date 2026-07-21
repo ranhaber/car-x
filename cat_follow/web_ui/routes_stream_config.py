@@ -1,8 +1,9 @@
 """
-Stream configuration API: resolution selection.
+Stream configuration API: resolution selection and capabilities.
 
 Routes:
-    POST /api/stream/resolution — Set stream resolution (640x480, 320x240, 160x120)
+    POST /api/stream/resolution — Set stream resolution
+    GET  /api/stream/capabilities — MJPEG / H.264 availability
 """
 
 from flask import Blueprint, request, jsonify
@@ -16,18 +17,30 @@ _ctx = None
 
 
 def init_stream_config_routes(ctx):
-    """Register stream config routes. ctx: get_stream_resolution, set_stream_resolution, resolution_lock, resolution_options."""
+    """Bind stream-config context."""
     global _ctx
     _ctx = ctx
 
-    @stream_config_bp.route("/api/stream/resolution", methods=["POST"])
-    def api_stream_resolution():
-        data = request.get_json(silent=True) or {}
-        res = data.get("resolution", "")
-        if res not in _ctx.resolution_options:
-            return jsonify({
-                "error": f"Invalid resolution. Choose from: {list(_ctx.resolution_options.keys())}"
-            }), 400
-        _ctx.set_stream_resolution(res)
-        _log.info("API stream resolution changed to %s", res)
-        return jsonify({"status": "ok", "resolution": res})
+
+@stream_config_bp.route("/api/stream/resolution", methods=["POST"])
+def api_stream_resolution():
+    data = request.get_json(silent=True) or {}
+    res = data.get("resolution", "")
+    if res not in _ctx.resolution_options:
+        return jsonify({
+            "error": f"Invalid resolution. Choose from: {list(_ctx.resolution_options.keys())}"
+        }), 400
+    _ctx.set_stream_resolution(res)
+    _log.info("API stream resolution changed to %s", res)
+    return jsonify({"status": "ok", "resolution": res})
+
+
+@stream_config_bp.route("/api/stream/capabilities", methods=["GET"])
+def api_stream_capabilities():
+    return jsonify({
+        "mjpeg": True,
+        "h264": bool(getattr(_ctx, "h264_available", False)),
+        "resolution": _ctx.get_stream_resolution(),
+        "resolutions": list(_ctx.resolution_options.keys()),
+        "stream_clients": _ctx.get_stream_clients(),
+    })

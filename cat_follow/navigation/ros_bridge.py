@@ -7,9 +7,12 @@ it translates topics into the existing contract dataclasses:
 - ``/scan``     -> lidar :class:`RangeState` (backend ``LIDAR_C1``) via
                    ``SharedState.update_lidar_range``, fused with the
                    ultrasonic ``RangeAdapter`` inside ``DecisionEngine``.
+                   Also feeds a downsampled scan overlay for the web map.
 - ``/odom``     -> :class:`NavigationState.heading` / ``heading_valid``.
 - ``/cmd_vel``  -> :class:`NavigationState.path_correction` (from angular.z)
                    and ``speed_limit`` (from linear.x scaled by max speed).
+- ``/map``      -> web-UI occupancy snapshot (:mod:`map_snapshot`).
+- TF ``map->base_link`` (fallback ``odom->base_link``) -> web-UI robot pose.
 
 ``rclpy`` and message imports are guarded so the module imports cleanly on
 machines without ROS 2; :func:`main` and :func:`spin_in_thread` raise a clear
@@ -26,9 +29,10 @@ from typing import Optional
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import LaserScan
-    from nav_msgs.msg import Odometry
+    from nav_msgs.msg import OccupancyGrid, Odometry
     from geometry_msgs.msg import Twist
 
     _HAS_ROS = True
@@ -42,6 +46,11 @@ from cat_follow.control.types import (
     RangeBackend,
     RangeState,
 )
+from cat_follow.navigation.map_snapshot import (
+    publish_map_grid,
+    publish_robot_pose,
+    publish_scan_overlay,
+)
 from cat_follow.runtime.shared_state import SharedState, now_monotonic_ms
 
 
@@ -54,6 +63,9 @@ MAX_PLANNER_SPEED_MPS = 0.30
 
 # Max |angular.z| (rad/s) that maps to path_correction == +/-1.0.
 MAX_PLANNER_YAW_RATE = 1.5
+
+# How often to sample TF for the web-UI pose (Hz).
+POSE_PUBLISH_HZ = 5.0
 
 
 def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
@@ -84,7 +96,7 @@ def _front_min_distance_cm(
 if _HAS_ROS:
 
     class RosBridge(Node):
-        """rclpy node writing NavigationState + lidar RangeState."""
+        """rclpy node writing NavigationState + lidar RangeState + map snapshot."""
 
         def __init__(
             self,
@@ -104,13 +116,38 @@ if _HAS_ROS:
             self.create_subscription(Odometry, "odom", self._on_odom, 10)
             self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 10)
 
+            # Maps are latched / transient-local from slam_toolbox / map_server.
+            map_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
+
             # Cached navigation fields updated from separate topics.
             self._heading = 0.0
             self._heading_valid = False
             self._path_correction = 0.0
             self._speed_limit = 0.0
+            self._odom_x = 0.0
+            self._odom_y = 0.0
 
-        # ── /scan -> lidar RangeState ────────────────────────────────
+            self._tf_buffer = None
+            self._tf_listener = None
+            try:
+                from tf2_ros import Buffer, TransformListener
+
+                self._tf_buffer = Buffer()
+                self._tf_listener = TransformListener(self._tf_buffer, self)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    "tf2_ros unavailable (%s); web map pose falls back to /odom",
+                    exc,
+                )
+
+            self.create_timer(1.0 / POSE_PUBLISH_HZ, self._on_pose_timer)
+
+        # ── /scan -> lidar RangeState + scan overlay ─────────────────
 
         def _on_scan(self, msg) -> None:  # noqa: ANN001
             dist_cm = _front_min_distance_cm(
@@ -151,13 +188,49 @@ if _HAS_ROS:
                     zone="front",
                 )
             self._ss.update_lidar_range(state)
+            try:
+                publish_scan_overlay(
+                    msg.ranges,
+                    msg.angle_min,
+                    msg.angle_increment,
+                    msg.range_max,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
-        # ── /odom -> NavigationState.heading ─────────────────────────
+        # ── /map -> web occupancy snapshot ───────────────────────────
+
+        def _on_map(self, msg) -> None:  # noqa: ANN001
+            info = msg.info
+            origin = info.origin
+            yaw = _yaw_from_quaternion(
+                origin.orientation.x,
+                origin.orientation.y,
+                origin.orientation.z,
+                origin.orientation.w,
+            )
+            try:
+                publish_map_grid(
+                    data=msg.data,
+                    width=int(info.width),
+                    height=int(info.height),
+                    resolution_m=float(info.resolution),
+                    origin_x=float(origin.position.x),
+                    origin_y=float(origin.position.y),
+                    origin_yaw=float(yaw),
+                    source="ros_/map",
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning("Failed to publish map snapshot: %s", exc)
+
+        # ── /odom -> NavigationState.heading (+ pose fallback) ───────
 
         def _on_odom(self, msg) -> None:  # noqa: ANN001
             q = msg.pose.pose.orientation
             self._heading = _yaw_from_quaternion(q.x, q.y, q.z, q.w)
             self._heading_valid = True
+            self._odom_x = float(msg.pose.pose.position.x)
+            self._odom_y = float(msg.pose.pose.position.y)
             self._publish_navigation()
 
         # ── /cmd_vel -> path_correction + speed_limit ────────────────
@@ -185,6 +258,32 @@ if _HAS_ROS:
                     path_correction=self._path_correction,
                 )
             )
+
+        def _on_pose_timer(self) -> None:
+            """Publish map-frame pose for the web UI (TF preferred)."""
+            if self._tf_buffer is not None:
+                try:
+                    tf = self._tf_buffer.lookup_transform(
+                        "map", "base_link", rclpy.time.Time()
+                    )
+                    t = tf.transform.translation
+                    q = tf.transform.rotation
+                    publish_robot_pose(
+                        x=float(t.x),
+                        y=float(t.y),
+                        yaw=_yaw_from_quaternion(q.x, q.y, q.z, q.w),
+                        frame="map",
+                    )
+                    return
+                except Exception:  # noqa: BLE001 - TF not ready yet
+                    pass
+            if self._heading_valid:
+                publish_robot_pose(
+                    x=self._odom_x,
+                    y=self._odom_y,
+                    yaw=self._heading,
+                    frame="odom",
+                )
 
 
 def spin_in_thread(shared_state: SharedState) -> "threading.Thread":

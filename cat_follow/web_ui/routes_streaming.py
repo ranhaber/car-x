@@ -28,16 +28,17 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 def init_streaming_routes(ctx):
-    """Register streaming routes. ctx must have: shared, state_machine, get_stream_resolution, resolution_options, set_stream_fps."""
+    """Bind streaming context. Route is registered at import time."""
     global _ctx
     _ctx = ctx
 
-    @streaming_bp.route("/stream")
-    def stream():
-        return Response(
-            _generate_mjpeg(),
-            mimetype="multipart/x-mixed-replace; boundary=frame",
-        )
+
+@streaming_bp.route("/stream")
+def stream():
+    return Response(
+        _generate_mjpeg(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 def _encode_jpeg(cv2, display) -> bytes:

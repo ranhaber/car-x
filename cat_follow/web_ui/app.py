@@ -6,14 +6,17 @@ Route modules (Blueprints), same pattern as cat_ball_tracker:
   - routes_streaming.py — GET /stream (MJPEG)
   - routes_control.py   — POST /api/target, POST /api/stop
   - routes_status.py    — GET /api/status
-  - routes_stream_config.py — POST /api/stream/resolution
+  - routes_stream_config.py — POST /api/stream/resolution, GET /api/stream/capabilities
   - routes_detector.py   — GET/POST /api/detector_model
   - routes_calibration.py — GET/POST /api/calibration, POST /api/calibrate/run_speed, run_steer
+  - routes_config.py     — GET /api/config (read-only camera + perception)
 """
+
+from __future__ import annotations
 
 import os
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask
 
@@ -169,13 +172,29 @@ def create_app(
     state_machine=None,
     calibration=None,
     picarx=None,
+    *,
+    runtime_shared: Any = None,
+    comms_manager: Any = None,
 ) -> Flask:
-    """Create and configure the Flask application with Blueprint routes."""
+    """Create and configure the Flask application with Blueprint routes.
+
+    Parameters
+    ----------
+    shared
+        Prototype ``memory.SharedState`` used for frames / bbox / detector model.
+    runtime_shared
+        Optional contract ``runtime.SharedState`` (DecisionEngine / ROS / FSM).
+    comms_manager
+        Optional ``CommsManager`` for contract command routing from the UI.
+    """
     ctx = _AppContext()
     ctx.shared = shared
     ctx.state_machine = state_machine
     ctx.calibration = calibration
     ctx.picarx = picarx
+    ctx.runtime_shared = runtime_shared
+    ctx.comms_manager = comms_manager
+    ctx.h264_available = False
     ctx.get_tracker_fps = get_tracker_fps
     ctx.get_stream_fps = _get_stream_fps
     ctx.set_stream_fps = _set_stream_fps
@@ -206,6 +225,8 @@ def create_app(
     from cat_follow.web_ui.routes_stream_config import stream_config_bp, init_stream_config_routes
     from cat_follow.web_ui.routes_detector import detector_bp, init_detector_routes
     from cat_follow.web_ui.routes_calibration import calibration_bp, init_calibration_routes
+    from cat_follow.web_ui.routes_config import config_bp, init_config_routes
+    from cat_follow.web_ui.routes_map import map_bp, init_map_routes
 
     init_pages_routes()
     init_streaming_routes(ctx)
@@ -214,15 +235,18 @@ def create_app(
     init_stream_config_routes(ctx)
     init_detector_routes(ctx)
     init_calibration_routes(ctx)
+    init_config_routes(ctx)
+    init_map_routes(ctx)
 
     # Optional hardware H.264 WebSocket stream (guarded: no-op if flask-sock /
     # GStreamer mpph264enc are unavailable).
     try:
         from cat_follow.web_ui.routes_h264 import init_h264_routes
 
-        init_h264_routes(ctx, app)
+        ctx.h264_available = bool(init_h264_routes(ctx, app))
     except Exception as exc:  # noqa: BLE001
         _log.debug("H.264 route registration skipped: %s", exc)
+        ctx.h264_available = False
 
     app.register_blueprint(pages_bp)
     app.register_blueprint(streaming_bp)
@@ -231,5 +255,7 @@ def create_app(
     app.register_blueprint(stream_config_bp)
     app.register_blueprint(detector_bp)
     app.register_blueprint(calibration_bp)
+    app.register_blueprint(config_bp)
+    app.register_blueprint(map_bp)
 
     return app

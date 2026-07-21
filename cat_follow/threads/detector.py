@@ -33,6 +33,7 @@ from cat_follow.memory.pool import FRAME_SHAPE
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.perception.motion_detector import MotionDetector
 from cat_follow.perception.phase import Phase, PhaseMachine
+from cat_follow.perception.status import update_perception_diagnostics
 from cat_follow.perception.tuning import apply_affinity, set_opencv_threads
 from cat_follow.perception_config import PerceptionConfig, load_perception_config
 from cat_follow.vision.backends import create_backend
@@ -135,6 +136,7 @@ def run_detector_loop(
         # Cheap motion gate. Prefer the hardware-scaled lores gray frame when
         # the camera publishes one (zero software downscale); otherwise fall
         # back to the full detector snapshot.
+        lores_active = shared.has_lores_gray()
         if config.motion_gating:
             lores_gray = shared.get_lores_gray()
             if lores_gray is not None:
@@ -187,6 +189,15 @@ def run_detector_loop(
         ):
             backend.unload()
             set_opencv_threads(config.opencv_threads_idle)
+
+        update_perception_diagnostics(
+            phase=phase.phase.value,
+            backend=config.backend,
+            model_loaded=bool(backend is not None and backend.loaded),
+            lores_active=lores_active,
+            motion=has_motion,
+            motion_gating=config.motion_gating,
+        )
 
         elapsed = time.monotonic() - t0
         time.sleep(max(0.0, tick - elapsed))

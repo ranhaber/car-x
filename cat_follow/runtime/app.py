@@ -63,6 +63,7 @@ class App:
     )
     ros_nav: bool = False
     ros_bridge_thread: Optional[threading.Thread] = None
+    web_ui_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         self.logger.start()
@@ -74,6 +75,8 @@ class App:
             self.range_adapter.start()
         if self.ros_nav:
             self._start_ros_bridge()
+        if self.web_ui_thread is not None:
+            self.web_ui_thread.start()
         self.control_loop.start()
         if self.udp_receiver is not None:
             self.udp_receiver.start()
@@ -135,6 +138,10 @@ def build_app(
     prototype_perception_threads: Tuple[threading.Thread, ...] = (),
     prototype_perception_stop_event: Optional[threading.Event] = None,
     ros_nav: bool = False,
+    web_ui: bool = False,
+    web_ui_port: int = 5000,
+    web_ui_shared_state: Optional[object] = None,
+    web_ui_picarx: Optional[Any] = None,
 ) -> App:
     """Construct the runtime stack without starting any threads.
 
@@ -167,6 +174,11 @@ def build_app(
       :class:`RangeAdapter` wired to the contract ``SharedState``.
     - Otherwise ``SharedState.range`` stays at its default and the
       obstacle-veto rules in DecisionEngine remain inactive.
+
+    Web UI:
+    - If ``web_ui`` is True, a Flask monitoring thread is prepared and
+      started from :meth:`App.start`. Requires a prototype
+      ``web_ui_shared_state`` (frame ring) for streaming.
     """
 
     shared_state = SharedState()
@@ -235,6 +247,16 @@ def build_app(
             logger=logger,
         )
 
+    web_ui_thread: Optional[threading.Thread] = None
+    if web_ui:
+        web_ui_thread = _build_web_ui_thread(
+            runtime_shared=shared_state,
+            comms_manager=comms_manager,
+            memory_shared=web_ui_shared_state or prototype_vision_shared_state,
+            picarx=web_ui_picarx,
+            port=web_ui_port,
+        )
+
     return App(
         shared_state=shared_state,
         fsm=fsm,
@@ -252,6 +274,74 @@ def build_app(
         prototype_perception_threads=prototype_perception_threads,
         prototype_perception_stop_event=prototype_perception_stop_event,
         ros_nav=ros_nav,
+        web_ui_thread=web_ui_thread,
+    )
+
+
+def _build_web_ui_thread(
+    *,
+    runtime_shared: SharedState,
+    comms_manager: CommsManager,
+    memory_shared: Optional[object],
+    picarx: Optional[Any],
+    port: int,
+) -> Optional[threading.Thread]:
+    """Build a daemon Flask thread for contract-runtime monitoring."""
+    if memory_shared is None:
+        try:
+            from cat_follow.memory.pool import allocate_pool
+            from cat_follow.memory.shared_state import (
+                SharedState as PrototypeSharedState,
+            )
+
+            memory_shared = PrototypeSharedState(allocate_pool())
+            sys.stderr.write(
+                "warning: --web-ui without prototype perception; "
+                "stream frames will stay blank until a camera publishes\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"warning: --web-ui unavailable ({exc!r}); skipping\n"
+            )
+            return None
+
+    try:
+        from cat_follow.calibration import Calibration
+        from cat_follow.web_ui.app import create_app
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(
+            f"warning: --web-ui import failed ({exc!r}); skipping\n"
+        )
+        return None
+
+    try:
+        calibration = Calibration()
+    except Exception:  # noqa: BLE001
+        calibration = None
+
+    flask_app = create_app(
+        shared=memory_shared,
+        state_machine=None,
+        calibration=calibration,
+        picarx=picarx,
+        runtime_shared=runtime_shared,
+        comms_manager=comms_manager,
+    )
+
+    def _run() -> None:
+        # threaded=True so MJPEG + status polls don't block each other.
+        flask_app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+
+    return threading.Thread(
+        target=_run,
+        name="CatFollow-Flask",
+        daemon=True,
     )
 
 
@@ -451,6 +541,21 @@ def main(argv: Optional[list] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--web-ui",
+        action="store_true",
+        help=(
+            "Start the Flask monitoring UI on a background thread. Prefer "
+            "pairing with --with-prototype-perception so the live stream has "
+            "camera frames. The UI is non-authoritative monitoring/config only."
+        ),
+    )
+    parser.add_argument(
+        "--web-ui-port",
+        type=int,
+        default=5000,
+        help="TCP port for --web-ui (default 5000)",
+    )
+    parser.add_argument(
         "--udp-listen-host",
         type=str,
         default=None,
@@ -504,6 +609,9 @@ def main(argv: Optional[list] = None) -> int:
         "udp_target_host": args.udp_target_host,
         "udp_target_port": args.udp_target_port,
         "ros_nav": args.ros_nav,
+        "web_ui": args.web_ui,
+        "web_ui_port": args.web_ui_port,
+        "web_ui_picarx": picarx_instance,
     }
     if proto is not None:
         app_kwargs.update(
@@ -513,6 +621,7 @@ def main(argv: Optional[list] = None) -> int:
             range_read_distance=proto.range_read_distance,
             prototype_perception_threads=tuple(proto.threads),
             prototype_perception_stop_event=proto.stop_event,
+            web_ui_shared_state=proto.shared_state,
         )
 
     app = build_app(**app_kwargs)

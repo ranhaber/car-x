@@ -23,35 +23,47 @@
     }
     header nav a:hover, header nav a.active { color: #e94560; }
 
-    main { flex: 1; padding: 20px; max-width: 900px; margin: 0 auto; width: 100%; }
+    main { flex: 1; padding: 20px; max-width: 960px; margin: 0 auto; width: 100%; }
 
     .stream-container {
       background: #0f0f23; border: 2px solid #0f3460; border-radius: 8px;
-      overflow: hidden; margin-bottom: 16px; text-align: center;
+      overflow: hidden; margin-bottom: 16px; text-align: center; position: relative;
     }
-    .stream-container img {
+    .stream-container img, .stream-container canvas {
       width: 100%; max-width: 640px; height: auto; display: block; margin: 0 auto;
     }
-    .ultrasonic-bar {
-      background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
-      padding: 10px 16px; margin-bottom: 12px; font-size: 1rem;
+    .stream-overlay {
+      position: absolute; left: 12px; top: 10px; font-size: 0.75rem;
+      background: rgba(0,0,0,0.55); padding: 4px 8px; border-radius: 4px;
+      color: #9fe870;
     }
-    .ultrasonic-label { color: #8888aa; text-transform: uppercase; font-size: 0.75rem; margin-right: 8px; }
-    .ultrasonic-value { font-weight: 600; color: #2ecc71; }
+
+    .sensor-bar, .panel {
+      background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+      padding: 10px 16px; margin-bottom: 12px; font-size: 0.95rem;
+    }
+    .sensor-bar { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+    .sensor-label { color: #8888aa; text-transform: uppercase; font-size: 0.75rem; margin-right: 6px; }
+    .sensor-value { font-weight: 600; color: #2ecc71; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .chip {
+      background: #0f3460; color: #e0e0e0; border-radius: 999px;
+      padding: 3px 10px; font-size: 0.75rem;
+    }
+    .chip.warn { background: #7a3e00; color: #ffd28a; }
+    .chip.danger { background: #5c1520; color: #ff9aa8; }
 
     .controls {
       display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; align-items: flex-end;
     }
     .control-group { display: flex; flex-direction: column; gap: 4px; }
     .control-group label { font-size: 0.75rem; color: #8888aa; text-transform: uppercase; }
-    .control-group input {
-      background: #16213e; border: 1px solid #0f3460; color: #e0e0e0;
-      padding: 8px 12px; border-radius: 4px; width: 100px; font-size: 0.95rem;
-    }
-    .control-group select {
+    .control-group input, .control-group select {
       background: #16213e; border: 1px solid #0f3460; color: #e0e0e0;
       padding: 8px 12px; border-radius: 4px; font-size: 0.95rem;
     }
+    .control-group input { width: 100px; }
 
     button {
       padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer;
@@ -61,6 +73,8 @@
     .btn-send:hover { background: #1a5276; }
     .btn-stop { background: #e94560; color: #fff; }
     .btn-stop:hover { background: #c0392b; }
+    .btn-chase { background: #1e7a46; color: #fff; }
+    .btn-chase:hover { background: #19663a; }
 
     .status-bar {
       background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
@@ -73,6 +87,22 @@
     .status-item .value { font-size: 1rem; font-weight: 600; }
     .status-item .value.state-idle { color: #8888aa; }
     .status-item .value.state-active { color: #2ecc71; }
+
+    .panel h2 {
+      font-size: 0.85rem; color: #a0a0c0; text-transform: uppercase;
+      margin-bottom: 8px; letter-spacing: 0.04em;
+    }
+    .panel pre {
+      white-space: pre-wrap; word-break: break-word; font-size: 0.75rem;
+      color: #b8b8d0; max-height: 180px; overflow: auto;
+    }
+
+    .map-panel canvas {
+      width: 100%; max-width: 640px; height: auto;
+      background: #0a0a14; border: 1px solid #0f3460; border-radius: 6px;
+      display: block; margin: 8px auto 0;
+    }
+    .map-meta { font-size: 0.8rem; color: #a0a0c0; margin-top: 6px; }
 
     .feedback {
       margin-top: 8px; padding: 8px 12px; border-radius: 4px;
@@ -97,20 +127,79 @@
   </nav>
 </header>
 
-<main x-data="catFollow()" x-init="startPolling()">
+<main x-data="catFollow()" x-init="start()">
 
-  <!-- Ultrasonic distance above stream -->
-  <div class="ultrasonic-bar" x-show="true">
-    <span class="ultrasonic-label">Ultrasonic:</span>
-    <span class="ultrasonic-value" x-text="status.ultrasonic_cm != null ? status.ultrasonic_cm.toFixed(1) + ' cm' : '—'"></span>
+  <div class="sensor-bar">
+    <div>
+      <span class="sensor-label">Mode</span>
+      <span class="sensor-value" x-text="status.mode || 'prototype'"></span>
+    </div>
+    <div>
+      <span class="sensor-label">Ultrasonic</span>
+      <span class="sensor-value"
+            x-text="status.ultrasonic_cm != null ? status.ultrasonic_cm.toFixed(1) + ' cm' : '—'"></span>
+    </div>
+    <div>
+      <span class="sensor-label">Lidar</span>
+      <span class="sensor-value"
+            x-text="lidarText()"></span>
+    </div>
+    <div>
+      <span class="sensor-label">Stream clients</span>
+      <span class="sensor-value" x-text="status.stream_clients ?? 0"></span>
+    </div>
   </div>
 
-  <!-- Stream -->
   <div class="stream-container">
-    <img :src="streamUrl" alt="Live stream" />
+    <img x-show="streamMode === 'mjpeg'" :src="streamUrl" alt="Live stream" />
+    <canvas x-show="streamMode === 'h264'" x-ref="h264Canvas" width="640" height="480"></canvas>
+    <div class="stream-overlay" x-text="overlayText()"></div>
   </div>
 
-  <!-- Controls -->
+  <div class="panel map-panel">
+    <h2>Live map (ROS / lidar)</h2>
+    <div class="map-meta" x-text="mapMetaText()"></div>
+    <canvas x-ref="mapCanvas" width="640" height="480"></canvas>
+  </div>
+
+  <div class="panel" x-show="status.mode === 'contract'">
+    <h2>Safety / fusion</h2>
+    <div>
+      Decision:
+      <strong x-text="(status.decision && status.decision.reason) || '—'"></strong>
+      · speed <span x-text="fmt(status.decision && status.decision.speed)"></span>
+      · steer <span x-text="fmt(status.decision && status.decision.steering)"></span>
+      · brake <span x-text="status.decision && status.decision.brake ? 'yes' : 'no'"></span>
+    </div>
+    <div class="chips">
+      <template x-for="c in (status.decision && status.decision.active_constraints) || []" :key="c">
+        <span class="chip" :class="chipClass(c)" x-text="c"></span>
+      </template>
+      <span class="chip" x-show="!(status.decision && status.decision.active_constraints && status.decision.active_constraints.length)">none</span>
+    </div>
+  </div>
+
+  <div class="panel" x-show="status.mode === 'contract'">
+    <h2>Navigation</h2>
+    <div>
+      path_correction <strong x-text="fmt(status.navigation && status.navigation.path_correction)"></strong>
+      · speed_limit <strong x-text="fmt(status.navigation && status.navigation.speed_limit)"></strong>
+      · heading <strong x-text="navHeading()"></strong>
+      · fresh <strong x-text="status.navigation && status.navigation.fresh ? 'yes' : 'no'"></strong>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Perception</h2>
+    <div>
+      phase <strong x-text="(status.perception && status.perception.phase) || '—'"></strong>
+      · backend <strong x-text="(status.perception && status.perception.backend) || '—'"></strong>
+      · model <strong x-text="(status.perception && status.perception.model_loaded) ? 'loaded' : 'idle'"></strong>
+      · lores <strong x-text="(status.perception && status.perception.lores_active) ? 'on' : 'off'"></strong>
+      · motion <strong x-text="(status.perception && status.perception.motion) ? 'yes' : 'no'"></strong>
+    </div>
+  </div>
+
   <div class="controls">
     <div class="control-group">
       <label>X (meters)</label>
@@ -121,9 +210,18 @@
       <input type="number" step="0.1" x-model="targetY" placeholder="0.0" />
     </div>
     <button class="btn-send" @click="sendTarget()">Send Target</button>
+    <button class="btn-chase" @click="startChase()" x-show="status.mode === 'contract'">Start Chase</button>
     <button class="btn-stop" @click="sendStop()">STOP</button>
+    <button class="btn-stop" @click="emergencyStop()" x-show="status.mode === 'contract'">E-STOP</button>
 
     <div class="control-group" style="margin-left: auto;">
+      <label>Stream</label>
+      <select x-model="streamMode" @change="changeStreamMode()">
+        <option value="mjpeg">MJPEG</option>
+        <option value="h264" :disabled="!caps.h264">H.264</option>
+      </select>
+    </div>
+    <div class="control-group">
       <label>Stream resolution</label>
       <select x-model="resolution" @change="changeResolution()">
         <option value="640x480">640x480</option>
@@ -134,22 +232,21 @@
     <div class="control-group">
       <label>Detector model</label>
       <select x-model="detectorModel" @change="changeDetectorModel()">
-        <option value="ssd_mobilenet_v2">SSD MobileNet V2</option>
-        <option value="efficientdet_lite0">EfficientDet-Lite0</option>
+        <template x-for="(label, key) in detectorOptions" :key="key">
+          <option :value="key" x-text="label"></option>
+        </template>
       </select>
     </div>
   </div>
 
-  <!-- Feedback -->
   <div class="feedback" :class="{ show: feedback, ok: feedbackOk, err: !feedbackOk }"
        x-text="feedback" x-show="feedback"
        x-transition.duration.300ms></div>
 
-  <!-- Status bar -->
   <div class="status-bar">
     <div class="status-item">
       <div class="label">State</div>
-      <div class="value" :class="status.state === 'idle' ? 'state-idle' : 'state-active'"
+      <div class="value" :class="isIdleState() ? 'state-idle' : 'state-active'"
            x-text="status.state"></div>
     </div>
     <div class="status-item">
@@ -190,6 +287,12 @@
     </div>
   </div>
 
+  <div class="panel" style="margin-top: 12px;">
+    <h2>Effective config (read-only)</h2>
+    <button class="btn-send" @click="fetchConfig()" style="margin-bottom: 8px;">Refresh config</button>
+    <pre x-text="configText"></pre>
+  </div>
+
 </main>
 
 <footer>Cat Follow v{{ version }}</footer>
@@ -201,29 +304,91 @@ function catFollow() {
     targetY: 0.0,
     resolution: '640x480',
     streamUrl: '/stream',
+    streamMode: 'mjpeg',
+    caps: { mjpeg: true, h264: false },
     feedback: '',
     feedbackOk: true,
+    detectorModel: 'ssd_mobilenet_v2',
+    detectorOptions: {
+      ssd_mobilenet_v2: 'SSD MobileNet V2',
+      efficientdet_lite0: 'EfficientDet-Lite0',
+    },
+    configText: '(not loaded)',
+    mapData: null,
+    _h264Overlay: { state: '', bbox: null },
+    _ws: null,
+    _mapPollTimer: null,
+    _mapImage: null,
 
     status: {
+      mode: 'prototype',
       state: 'idle',
       odometry: { x: 0, y: 0, heading_deg: 0 },
       bbox_tracker: { x: 0, y: 0, w: 0, h: 0, valid: 0 },
       ultrasonic_cm: null,
       tracker_fps: 0,
       stream_fps: 0,
+      stream_clients: 0,
       app_version: '{{ version }}',
       cpu_percent: -1,
       ram_percent: -1,
       cpu_temp: -1,
       battery_v: -1,
+      perception: {},
+      decision: null,
+      navigation: null,
+      lidar: null,
+      range: null,
     },
 
     _pollTimer: null,
 
-    startPolling() {
+    start() {
       this.fetchStatus();
       this.fetchDetectorModel();
+      this.fetchCapabilities();
+      this.fetchConfig();
+      this.fetchMap();
       this._pollTimer = setInterval(() => this.fetchStatus(), 1000);
+      this._mapPollTimer = setInterval(() => this.fetchMap(), 500);
+    },
+
+    fmt(v) {
+      if (v === null || v === undefined || Number.isNaN(v)) return '—';
+      return Number(v).toFixed(2);
+    },
+
+    lidarText() {
+      const l = this.status.lidar;
+      if (!l || l.distance_cm == null) return '—';
+      const mark = l.fresh ? '' : ' (stale)';
+      return l.distance_cm.toFixed(1) + ' cm' + mark;
+    },
+
+    navHeading() {
+      const n = this.status.navigation;
+      if (!n || !n.heading_valid) return '—';
+      return (n.heading * 180 / Math.PI).toFixed(1) + '°';
+    },
+
+    overlayText() {
+      if (this.streamMode === 'h264' && this._h264Overlay.state) {
+        return 'H.264 · ' + this._h264Overlay.state;
+      }
+      const phase = (this.status.perception && this.status.perception.phase) || '';
+      return (this.status.state || '') + (phase ? ' · ' + phase : '');
+    },
+
+    isIdleState() {
+      const s = (this.status.state || '').toLowerCase();
+      return s === 'idle' || s === 'home';
+    },
+
+    chipClass(c) {
+      if (!c) return '';
+      if (c.includes('veto') || c.includes('critical') || c.includes('failsafe')) return 'danger';
+      if (c.includes('obstacle') || c.includes('stale') || c.includes('dead_end')) return 'warn';
+      return '';
     },
 
     async fetchStatus() {
@@ -236,6 +401,167 @@ function catFollow() {
       } catch (e) { /* ignore fetch errors */ }
     },
 
+    async fetchCapabilities() {
+      try {
+        const res = await fetch('/api/stream/capabilities');
+        if (res.ok) {
+          this.caps = await res.json();
+          if (!this.caps.h264 && this.streamMode === 'h264') {
+            this.streamMode = 'mjpeg';
+          }
+        }
+      } catch (e) { /* ignore */ }
+    },
+
+    async fetchConfig() {
+      try {
+        const res = await fetch('/api/config');
+        if (res.ok) {
+          const data = await res.json();
+          this.configText = JSON.stringify(data, null, 2);
+        }
+      } catch (e) {
+        this.configText = '(failed to load)';
+      }
+    },
+
+    mapMetaText() {
+      const m = this.mapData;
+      if (!m) return 'Waiting for /api/map…';
+      if (!m.available) return m.note || 'No map yet (start ros-nav / mapping with C1 connected)';
+      const pose = m.pose || {};
+      const px = (pose.x != null) ? pose.x.toFixed(2) : '—';
+      const py = (pose.y != null) ? pose.y.toFixed(2) : '—';
+      const yaw = (pose.yaw != null) ? (pose.yaw * 180 / Math.PI).toFixed(1) + '°' : '—';
+      return m.width + '×' + m.height + ' @ ' + Number(m.resolution_m).toFixed(3) + ' m/cell'
+        + ' · pose (' + px + ', ' + py + ') ' + yaw
+        + ' [' + (pose.frame || '?') + (pose.fresh ? '' : ', stale') + ']'
+        + ' · source ' + (m.source || '—');
+    },
+
+    async fetchMap() {
+      try {
+        const res = await fetch('/api/map');
+        if (!res.ok) return;
+        const data = await res.json();
+        this.mapData = data;
+        this.drawMap(data);
+      } catch (e) { /* ignore */ }
+    },
+
+    drawMap(m) {
+      const canvas = this.$refs.mapCanvas;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width;
+      const H = canvas.height;
+      ctx.fillStyle = '#0a0a14';
+      ctx.fillRect(0, 0, W, H);
+
+      if (!m || !m.available || !m.cells_b64 || !m.width || !m.height) {
+        ctx.fillStyle = '#8888aa';
+        ctx.font = '16px sans-serif';
+        ctx.fillText(m && m.note ? m.note : 'No occupancy map yet', 24, 40);
+        ctx.fillText('Needs --ros-nav + slam_toolbox publishing /map', 24, 68);
+        return;
+      }
+
+      const gw = m.width;
+      const gh = m.height;
+      // Decode base64 cells once into ImageData-sized buffer.
+      const bin = atob(m.cells_b64);
+      if (bin.length < gw * gh) {
+        ctx.fillStyle = '#e07070';
+        ctx.fillText('Map payload truncated', 24, 40);
+        return;
+      }
+
+      // Fit map into canvas with margin, preserving aspect.
+      const margin = 12;
+      const scale = Math.min((W - 2 * margin) / gw, (H - 2 * margin) / gh);
+      const dw = gw * scale;
+      const dh = gh * scale;
+      const ox = (W - dw) / 2;
+      const oy = (H - dh) / 2;
+
+      const img = ctx.createImageData(gw, gh);
+      for (let i = 0; i < gw * gh; i++) {
+        const v = bin.charCodeAt(i);
+        let r, g, b;
+        if (v >= 200) { r = 30; g = 30; b = 36; }       // occupied
+        else if (v >= 100) { r = 55; g = 55; b = 80; }  // unknown
+        else { r = 210; g = 210; b = 220; }             // free
+        const p = i * 4;
+        img.data[p] = r; img.data[p + 1] = g; img.data[p + 2] = b; img.data[p + 3] = 255;
+      }
+      // OccupancyGrid is row-major with y=0 at the origin (often bottom-left).
+      // Flip vertically for screen coordinates.
+      const off = document.createElement('canvas');
+      off.width = gw; off.height = gh;
+      const octx = off.getContext('2d');
+      octx.putImageData(img, 0, 0);
+      ctx.save();
+      ctx.translate(ox, oy + dh);
+      ctx.scale(scale, -scale);
+      ctx.drawImage(off, 0, 0);
+      ctx.restore();
+
+      // World -> canvas helpers (map frame meters).
+      const res = Number(m.resolution_m) || 0.05;
+      const originX = Number(m.origin_x) || 0;
+      const originY = Number(m.origin_y) || 0;
+      const worldToCanvas = (wx, wy) => {
+        const mx = (wx - originX) / res;
+        const my = (wy - originY) / res;
+        return {
+          x: ox + mx * scale,
+          y: oy + dh - my * scale,
+        };
+      };
+
+      // Scan rays from robot pose.
+      const pose = m.pose || {};
+      if (pose.fresh && Array.isArray(m.scan) && m.scan.length) {
+        ctx.strokeStyle = 'rgba(46, 204, 113, 0.35)';
+        ctx.lineWidth = 1;
+        const yaw = Number(pose.yaw) || 0;
+        for (const pt of m.scan) {
+          const a = yaw + Number(pt.angle);
+          const r = Number(pt.range_m);
+          if (!isFinite(r) || r <= 0) continue;
+          const ex = Number(pose.x) + r * Math.cos(a);
+          const ey = Number(pose.y) + r * Math.sin(a);
+          const p0 = worldToCanvas(pose.x, pose.y);
+          const p1 = worldToCanvas(ex, ey);
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.stroke();
+        }
+      }
+
+      // Robot pose arrow.
+      if (pose && (pose.fresh || pose.x != null)) {
+        const p = worldToCanvas(Number(pose.x) || 0, Number(pose.y) || 0);
+        const yaw = Number(pose.yaw) || 0;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        // Screen y is flipped vs world; negate yaw for drawing.
+        ctx.rotate(-yaw);
+        ctx.fillStyle = '#e94560';
+        ctx.beginPath();
+        ctx.moveTo(12, 0);
+        ctx.lineTo(-8, 7);
+        ctx.lineTo(-8, -7);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+      }
+    },
+
     async sendTarget() {
       try {
         const res = await fetch('/api/target', {
@@ -245,7 +571,7 @@ function catFollow() {
         });
         const data = await res.json();
         if (res.ok) {
-          this.showFeedback('Target sent: (' + data.x + ', ' + data.y + ')', true);
+          this.showFeedback('Target sent: (' + data.x + ', ' + data.y + ') [' + data.mode + ']', true);
         } else {
           this.showFeedback(data.error || 'Error', false);
         }
@@ -257,10 +583,38 @@ function catFollow() {
     async sendStop() {
       try {
         const res = await fetch('/api/stop', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          this.showFeedback('Stop command sent', true);
+          this.showFeedback('Stop command sent [' + (data.mode || 'ok') + ']', true);
         } else {
           this.showFeedback('Error sending stop', false);
+        }
+      } catch (e) {
+        this.showFeedback('Network error', false);
+      }
+    },
+
+    async startChase() {
+      try {
+        const res = await fetch('/api/command/start_chase', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          this.showFeedback('Start chase accepted', true);
+        } else {
+          this.showFeedback(data.error || 'Start chase failed', false);
+        }
+      } catch (e) {
+        this.showFeedback('Network error', false);
+      }
+    },
+
+    async emergencyStop() {
+      try {
+        const res = await fetch('/api/command/emergency_stop', { method: 'POST' });
+        if (res.ok) {
+          this.showFeedback('Emergency stop sent', true);
+        } else {
+          this.showFeedback('E-stop failed', false);
         }
       } catch (e) {
         this.showFeedback('Network error', false);
@@ -275,13 +629,81 @@ function catFollow() {
           body: JSON.stringify({ resolution: this.resolution }),
         });
         if (res.ok) {
-          // Reload the stream by toggling the src
-          this.streamUrl = '';
-          setTimeout(() => { this.streamUrl = '/stream'; }, 100);
+          if (this.streamMode === 'mjpeg') {
+            this.streamUrl = '';
+            setTimeout(() => { this.streamUrl = '/stream'; }, 100);
+          }
           this.showFeedback('Resolution: ' + this.resolution, true);
         }
       } catch (e) {
         this.showFeedback('Error changing resolution', false);
+      }
+    },
+
+    changeStreamMode() {
+      this.stopH264();
+      if (this.streamMode === 'h264') {
+        if (!this.caps.h264) {
+          this.streamMode = 'mjpeg';
+          this.showFeedback('H.264 unavailable on this host', false);
+          return;
+        }
+        this.streamUrl = '';
+        this.startH264();
+        this.showFeedback('Switched to H.264 WebSocket stream', true);
+      } else {
+        this.streamUrl = '/stream';
+        this.showFeedback('Switched to MJPEG', true);
+      }
+    },
+
+    startH264() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(proto + '://' + location.host + '/ws/h264');
+      ws.binaryType = 'arraybuffer';
+      this._ws = ws;
+      const canvas = this.$refs.h264Canvas;
+      const ctx = canvas ? canvas.getContext('2d') : null;
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'overlay') {
+              this._h264Overlay = msg;
+              if (ctx && msg.bbox && msg.bbox[4]) {
+                // Lightweight client overlay outline (video frames are opaque).
+                ctx.strokeStyle = '#2ecc71';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]);
+              }
+            }
+          } catch (e) { /* ignore */ }
+          return;
+        }
+        // Without a JS H.264 decoder we still keep the WS open for encode
+        // load testing / client counting. Show status on canvas.
+        if (ctx) {
+          ctx.fillStyle = '#0f0f23';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#9fe870';
+          ctx.font = '16px sans-serif';
+          ctx.fillText('H.264 stream connected (raw Annex-B chunks)', 24, 40);
+          ctx.fillText('State: ' + (this._h264Overlay.state || '—'), 24, 68);
+          ctx.fillText('Install a browser MSE/WebCodecs client later for video decode', 24, 96);
+        }
+      };
+      ws.onerror = () => this.showFeedback('H.264 WebSocket error', false);
+      ws.onclose = () => {
+        if (this.streamMode === 'h264') {
+          this.showFeedback('H.264 WebSocket closed', false);
+        }
+      };
+    },
+
+    stopH264() {
+      if (this._ws) {
+        try { this._ws.close(); } catch (e) {}
+        this._ws = null;
       }
     },
 
@@ -290,6 +712,7 @@ function catFollow() {
         const res = await fetch('/api/detector_model');
         if (res.ok) {
           const data = await res.json();
+          if (data.options) this.detectorOptions = data.options;
           if (data.current) this.detectorModel = data.current;
         }
       } catch (e) { /* ignore */ }
