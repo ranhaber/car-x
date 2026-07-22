@@ -142,7 +142,9 @@ Overhead data is not authoritative for car-local heading, local steering, or obs
 Every shared-state group must carry:
 - `timestamp_ms`: producer timestamp when the data was generated or sampled. This is useful for cross-device log correlation and should be synchronized with NTP/Chrony where possible.
 - `received_ms`: PiCar-X local monotonic timestamp when the data entered the car process. This is authoritative for freshness, timeout, and failsafe decisions.
-- `fresh: bool`: computed by max-age policy.
+- `fresh: bool`: producer/adaptor status hint only; consumers must recompute
+  authoritative freshness from local monotonic `received_ms` and the applicable
+  max-age policy.
 - `authority`: string/enum naming the producer.
 - `confidence`: producer-specific confidence when available.
 
@@ -150,9 +152,10 @@ Max usable ages:
 
 | Data Group | Max Age | Expired Behavior |
 |---|---:|---|
-| `vision` | 200 ms | Local visual lock is invalid |
-| `range` | 100 ms | Range cannot authorize final approach; obstacle state becomes conservative |
-| `navigation` | 200 ms | Navigation constraints are stale; reduce speed or stop depending on state |
+| `vision` | 350 ms | Dispatch `CAT_LOST`; `TRACK_B -> CHASE_A` |
+| `range` | 500 ms | Sensor cannot authorize navigation; fail closed if no other obstacle sensor is usable |
+| `lidar` | 500 ms | Sensor cannot authorize navigation; fail closed if no other obstacle sensor is usable |
+| `navigation` | 500 ms | Clear navigation drive terms and stop/degrade according to state |
 | `overhead` warning | 300 ms | Reduce speed to safe crawl |
 | `overhead` expired | 700 ms | Enter `FAILSAFE` |
 | `system/thermal` | 1000 ms | Treat thermal state as unknown and conservative |
@@ -163,7 +166,7 @@ Freshness is computed from PiCar-X local monotonic time:
 age_ms = now_monotonic_ms - received_ms
 ```
 
-Freshness must not be computed from producer `timestamp_ms`, because synchronized wall-clock time can drift, jump, or be temporarily unavailable.
+Freshness must not be computed from producer `timestamp_ms`, because synchronized wall-clock time can drift, jump, or be temporarily unavailable. The stored `fresh` field is advisory only; `DecisionEngine` recomputes freshness on every tick from local monotonic time and `received_ms`.
 
 The control thread must not mix a fresh field with an expired field as if both describe the same moment. If required data for a state is expired, `DecisionEngine` must degrade, fallback, or stop according to the state-specific policy.
 
@@ -183,8 +186,11 @@ Per-tick budget:
 
 Overrun behavior:
 - Single tick over `20 ms`: emit `control_tick_overrun` telemetry.
-- `3` consecutive overruns: apply conservative speed limiting.
-- Any tick over `100 ms`: command safe stop and emit critical telemetry.
+- `3` consecutive overruns: emergency-stop and latch `FAILSAFE`.
+- Any tick over `100 ms`: emergency-stop, latch `FAILSAFE`, and emit critical telemetry.
+- Any unhandled tick exception: emergency-stop and latch `FAILSAFE`.
+- The latch inhibits subsequent motor output until an accepted operator
+  `clear_failsafe` command.
 - If the loop cannot maintain at least `20 Hz`, reduce speed or stop.
 
 Telemetry file I/O must never run inside the control tick; it belongs to the async telemetry thread.
@@ -200,6 +206,13 @@ Responsibilities:
 - update shared overhead state
 - detect stale stream
 - receive reliable commands including `start_chase`, `stop_chase`, `return_home`, and `go_to`
+
+The UDP adapter authenticates command datagrams when
+`CAT_FOLLOW_COMMS_TOKEN` is configured. A command must carry the matching
+top-level JSON `token`; missing/invalid tokens are dropped before
+`CommsManager`. Tracking datagrams remain ungated. Accepted
+`emergency_stop` commands invoke the motor stop and FAILSAFE hook
+synchronously before the ACK is emitted.
 
 The current web/API command queue should become a dev/test injection path. It may reuse the internal command channel but must not be the production overhead interface.
 
@@ -414,9 +427,30 @@ Recommended target:
 Affinity must be optional and must safely no-op on Windows or unsupported platforms.
 
 ### 11.3 Bounded Async Logging
-Telemetry logging uses a bounded queue. If the queue is full, low-priority telemetry may be dropped, but safety/failsafe events should be preserved whenever possible.
+Telemetry logging uses a bounded queue. If the queue is full, low-priority
+telemetry may be dropped, but safety/failsafe events are preserved ahead of
+lower-severity records. If a sink write fails after a batch is dequeued, that
+batch is moved into a bounded retry buffer and retried before newer events.
+Retry-buffer overflow evicts the lowest-severity records first so CRITICAL
+failsafe forensics are the last records discarded.
 
 This prevents logging backpressure from slowing the control loop.
+
+### 11.4 Monitoring-map freshness and frame safety
+
+The web map is non-authoritative, but it must not present stale or
+frame-incompatible data as live. `/api/map` recomputes freshness at read time:
+
+| Data | TTL |
+|---|---:|
+| robot pose | 1500 ms |
+| lidar scan overlay | 1500 ms |
+| occupancy map | 30000 ms |
+
+Scan rays and the robot marker are drawn on the occupancy grid only when the
+pose is fresh and expressed in the `map` frame. If `map -> base_link` TF fails,
+the bridge may report an `odom` pose for diagnostics, but the UI marks
+`pose_on_map=false` and does not overlay it on the map grid.
 
 ## 12. Telemetry Events
 Telemetry should be JSONL and include at minimum:

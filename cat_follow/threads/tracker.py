@@ -74,6 +74,29 @@ def _bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float
 def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target_fps: float = 30.0) -> None:
     tick = 1.0 / target_fps
     frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
+    # Separate buffer holding the exact frame the detector inferred on, used to
+    # (re)initialize the tracker on the same pixels that produced the bbox.
+    det_frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
+
+    def _init_on_detector_frame(bbox_int, det_gen):
+        """Create + init a tracker on the detector's frame iff that frame's
+        generation still matches the bbox generation.
+
+        Returns the initialized tracker, or ``None`` if creation/init failed or
+        the frame/bbox generations disagree (avoids wrong-pixel init).
+        """
+        frame_gen = shared.get_detector_frame_and_gen(det_frame_buf)
+        if det_gen < 0 or det_gen != frame_gen:
+            # The published detector frame no longer matches this bbox; skip
+            # this cycle rather than initializing on mismatched pixels.
+            return None
+        try:
+            trk = _create_tracker()
+            if trk.init(det_frame_buf, bbox_int):
+                return trk
+        except Exception as e:  # noqa: BLE001
+            log.warning("Tracker init failed: %s", e)
+        return None
 
     # Tracker instance
     tracker = None
@@ -102,8 +125,11 @@ def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target
         shared.get_frame_latest(frame_buf)
         now = time.monotonic()
 
-        # Read detector bbox and maintain short history for confirmation
-        det = shared.get_bbox_detector()
+        # Read detector bbox (with its frame generation) and maintain short
+        # history for confirmation.
+        det_wg = shared.get_bbox_detector_with_gen()
+        det = det_wg[:5]
+        det_gen = det_wg[5]
         if det[4] > 0:
             det_bbox = (float(det[0]), float(det[1]), float(det[2]), float(det[3]))
             det_history.append((det_bbox, now))
@@ -129,18 +155,11 @@ def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target
                 x, y, w, h = det_history[-1][0]
                 bbox = (int(x), int(y), int(w), int(h))
                 if tracker_creator is not None:
-                    try:
-                        tracker = _create_tracker()
-                        ok = tracker.init(frame_buf, bbox)
-                        if ok:
-                            shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
-                            last_reinit = now
-                            log.info("Tracker initialized from confirmed detector bbox: %s", str(bbox))
-                        else:
-                            tracker = None
-                    except Exception as e:
-                        log.warning("Tracker init failed: %s", e)
-                        tracker = None
+                    tracker = _init_on_detector_frame(bbox, det_gen)
+                    if tracker is not None:
+                        shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
+                        last_reinit = now
+                        log.info("Tracker initialized from confirmed detector bbox: %s", str(bbox))
                 else:
                     # no OpenCV available; publish detector bbox directly
                     shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
@@ -157,10 +176,17 @@ def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target
             if ok and newbox is not None:
                 nx, ny, nw, nh = newbox
                 shared.set_bbox_tracker(float(nx), float(ny), float(nw), float(nh), 1.0)
+                # Refresh the local tracker bbox so the IoU/fuse step below uses
+                # the *updated* box, not the pre-update snapshot (which would
+                # pull the published box backward).
+                tr_bbox = (float(nx), float(ny), float(nw), float(nh))
+                tr_valid = True
             else:
                 # tracking failed -> mark invalid and drop tracker to allow re-init
                 shared.set_bbox_tracker(0.0, 0.0, 0.0, 0.0, 0.0)
                 tracker = None
+                tr_bbox = None
+                tr_valid = False
 
         # If tracker exists and detector is present, decide whether to fuse or re-init
         if tracker is not None and det[4] > 0 and tr_bbox is not None:
@@ -189,18 +215,11 @@ def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target
                 if confirmed:
                     x, y, w, h = det_history[-1][0]
                     bbox = (int(x), int(y), int(w), int(h))
-                    try:
-                        tracker = _create_tracker()
-                        ok = tracker.init(frame_buf, bbox)
-                        if ok:
-                            shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
-                            last_reinit = now
-                            log.info("Tracker re-initialized after disagreement: %s", str(bbox))
-                        else:
-                            tracker = None
-                    except Exception as e:
-                        log.warning("Tracker re-init failed: %s", e)
-                        tracker = None
+                    tracker = _init_on_detector_frame(bbox, det_gen)
+                    if tracker is not None:
+                        shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
+                        last_reinit = now
+                        log.info("Tracker re-initialized after disagreement: %s", str(bbox))
 
         # If no tracker and no detector, ensure bbox invalid
         if tracker is None and det[4] == 0:

@@ -30,6 +30,8 @@ from cat_follow.control.types import (
     DecisionInput,
     DecisionOutput,
     DecisionState,
+    FsmState,
+    ReasonCode,
     TelemetryEventType,
     TelemetrySeverity,
 )
@@ -166,13 +168,36 @@ class ControlLoop:
             try:
                 self.tick(tick_start_ms)
             except Exception:
-                # Control thread must never die silently in V2.  Future
-                # work surfaces this through ``thread_health`` telemetry.
+                # A tick exception means we cannot produce a fresh, trusted
+                # decision.  Fail closed: latch FAILSAFE and emergency-stop so
+                # the next tick cannot re-drive on stale state.
                 self._log_thread_exception()
+                self._latch_failsafe(reason="control_tick_exception")
             elapsed_ms = now_monotonic_ms() - tick_start_ms
             remaining_s = period_s - (elapsed_ms / 1000.0)
             if remaining_s > 0:
                 self._stop.wait(remaining_s)
+
+    def _latch_failsafe(self, *, reason: str) -> None:
+        """Latch FAILSAFE and inhibit motors until an operator CLEAR_FAILSAFE.
+
+        Forcing the shared FSM to FAILSAFE makes every subsequent
+        ``DecisionEngine.tick`` emit a safe-stop (only ``clear_failsafe``
+        leaves FAILSAFE), so the latch holds across ticks instead of allowing
+        an immediate re-drive.
+        """
+        try:
+            self._motor.emergency_stop(reason=reason)
+        except Exception:
+            pass
+        try:
+            if self._fsm.state != FsmState.FAILSAFE:
+                self._fsm.force_state(
+                    FsmState.FAILSAFE, reason=ReasonCode.FAILSAFE_TRIGGERED
+                )
+                self._ss.update_fsm(self._fsm.snapshot())
+        except Exception:
+            pass
 
     def _log_decision(self, output: DecisionOutput) -> None:
         if self._logger is None:
@@ -208,20 +233,27 @@ class ControlLoop:
 
         self._consecutive_overruns += 1
         critical = elapsed_ms >= self._critical_overrun_ms
-        if critical:
-            # Critical overrun: command emergency stop and emit telemetry
-            # at critical severity so the failsafe survives the queue's
-            # drop policy.
-            try:
-                self._motor.emergency_stop(reason="control_tick_overrun")
-            except Exception:
-                pass
+        # A single critical overrun, or repeated overruns beyond the configured
+        # limit, both indicate the loop can no longer meet its deadline.  Latch
+        # FAILSAFE (not just a one-shot e-stop) so motors stay inhibited until
+        # an operator CLEAR_FAILSAFE rather than re-driving on the next tick.
+        limit_exceeded = (
+            self._consecutive_overruns >= self._consecutive_overrun_limit
+        )
+        if critical or limit_exceeded:
+            self._latch_failsafe(
+                reason=(
+                    "control_tick_overrun_critical"
+                    if critical
+                    else "control_consecutive_overruns"
+                )
+            )
 
         if self._logger is None:
             return
         severity = (
             TelemetrySeverity.CRITICAL
-            if critical
+            if (critical or limit_exceeded)
             else TelemetrySeverity.WARNING
         )
         self._logger.log(

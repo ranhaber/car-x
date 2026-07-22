@@ -209,6 +209,14 @@ def create_app(
     ctx.inc_stream_clients = inc_stream_clients
     ctx.dec_stream_clients = dec_stream_clients
     ctx.get_stream_clients = get_stream_clients
+    # Serializes web-initiated direct hardware access (calibration motor tests)
+    # so two routines cannot drive the shared Picarx concurrently.
+    ctx.hardware_lock = threading.Lock()
+
+    # Warn once if motion-causing endpoints are unauthenticated.
+    from cat_follow.web_ui.auth import warn_if_unauthenticated
+
+    warn_if_unauthenticated("0.0.0.0")
 
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     static_dir = os.path.join(os.path.dirname(__file__), "static")

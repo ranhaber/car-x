@@ -2,8 +2,8 @@
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
 **Compute target:** Radxa ROCK 4D (primary)  
 **Navigation:** ROS 2 Jazzy hybrid (Nav2 + slam_toolbox) + `cat_follow` runtime  
-**Version:** 1.0  
-**Status:** ROS 2 stack deployed; C1 hardware validation pending
+**Version:** 1.1  
+**Status:** Software safety review complete; ROS 2 stack deployed; C1 hardware validation pending
 
 ## 1. Purpose
 This document defines how software components integrate on the ROCK 4D:
@@ -115,6 +115,35 @@ sudo systemctl daemon-reload
 sudo systemctl disable ros-nav.service cat-follow-ros.service
 ```
 
+#### Provision the RKNN detection model (required)
+Detection is RKNN-only; the runtime has no CPU/TFLite fallback, so a fresh
+deployment is not functional until a `.rknn` model is present. Build it once on
+an x86 workstation with `rknn-toolkit2`, copy it to the board, and point the env
+at it:
+
+```bash
+# On an x86 workstation (rknn-toolkit2 installed):
+python scripts/convert_to_rknn.py \
+  --src models/ssd_mobilenet_v2_320x320.tflite \
+  --dst models/ssd_mobilenet_v2.rknn \
+  --dataset dataset.txt
+
+# Copy to the board (path must match CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH,
+# resolved relative to /opt/car-x):
+scp models/ssd_mobilenet_v2.rknn picarx@<board>:/opt/car-x/models/
+```
+
+The board runs the lightweight `rknnlite` runtime (install it into the venv on
+the ROCK 4D). At startup the detector worker validates the backend and reports
+readiness to the main thread through a **startup handshake**: the supervisor
+blocks until the worker confirms a usable model (one real inference + output
+contract check), so a missing/corrupt model or a failed init aborts startup and
+the service exits non-zero (visible in `journalctl`) instead of the daemon
+thread silently dying. Each service unit also has an `ExecStartPre`
+file-existence guard for a clearer message. Ensure
+`CAT_FOLLOW_PERCEPTION_RKNN_INPUT` matches the converted model's input geometry
+(320,320 for the documented model).
+
 ### 3.5 Deployment progress (2026-07-20)
 - [x] ROS 2 Jazzy `ros-base` installed on ROCK 4D.
 - [x] `slam_toolbox` and Nav2 bringup installed.
@@ -125,11 +154,57 @@ sudo systemctl disable ros-nav.service cat-follow-ros.service
 - [ ] Connect the C1 and verify that the installed udev rule creates `/dev/rplidar`.
 - [ ] Launch the C1 at 460800 baud and verify `/scan`.
 
-### 3.6 NPU / RKNN (later milestone)
-If adding NPU-accelerated vision on native Ubuntu 24.04:
-- Use **Python 3.11 venv** (Miniforge) for RKNN-Toolkit-Lite2 wheels.
+### 3.6 NPU / RKNN (sole detection backend)
+Detection runs exclusively on the RK3576 NPU via RKNN; there is no CPU/TFLite
+fallback. When the RKNN runtime (`rknnlite`) is present but the `.rknn` model
+is missing or fails to load, startup hard-fails with a `RuntimeError`. The
+deterministic stub is **opt-in**: it only runs on machines that both lack the
+RKNN runtime *and* set `CAT_FOLLOW_PERCEPTION_ALLOW_STUB=1` (dev laptop / CI).
+In production `ALLOW_STUB` stays `0`, so a broken/uninstalled `rknnlite` never
+masquerades as valid detection. At runtime, a failed NPU reload after
+idle-unload or `CAT_FOLLOW_PERCEPTION_MAX_INFER_FAILURES` consecutive inference
+failures escalate: the detector records the error in `perception.error` on
+`/api/status` and stops the app (systemd restarts the unit) rather than
+returning empty detections forever.
+
+- Use **Python 3.11 venv** (Miniforge) for RKNN-Toolkit-Lite2 (`rknnlite`) runtime wheels on the board.
+- Convert the model on an x86 workstation with `rknn-toolkit2` (`scripts/convert_to_rknn.py`), then set `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` (and `CAT_FOLLOW_PERCEPTION_RKNN_INPUT`).
 - Add udev rule for `/dev/rknpu` group access.
 - Consider `cma=512M` or `1024M` in boot env for large camera buffers.
+
+### 3.7 Production safety and control-channel security
+
+The 0.7.x safety review established the following runtime rules:
+
+- `DecisionEngine` recomputes range, lidar, navigation, and vision freshness
+  from local monotonic `received_ms`; stored `fresh=True` values are advisory.
+- `/cmd_vel` and `/odom` age independently. Navigation drive data is usable
+  only while both are within TTL, and stale planner speed/steering terms are
+  cleared.
+- Navigation drive fails closed unless at least one obstacle sensor is fresh
+  and valid. In `CHASE_A`, Nav2 is advisory (steering bias/speed cap); `GOTO`
+  remains the Nav2-driven mode.
+- Detector fatal errors, control-tick exceptions, critical overruns, repeated
+  overruns, and accepted emergency-stop commands synchronously stop the motors
+  and latch `FAILSAFE` until an operator clears it.
+- Map, pose, and scan freshness is recomputed when `/api/map` is read. A fresh
+  odom-frame fallback pose is not overlaid on a map-frame occupancy grid when
+  TF localization fails.
+- Failed telemetry sink writes are re-buffered and retried; bounded overflow
+  evicts lower-severity records before CRITICAL failsafe forensics.
+
+Configure motion-channel authentication in `/etc/car-x/car-x.env`:
+
+```text
+CAT_FOLLOW_WEB_CONTROL_TOKEN=<strong-random-secret>
+CAT_FOLLOW_COMMS_TOKEN=<strong-random-secret>
+```
+
+The web token protects motion-causing control/calibration routes; stop and
+emergency-stop remain intentionally unauthenticated. UDP command packets must
+carry a matching top-level JSON `token` when `CAT_FOLLOW_COMMS_TOKEN` is set.
+Tracking packets are unaffected. Unset tokens retain development compatibility
+but produce startup warnings and are not appropriate on an exposed network.
 
 ## 4. `robot_hat` port for ROCK 4D (Option B)
 
@@ -218,6 +293,8 @@ The environment file sets:
 ```text
 ROBOT_HAT_GPIO_BACKEND=rock4d
 ROBOT_HAT_I2C_BUS=8
+CAT_FOLLOW_WEB_CONTROL_TOKEN=<deployment secret>
+CAT_FOLLOW_COMMS_TOKEN=<deployment secret>
 PYTHONPATH=/opt/car-x
 PYTHONUNBUFFERED=1
 ```
@@ -334,12 +411,20 @@ ros_ws/                    # optional colcon workspace
 
 ### 6.3 DecisionEngine fusion (CHASE_A / GOTO)
 ```text
-pursuit_steer  ← overhead cat or go_to target
-path_correction ← NavigationState (from Nav2)
-final_steer = clamp(pursuit_steer + path_correction)
-final_speed = min(pursuit_speed, navigation.speed_limit × max_speed)
+freshness ← recompute from local monotonic received_ms + per-source TTL
+drive gate ← fresh navigation AND at least one fresh/valid obstacle sensor
+
+CHASE_A:
+  local pursuit speed = 0 until vision pursuit owns forward motion
+  Nav2 path_correction may bias steering and speed_limit may cap speed
+
+GOTO:
+  final_steer = clamp(local target steer + Nav2 path_correction)
+  final_speed = min(local target speed, Nav2 speed_limit × max_speed)
 ```
-Obstacle veto from ultrasonic/range and lidar-critical sectors unchanged.
+Critical ultrasonic/lidar veto still has precedence over navigation. If all
+obstacle sensors are stale, invalid, or report no usable reading, navigation
+outputs a safe stop with the `obstacle_sensor_unavailable` constraint.
 
 ### 6.4 What not to vendor into Python
 Do **not** copy Nav2 or slam_toolbox sources into `cat_follow`. Run them as
@@ -359,7 +444,7 @@ wrapper unless ROS is unavailable.
 | Thread / process | Responsibility | Rate |
 |------------------|----------------|------|
 | `cat_follow` main | FSM, DecisionEngine, adapters | 50 Hz control |
-| `CatFollow-Proc` | Camera + TFLite (or NPU later) | independent |
+| `CatFollow-Proc` | Camera + RKNN NPU detection | independent |
 | `CatFollow-Comms` | Overhead UDP | ~10 Hz |
 | `CatFollow-Range` | Ultrasonic adapter | ~20 Hz |
 | ROS 2 `sllidar_ros2` | `/scan` | ~10 Hz |
@@ -405,6 +490,9 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 ### M4f — Production hardening
 - [x] WiFi power-save-off config authored (`scripts/default-wifi-powersave-off.conf`).
 - [x] systemd units authored (`scripts/ros-nav.service`, `scripts/cat-follow-ros.service`).
+- [x] Safety review findings covered by automated regression tests (334 passing).
+- [x] Web/UDP motion paths support shared-secret authentication and warn when open.
+- [x] CRITICAL telemetry survives transient sink failure through bounded retry.
 - [ ] Thermal/fan policy documented.
 - [ ] JSONL telemetry includes navigation + scan health end-to-end on hardware.
 

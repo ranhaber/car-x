@@ -37,11 +37,20 @@ def _force_deterministic_stubs(monkeypatch):
     The camera falls back to its no-cv2 stub, and the detector's backend
     factory is forced to report "no usable model" so the detector runs its
     deterministic bbox stub regardless of what is installed on the host.
+
+    The deterministic stub is opt-in (production hard-fails without an NPU), so
+    the dev/CI flag is enabled for these integration tests.
     """
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "1")
     monkeypatch.setattr(camera_module, "_HAS_CV2", False)
 
     class _UnavailableBackend:
         loaded = False
+
+        def runtime_available(self):
+            # No RKNN runtime on the host -> detector takes the stub path
+            # (not the hard-fail path).
+            return False
 
         def available(self):
             return False
@@ -52,7 +61,7 @@ def _force_deterministic_stubs(monkeypatch):
         def unload(self):
             return None
 
-        def warmup(self):
+        def self_test(self):
             return None
 
         def infer(self, frame_bgr, score_threshold):
@@ -222,6 +231,402 @@ def test_no_exceptions_during_run():
 
     for name, was_alive in alive_flags.items():
         assert was_alive, f"Thread {name} died before stop (likely exception)"
+
+
+def test_detector_hard_fails_when_runtime_present_but_model_missing(monkeypatch):
+    """If the RKNN runtime is present but the model is missing, the detector
+    loop must raise RuntimeError rather than silently degrade."""
+
+    class _RuntimePresentNoModel:
+        loaded = False
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return False
+
+        def load(self):
+            return False
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            raise RuntimeError("model missing")
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _RuntimePresentNoModel(),
+    )
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    with pytest.raises(RuntimeError):
+        run_detector_loop(shared, stop, target_fps=1.0)
+
+
+def test_detector_hard_fails_when_model_fails_strict_validation(monkeypatch):
+    """A model that loads but fails the strict inference/output-contract check
+    must raise at preflight, not silently return empty detections."""
+
+    class _RuntimePresentCorruptModel:
+        loaded = False
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return True  # file exists...
+
+        def load(self):
+            return True  # ...loads, but inference/output contract is broken
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            # Strict validation catches the unusable model.
+            raise ValueError("output contract mismatch")
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _RuntimePresentCorruptModel(),
+    )
+
+    with pytest.raises(RuntimeError):
+        detector_module.preflight_perception()
+
+
+def test_preflight_returns_false_without_runtime(monkeypatch):
+    """When the RKNN runtime is absent (dev/CI), preflight reports stub mode
+    (False) instead of raising."""
+
+    class _NoRuntime:
+        loaded = False
+
+        def runtime_available(self):
+            return False
+
+        def available(self):
+            return False
+
+        def load(self):
+            return False
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            return None
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _NoRuntime(),
+    )
+    assert detector_module.preflight_perception() is False
+
+
+def test_detector_hard_fails_without_runtime_when_stub_disabled(monkeypatch):
+    """In production (stub disabled) a missing RKNN runtime must NOT quietly
+    enable the fake-detection stub -- it must hard-fail."""
+
+    class _NoRuntime:
+        loaded = False
+
+        def runtime_available(self):
+            return False
+
+        def available(self):
+            return False
+
+        def load(self):
+            return False
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            return None
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "0")
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _NoRuntime(),
+    )
+    with pytest.raises(RuntimeError):
+        detector_module.preflight_perception()
+
+
+def test_startup_handshake_reports_failure(monkeypatch):
+    """A backend that fails validation must report the failure through the
+    handshake so a supervisor waiting on it aborts startup."""
+
+    class _RuntimePresentCorruptModel:
+        loaded = False
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return True
+
+        def load(self):
+            return True
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            raise ValueError("output contract mismatch")
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _RuntimePresentCorruptModel(),
+    )
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    handshake = detector_module.DetectorHandshake()
+    t = threading.Thread(
+        target=run_detector_loop,
+        args=(shared, stop),
+        kwargs={"target_fps": 1.0, "handshake": handshake},
+        daemon=True,
+    )
+    t.start()
+    try:
+        with pytest.raises(RuntimeError):
+            handshake.wait_ready(timeout=3.0)
+    finally:
+        stop.set()
+        t.join(timeout=3.0)
+    assert stop.is_set()
+
+
+def test_startup_handshake_reports_stub_ready(monkeypatch):
+    """When the stub is allowed and no runtime is present, the handshake must
+    report readiness in stub mode (not raise)."""
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "1")
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    handshake = detector_module.DetectorHandshake()
+    t = threading.Thread(
+        target=run_detector_loop,
+        args=(shared, stop),
+        kwargs={"target_fps": 5.0, "handshake": handshake},
+        daemon=True,
+    )
+    t.start()
+    try:
+        npu_ready = handshake.wait_ready(timeout=3.0)
+        assert npu_ready is False  # stub mode
+    finally:
+        stop.set()
+        t.join(timeout=3.0)
+
+
+def test_detector_escalates_on_repeated_inference_failure(monkeypatch):
+    """Repeated inference failures must escalate: the detector sets stop_event
+    (notifying the supervisor) rather than returning empty forever."""
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "1")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_MOTION_GATING", "0")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_MAX_INFER_FAILURES", "3")
+
+    class _FailingBackend:
+        loaded = True
+        consecutive_failures = 0
+        last_error = "boom"
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return True
+
+        def load(self):
+            return True
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            return None
+
+        def infer(self, frame_bgr, score_threshold):
+            self.consecutive_failures += 1
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _FailingBackend(),
+    )
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    handshake = detector_module.DetectorHandshake()
+    t = threading.Thread(
+        target=run_detector_loop,
+        args=(shared, stop),
+        kwargs={"target_fps": 20.0, "handshake": handshake},
+        daemon=True,
+    )
+    t.start()
+    # The worker should escalate within a few ticks and set stop_event itself.
+    for _ in range(50):
+        if stop.is_set():
+            break
+        time.sleep(0.05)
+    t.join(timeout=3.0)
+    assert stop.is_set(), "detector should escalate repeated failures via stop_event"
+
+
+def test_fatal_hook_buffers_until_handler_set():
+    """A fatal fired before the handler is wired is delivered once set."""
+    hook = detector_module.DetectorFatalHook()
+    received = []
+    hook.fire("early failure")
+    assert hook.fired is True
+    assert received == []  # no handler yet
+    hook.set_handler(received.append)
+    assert received == ["early failure"]
+
+
+def test_detector_startup_failure_fires_on_fatal(monkeypatch):
+    """A backend that fails strict validation must notify the supervisor via
+    on_fatal (so it can e-stop + FAILSAFE), not just die on the thread."""
+
+    class _CorruptModel:
+        loaded = False
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return True
+
+        def load(self):
+            return True
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            raise ValueError("contract mismatch")
+
+        def infer(self, frame_bgr, score_threshold):
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _CorruptModel(),
+    )
+
+    fatal = []
+    hook = detector_module.DetectorFatalHook()
+    hook.set_handler(fatal.append)
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    handshake = detector_module.DetectorHandshake()
+    t = threading.Thread(
+        target=run_detector_loop,
+        args=(shared, stop),
+        kwargs={"target_fps": 1.0, "handshake": handshake, "on_fatal": hook},
+        daemon=True,
+    )
+    t.start()
+    with pytest.raises(RuntimeError):
+        handshake.wait_ready(timeout=3.0)
+    t.join(timeout=3.0)
+    assert fatal, "on_fatal handler should have been invoked on startup failure"
+
+
+def test_detector_runtime_escalation_fires_on_fatal(monkeypatch):
+    """Repeated inference failures escalate through on_fatal and stop_event."""
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "1")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_MOTION_GATING", "0")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_MAX_INFER_FAILURES", "2")
+
+    class _FailingBackend:
+        loaded = True
+        consecutive_failures = 0
+        last_error = "boom"
+
+        def runtime_available(self):
+            return True
+
+        def available(self):
+            return True
+
+        def load(self):
+            return True
+
+        def unload(self):
+            return None
+
+        def self_test(self):
+            return None
+
+        def infer(self, frame_bgr, score_threshold):
+            self.consecutive_failures += 1
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(
+        detector_module,
+        "create_backend",
+        lambda *args, **kwargs: _FailingBackend(),
+    )
+
+    fatal = []
+    hook = detector_module.DetectorFatalHook()
+    hook.set_handler(fatal.append)
+
+    pool = allocate_pool()
+    shared = SharedState(pool)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_detector_loop,
+        args=(shared, stop),
+        kwargs={"target_fps": 20.0, "on_fatal": hook},
+        daemon=True,
+    )
+    t.start()
+    for _ in range(50):
+        if stop.is_set():
+            break
+        time.sleep(0.05)
+    t.join(timeout=3.0)
+    assert stop.is_set()
+    assert fatal, "on_fatal handler should have been invoked on runtime escalation"
 
 
 # ── run as script ────────────────────────────────────────────────────────

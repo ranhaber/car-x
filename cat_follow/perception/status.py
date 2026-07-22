@@ -15,11 +15,14 @@ from typing import Any, Dict
 @dataclass(frozen=True)
 class PerceptionDiagnostics:
     phase: str = "IDLE"
-    backend: str = "tflite"
+    backend: str = "rknn"
     model_loaded: bool = False
     lores_active: bool = False
     motion: bool = False
     motion_gating: bool = True
+    # Non-empty when the detector has escalated a fatal runtime error (e.g. a
+    # failed NPU reload or repeated inference failures).
+    error: str = ""
 
 
 _lock = threading.Lock()
@@ -34,6 +37,7 @@ def update_perception_diagnostics(
     lores_active: bool | None = None,
     motion: bool | None = None,
     motion_gating: bool | None = None,
+    error: str | None = None,
 ) -> None:
     """Merge non-None fields into the published diagnostics snapshot."""
     global _current
@@ -52,6 +56,7 @@ def update_perception_diagnostics(
             motion_gating=(
                 cur.motion_gating if motion_gating is None else bool(motion_gating)
             ),
+            error=cur.error if error is None else str(error),
         )
 
 

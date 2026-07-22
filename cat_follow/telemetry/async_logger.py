@@ -118,9 +118,15 @@ class AsyncLogger:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._queue: deque = deque()
+        # Events already dequeued but whose sink write failed.  Kept so a
+        # transient sink failure does not silently drop telemetry (especially
+        # CRITICAL failsafe forensics).  Retried on the next drain, ahead of the
+        # main queue; bounded, dropping lowest-priority first on overflow.
+        self._pending_retry: deque = deque()
         self._next_event_id = 1
         self._dropped_low_priority = 0
         self._dropped_high_priority = 0
+        self._sink_failures = 0
         self._writer: Optional[threading.Thread] = None
 
     # ── lifecycle ───────────────────────────────────────────────────
@@ -183,8 +189,10 @@ class AsyncLogger:
         with self._lock:
             return {
                 "queued": len(self._queue),
+                "pending_retry": len(self._pending_retry),
                 "dropped_low_priority": self._dropped_low_priority,
                 "dropped_high_priority": self._dropped_high_priority,
+                "sink_failures": self._sink_failures,
                 "next_event_id": self._next_event_id,
             }
 
@@ -265,6 +273,13 @@ class AsyncLogger:
         events: list = []
         had_critical = False
         with self._lock:
+            # Retry previously-failed events first (in order) so a recovered
+            # sink drains them ahead of newer events.
+            while self._pending_retry and len(events) < self._flush_batch_size:
+                event = self._pending_retry.popleft()
+                events.append(event)
+                if event["severity"] == TelemetrySeverity.CRITICAL.value:
+                    had_critical = True
             while self._queue and len(events) < self._flush_batch_size:
                 event = self._queue.popleft()
                 events.append(event)
@@ -278,10 +293,45 @@ class AsyncLogger:
                 force_flush=force_flush or had_critical,
             )
         except Exception:
-            # Telemetry must never crash the control loop.  Sink errors are
-            # swallowed; future work can surface them through a metrics
-            # channel once thread_health telemetry is wired in.
-            pass
+            # Telemetry must never crash the control loop, but neither should a
+            # transient sink failure silently drop already-dequeued events
+            # (CRITICAL failsafe forensics in particular).  Re-buffer them for
+            # retry on the next drain; the periodic flush interval avoids a hot
+            # spin against a persistently failing sink.
+            self._requeue_failed(events)
+
+    def _requeue_failed(self, events: list) -> None:
+        """Return failed events to the retry buffer, preserving order.
+
+        The retry buffer is bounded by ``max_queue``; on overflow the
+        lowest-severity events are dropped first so CRITICAL/ERROR forensics are
+        the last thing lost.
+        """
+        with self._lock:
+            self._sink_failures += 1
+            # Prepend in original order (extendleft reverses, so reverse first).
+            self._pending_retry.extendleft(reversed(events))
+            # Enforce the bound, evicting the lowest-rank events first.
+            while len(self._pending_retry) > self._max_queue:
+                min_idx = 0
+                min_rank = None
+                for idx, queued in enumerate(self._pending_retry):
+                    rank = _SEVERITY_RANK[TelemetrySeverity(queued["severity"])]
+                    if min_rank is None or rank < min_rank:
+                        min_rank = rank
+                        min_idx = idx
+                        if rank == 0:
+                            break
+                self._pending_retry.rotate(-min_idx)
+                dropped = self._pending_retry.popleft()
+                self._pending_retry.rotate(min_idx)
+                if dropped["severity"] in (
+                    TelemetrySeverity.DEBUG.value,
+                    TelemetrySeverity.INFO.value,
+                ):
+                    self._dropped_low_priority += 1
+                else:
+                    self._dropped_high_priority += 1
 
 
 def _enum_value(value) -> str:

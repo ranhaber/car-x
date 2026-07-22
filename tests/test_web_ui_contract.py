@@ -24,7 +24,7 @@ from cat_follow.web_ui.app import create_app
 def test_perception_diagnostics_roundtrip():
     update_perception_diagnostics(
         phase="TRACKING",
-        backend="tflite",
+        backend="rknn",
         model_loaded=True,
         lores_active=True,
         motion=True,
@@ -34,6 +34,48 @@ def test_perception_diagnostics_roundtrip():
     assert d.phase == "TRACKING"
     assert d.model_loaded is True
     assert d.lores_active is True
+
+
+def test_motion_endpoint_open_when_no_token(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    proto = PrototypeSharedState(allocate_pool())
+    app = create_app(shared=proto)
+    client = app.test_client()
+    res = client.post("/api/target", json={"x": 1.0, "y": 2.0})
+    assert res.status_code == 200
+
+
+def test_motion_endpoint_requires_token_when_set(monkeypatch):
+    monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    proto = PrototypeSharedState(allocate_pool())
+    app = create_app(shared=proto)
+    client = app.test_client()
+
+    # Missing token -> 401
+    res = client.post("/api/target", json={"x": 1.0, "y": 2.0})
+    assert res.status_code == 401
+
+    # Wrong token -> 401
+    res = client.post(
+        "/api/target", json={"x": 1.0, "y": 2.0}, headers={"X-Control-Token": "nope"}
+    )
+    assert res.status_code == 401
+
+    # Correct token -> 200
+    res = client.post(
+        "/api/target", json={"x": 1.0, "y": 2.0}, headers={"X-Control-Token": "s3cret"}
+    )
+    assert res.status_code == 200
+
+
+def test_stop_endpoint_never_requires_token(monkeypatch):
+    monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    proto = PrototypeSharedState(allocate_pool())
+    app = create_app(shared=proto)
+    client = app.test_client()
+    # Stopping the car must always be allowed, even without a token.
+    assert client.post("/api/stop").status_code == 200
+    assert client.post("/api/command/emergency_stop").status_code == 200
 
 
 def test_status_prototype_mode(monkeypatch):

@@ -90,3 +90,62 @@ def test_map_snapshot_dict_empty_note():
     d = map_snapshot_dict()
     assert d["available"] is False
     assert "No map" in d["note"]
+
+
+def test_freshness_recomputed_at_read_time(monkeypatch):
+    import cat_follow.navigation.map_snapshot as ms
+
+    clock = {"t": 1000}
+    monkeypatch.setattr(ms, "_now_ms", lambda: clock["t"])
+
+    publish_map_grid(
+        data=[0] * 100,
+        width=10,
+        height=10,
+        resolution_m=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    publish_robot_pose(x=0.0, y=0.0, yaw=0.0, frame="map")
+    publish_scan_overlay([1.0, 2.0], 0.0, 0.5, 10.0)
+
+    d = map_snapshot_dict()
+    assert d["pose_fresh"] is True
+    assert d["scan_fresh"] is True
+    assert d["map_fresh"] is True
+    assert d["pose_on_map"] is True
+    assert d["pose"]["fresh"] is True
+
+    # Advance the clock past the pose/scan TTL but within the map TTL.
+    clock["t"] = 1000 + ms.POSE_STALE_MS + 1
+    d = map_snapshot_dict()
+    assert d["pose_fresh"] is False
+    assert d["scan_fresh"] is False
+    assert d["pose_on_map"] is False
+    assert d["pose"]["fresh"] is False
+    assert d["map_fresh"] is True
+
+    # Advance past the map TTL: map ages out too.
+    clock["t"] = 1000 + ms.MAP_STALE_MS + 1
+    assert map_snapshot_dict()["map_fresh"] is False
+
+
+def test_odom_frame_pose_not_flagged_for_map_overlay(monkeypatch):
+    import cat_follow.navigation.map_snapshot as ms
+
+    monkeypatch.setattr(ms, "_now_ms", lambda: 5000)
+
+    publish_map_grid(
+        data=[0] * 100,
+        width=10,
+        height=10,
+        resolution_m=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    # TF failed -> bridge falls back to the odom frame.
+    publish_robot_pose(x=1.0, y=2.0, yaw=0.3, frame="odom")
+
+    d = map_snapshot_dict()
+    assert d["pose_fresh"] is True
+    assert d["pose_on_map"] is False  # odom pose must not overlay the map grid

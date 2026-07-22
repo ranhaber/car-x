@@ -6,7 +6,9 @@ from cat_follow.memory.shared_state import SharedState
 from cat_follow.threads.detector import run_detector_loop
 
 
-def test_detector_stub_publishes_bbox():
+def test_detector_stub_publishes_bbox(monkeypatch):
+    # The deterministic stub is opt-in; production hard-fails without an NPU.
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ALLOW_STUB", "1")
     pool = allocate_pool()
     shared = SharedState(pool)
 

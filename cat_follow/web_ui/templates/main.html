@@ -433,9 +433,15 @@ function catFollow() {
       const px = (pose.x != null) ? pose.x.toFixed(2) : '—';
       const py = (pose.y != null) ? pose.y.toFixed(2) : '—';
       const yaw = (pose.yaw != null) ? (pose.yaw * 180 / Math.PI).toFixed(1) + '°' : '—';
+      let poseTag;
+      if (!m.pose_fresh) poseTag = (pose.frame || '?') + ', stale';
+      else if (!m.pose_on_map) poseTag = (pose.frame || '?') + ', not localized to map';
+      else poseTag = pose.frame || '?';
+      const mapTag = m.map_fresh ? '' : ' · map stale';
       return m.width + '×' + m.height + ' @ ' + Number(m.resolution_m).toFixed(3) + ' m/cell'
         + ' · pose (' + px + ', ' + py + ') ' + yaw
-        + ' [' + (pose.frame || '?') + (pose.fresh ? '' : ', stale') + ']'
+        + ' [' + poseTag + ']'
+        + mapTag
         + ' · source ' + (m.source || '—');
     },
 
@@ -519,9 +525,11 @@ function catFollow() {
         };
       };
 
-      // Scan rays from robot pose.
+      // Scan rays from robot pose.  Only overlay when the pose is fresh AND
+      // localized to the map frame (pose_on_map); an odom-frame fallback pose
+      // drifts relative to the map grid and must not be drawn over it.
       const pose = m.pose || {};
-      if (pose.fresh && Array.isArray(m.scan) && m.scan.length) {
+      if (m.pose_on_map && m.scan_fresh && Array.isArray(m.scan) && m.scan.length) {
         ctx.strokeStyle = 'rgba(46, 204, 113, 0.35)';
         ctx.lineWidth = 1;
         const yaw = Number(pose.yaw) || 0;
@@ -540,8 +548,9 @@ function catFollow() {
         }
       }
 
-      // Robot pose arrow.
-      if (pose && (pose.fresh || pose.x != null)) {
+      // Robot pose arrow.  Only draw over the map grid when localized to the
+      // map frame; otherwise the odom-frame pose would land at a wrong cell.
+      if (m.pose_on_map) {
         const p = worldToCanvas(Number(pose.x) || 0, Number(pose.y) || 0);
         const yaw = Number(pose.yaw) || 0;
         ctx.save();

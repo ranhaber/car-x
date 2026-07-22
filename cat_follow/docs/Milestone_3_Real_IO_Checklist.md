@@ -62,6 +62,11 @@ cat_follow/
 - [x] `cat_follow/runtime/app.py` exposes `--udp-listen-port`,
   `--udp-listen-host`, `--udp-target-host`, `--udp-target-port` flags
   to enable transport at runtime.
+- [x] When `CAT_FOLLOW_COMMS_TOKEN` is configured, UDP command
+  datagrams require a matching top-level JSON `token`; missing/invalid
+  tokens are dropped and logged. Tracking datagrams remain ungated.
+- [x] The receiver emits a startup warning when UDP command
+  authentication is disabled.
 
 ### 4.3 Vision adapter
 - [x] `cat_follow/perception/vision_adapter.py` reads the prototype
@@ -69,9 +74,11 @@ cat_follow/
   ``VisionState`` into the contract ``SharedState.vision``.
 - [x] Translates pixel-space ``(x, y, w, h)`` bboxes into normalized
   horizontal offset ``x_offset_norm`` in ``[-1.0, 1.0]``.
-- [x] Tracks ``cat_visible_stable`` after N consecutive frames (default
-  3, matching Interface spec section 10.4).
-- [x] Tracks ``last_seen_ms`` and emits ``vision_update`` telemetry.
+- [x] Tracks ``cat_visible_stable`` after N new tracker generations
+  (default 3, matching Interface spec section 10.4); repeated adapter
+  polls of a sticky bbox do not advance stability.
+- [x] Tracks ``last_seen_ms`` and ages ``received_ms`` from genuine
+  tracker observations so frozen tracking data expires.
 - [x] Unit tests cover invisible/visible transitions, offset math,
   clamping, stability, last-seen tracking, telemetry, and the polling
   thread (`tests/test_perception_vision_adapter.py`).
@@ -86,7 +93,9 @@ cat_follow/
 - [x] Emits ``range_update`` telemetry per update; ``thread_health`` on
   exceptions.
 - [x] Sensor failures (``None`` reads or callable exceptions) yield a
-  ``confidence=0.0`` state so DecisionEngine's veto logic short-circuits.
+  ``confidence=0.0`` state. `DecisionEngine` treats that sensor as
+  unusable and fails navigation closed if no other fresh, valid
+  obstacle sensor is available.
 - [x] Unit tests cover normal/obstacle/critical distances, severity
   ramp, sensor failures, telemetry, and the polling thread
   (`tests/test_perception_range_adapter.py`).
@@ -122,8 +131,8 @@ Milestone 3 is complete when:
 
 ## 6. Status
 - 4.1 PiCar-X motor backend — code + 10 tests landed; CLI flag wired in.
-- 4.2 UDP transport — receiver, sender, integration tests, and CLI
-  flags landed. 8 unit tests + 1 app-level round-trip test pass.
+- 4.2 UDP transport — receiver, sender, integration tests, CLI flags,
+  and optional shared-secret command authentication landed.
 - 4.3 Vision adapter — code + 12 unit tests + 1 app-level integration
   test landed. ``build_app`` accepts ``prototype_vision_shared_state``
   + ``vision_image_width``/``vision_image_height`` and constructs a
@@ -139,7 +148,8 @@ Milestone 3 is complete when:
   ``--udp-target-host``, ``--udp-target-port``.  Single-command Pi
   bring-up is now possible.
 
-**Total tests:** 148 passing across all milestones.
+**Current repository baseline:** 334 tests passing across all milestones,
+including safety-review regression coverage.
 
 **Remaining open item:** Manual smoke test on the actual PiCar-X
 hardware.  All software pieces are in place and verified end-to-end on

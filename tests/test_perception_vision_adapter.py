@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cat_follow.perception.vision_adapter import VisionAdapter  # noqa: E402
 from cat_follow.runtime.shared_state import SharedState  # noqa: E402
+from cat_follow.memory.pool import allocate_pool  # noqa: E402
+from cat_follow.memory.shared_state import SharedState as ProtoSharedState  # noqa: E402
 from cat_follow.telemetry.async_logger import AsyncLogger, CallableSink  # noqa: E402
 from cat_follow.control.types import TelemetryEventType  # noqa: E402
 
@@ -162,6 +164,45 @@ def test_stability_resets_on_loss():
     assert s1.cat_visible_stable is False
     assert s2.cat_visible_stable is False
     assert s3.cat_visible_stable is True
+
+
+# ── generation-keyed stability / freshness ─────────────────────────
+
+
+def test_stability_keyed_off_tracker_generation_not_poll_rate():
+    """With a generation-aware prototype SS, repeatedly polling an unchanged
+    tracker bbox must NOT accumulate stability; only new tracker frames do."""
+    proto = ProtoSharedState(allocate_pool())
+    contract = SharedState()
+    adapter = VisionAdapter(
+        proto, contract, image_width=640, image_height=480, stability_frames=3
+    )
+
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)  # one new frame (gen)
+    last = None
+    for _ in range(5):
+        last = adapter.update()
+    # Five polls, but only ONE genuinely new tracker frame -> not stable.
+    assert last.cat_visible_stable is False
+
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)  # 2nd new frame
+    assert adapter.update().cat_visible_stable is False
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)  # 3rd new frame
+    assert adapter.update().cat_visible_stable is True
+
+
+def test_frozen_tracker_ages_out_received_ms():
+    """A frozen tracker (no generation change) must not keep advancing
+    received_ms, so the DecisionEngine can age vision out."""
+    proto = ProtoSharedState(allocate_pool())
+    contract = SharedState()
+    adapter = VisionAdapter(proto, contract, image_width=640, image_height=480)
+
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)
+    s1 = adapter.update()
+    time.sleep(0.01)
+    s2 = adapter.update()  # same generation -> stale, received_ms held
+    assert s2.received_ms == s1.received_ms
 
 
 # ── last_seen_ms ───────────────────────────────────────────────────

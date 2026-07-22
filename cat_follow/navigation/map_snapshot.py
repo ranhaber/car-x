@@ -27,6 +27,15 @@ DEFAULT_MAX_DIM = 200
 # Max scan endpoints retained for the ray overlay.
 DEFAULT_MAX_SCAN_POINTS = 72
 
+# Freshness TTLs (ms).  Freshness is recomputed at read time from the relevant
+# ``received_ms`` so a stalled ROS bridge / dead SLAM node stops looking live
+# instead of leaving the last sample authoritative forever.  The map is latched
+# (transient-local) and updates slowly, so it gets a much longer TTL than the
+# fast pose/scan streams.
+POSE_STALE_MS = 1500
+SCAN_STALE_MS = 1500
+MAP_STALE_MS = 30000
+
 
 @dataclass(frozen=True)
 class RobotPose:
@@ -56,6 +65,7 @@ class MapSnapshot:
     cells_b64: str = ""
     pose: RobotPose = field(default_factory=RobotPose)
     scan: Tuple[ScanPoint, ...] = ()
+    scan_received_ms: int = 0
     source: str = "none"
     received_ms: int = 0
     note: str = ""
@@ -197,6 +207,7 @@ def publish_map_grid(
             cells_b64=encode_cells_b64(cells) if cells else "",
             pose=prev.pose,
             scan=prev.scan,
+            scan_received_ms=prev.scan_received_ms,
             source=source,
             received_ms=_now_ms(),
             note="",
@@ -231,6 +242,7 @@ def publish_robot_pose(
                 received_ms=_now_ms(),
             ),
             scan=prev.scan,
+            scan_received_ms=prev.scan_received_ms,
             source=prev.source,
             received_ms=prev.received_ms,
             note=prev.note,
@@ -260,6 +272,7 @@ def publish_scan_overlay(
             cells_b64=prev.cells_b64,
             pose=prev.pose,
             scan=points,
+            scan_received_ms=_now_ms(),
             source=prev.source,
             received_ms=prev.received_ms,
             note=prev.note,
@@ -275,6 +288,32 @@ def map_snapshot_dict() -> Dict[str, Any]:
     snap = get_map_snapshot()
     d = asdict(snap)
     # asdict turns ScanPoint tuples into list[dict] already.
+
+    # Recompute freshness at read time from received_ms + TTL so a stalled ROS
+    # bridge or dead SLAM node stops looking live.  Consumers (web UI) should
+    # trust these computed flags rather than the sticky stored `fresh` fields.
+    now = _now_ms()
+    map_fresh = bool(snap.available) and (now - snap.received_ms) <= MAP_STALE_MS
+    pose_fresh = (
+        snap.pose.received_ms > 0
+        and (now - snap.pose.received_ms) <= POSE_STALE_MS
+    )
+    scan_fresh = (
+        snap.scan_received_ms > 0
+        and (now - snap.scan_received_ms) <= SCAN_STALE_MS
+    )
+    # A pose is only safe to overlay on the map grid when it is both fresh and
+    # actually expressed in the map frame.  On TF failure the bridge falls back
+    # to the odom frame, which drifts relative to the map; drawing that pose
+    # (and its scan rays) over the map grid would be misleading.
+    pose_on_map = pose_fresh and snap.pose.frame == "map"
+
+    d["map_fresh"] = map_fresh
+    d["pose_fresh"] = pose_fresh
+    d["scan_fresh"] = scan_fresh
+    d["pose_on_map"] = pose_on_map
+    # Override the sticky stored flag with the age-based result.
+    d["pose"]["fresh"] = pose_fresh
     return d
 
 

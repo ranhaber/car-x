@@ -1,6 +1,6 @@
 # cat_follow
 
-**Version:** 0.5.2
+**Version:** 0.7.1
 
 Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and drives to keep the cat in the middle of the frame.
 
@@ -10,8 +10,8 @@ Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and dr
 - **commands.py** — Stub: `set_cat_location(x,y)`, `set_stop_command()`; `poll_commands(on_cat_location, on_stop)`.
 - **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits (incl. target approach distance). Stored in `cat_follow/calibration/*.json`; loaded once at startup.
 - **motion/** — `driver`, `center_cat_control()`, `limits`, `goto_xy` (runtime goto), `search`. Runtime goto uses **motion/goto_xy.py**; **calibration/goto_xy.py** is for calibration runs only.
-- **vision/** — `get_cat_bbox(image)` uses TFLite (`tflite_common.py` + `detector.py`). Optional API for single-frame detection.
-- **threads/** — Camera, tracker (OpenCV single-object tracker, re-init via IoU), detector (TFLite loop; writes to SharedState). Camera writes into a pre-allocated frame ring; main loop copies to detector frame every K frames.
+- **vision/** — RKNN NPU detection backend (`backends.py` + `rknn_backend.py`, SSD parsing in `ssd_postprocess.py`). RKNN is the only backend; there is no CPU/TFLite fallback.
+- **threads/** — Camera, tracker (OpenCV single-object tracker, generation-matched re-init via IoU), detector (RKNN NPU loop; writes to SharedState). Camera writes into a pre-allocated frame ring; the detector snapshots its own source frame so detection remains independent of the web UI and tracker initialization uses the exact inferred frame.
 - **odometry.py** — Bicycle-model dead reckoning (position, heading). Used via **location/** facade.
 - **main_loop.py** — Tick loop: commands → state machine → motion.
 - **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`. Starts from `main_loop` or `runtime.app --web-ui`.
@@ -66,6 +66,26 @@ DecisionEngine constraints, lidar/ultrasonic, navigation fusion, perception
 phase, a live occupancy map + robot pose (from ROS `/map` + TF when
 `--ros-nav` is running), and optional H.264 when Rockchip MPP is available.
 Disconnecting the browser stops stream encode (VM-24) while detection continues.
+
+### Control-channel authentication
+
+The web UI and UDP receiver are reachable beyond localhost in the normal
+deployment. Configure both shared secrets in `/etc/car-x/car-x.env`:
+
+```bash
+CAT_FOLLOW_WEB_CONTROL_TOKEN=<strong-random-secret>
+CAT_FOLLOW_COMMS_TOKEN=<strong-random-secret>
+```
+
+`CAT_FOLLOW_WEB_CONTROL_TOKEN` protects motion-causing control and calibration
+routes. Supply it as `X-Control-Token` (preferred), a `token` query parameter,
+or a JSON/form `token` field. Stop and emergency-stop routes intentionally
+remain open so any operator can halt the vehicle.
+
+`CAT_FOLLOW_COMMS_TOKEN` protects UDP command datagrams. Senders must include a
+matching top-level JSON `"token"` field; missing or invalid tokens are dropped.
+Tracking datagrams are not gated. If either secret is unset, the corresponding
+channel remains open for development compatibility and logs a startup warning.
 
 The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
 
@@ -141,16 +161,67 @@ python -c "from cat_follow.state_machine import StateMachine, State, Event; sm=S
 python -c "from cat_follow.calibration import Calibration; c=Calibration(); assert c.get_cm_per_sec(30)==12.0; print('OK')"
 ```
 
-Or install pytest and run: `python -m pytest tests/ -v`
+Or install pytest and run: `python -m pytest tests/ -v`. The current host
+baseline is **334 passing tests**.
 
 ## Next steps
 
 1. **Validate the C1 lidar** — Connect it over USB, install/verify the `/dev/rplidar` udev rule, launch `sllidar_ros2` at 460800 baud, and confirm `/scan`.
 2. **Complete ROCK 4D validation** — Run floor-drive and thermal tests and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
-3. **TFLite models** — Place a compatible `.tflite` model (e.g. SSD MobileNet V2) in `models/` so the detector thread and `vision.get_cat_bbox()` can use it when not in stub mode.
+3. **RKNN model** — Convert an SSD MobileNet model to `.rknn` on a workstation with `rknn-toolkit2` (`python scripts/convert_to_rknn.py --src model.tflite --dst models/ssd_mobilenet_v2.rknn --dataset dataset.txt`) and point `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at it. On the ROCK 4D a missing model is a hard error (no CPU fallback).
 
 ## 📝 Version History
 
+- **0.7.1** — Ops/monitoring hardening (medium-priority review items).
+  Telemetry no longer loses already-dequeued events (CRITICAL failsafe
+  forensics in particular) when the sink write fails: failed batches are
+  re-buffered and retried on the next drain, bounded and dropping the
+  lowest-severity events first, and a detector escalation / e-stop now emits a
+  CRITICAL telemetry event. Web-map freshness is recomputed at read time from
+  `received_ms` + TTL (map/pose/scan), and an odom-frame fallback pose (TF
+  failure) is flagged `pose_on_map=false` so it — and its scan rays — are no
+  longer drawn over the map grid. UDP command datagrams are dropped unless they
+  carry a matching `CAT_FOLLOW_COMMS_TOKEN` (when configured; tracking packets
+  are unaffected), and the receiver warns at startup when command auth is off.
+- **0.7.0** — Cross-pipeline safety/authority hardening from a full review.
+  Freshness is now recomputed at decision time from `received_ms` + TTL (the
+  sticky `fresh` flag is advisory only), so a dead ultrasonic/lidar/nav thread
+  fails closed instead of staying authoritative forever; the ROS bridge ages
+  `/cmd_vel` independently of `/odom` (a silent planner drops the drive terms).
+  A detector escalation now stops the whole vehicle (motor e-stop + FAILSAFE
+  latch + app teardown), and the legacy loop observes the stop event.
+  Control-loop critical/consecutive overruns and tick exceptions latch FAILSAFE
+  (inhibited until operator `clear_failsafe`) instead of allowing an immediate
+  re-drive; comms `emergency_stop` actuates synchronously. Perception: the
+  sticky detector bbox is cleared on IDLE, the tracker (re)inits on the exact
+  frame the detector inferred on (frame-generation handoff) and fuses the
+  post-update box, and vision now drives the FSM (`CAT_VISIBLE_STABLE` /
+  `CAT_LOST`, stability keyed off tracker-frame generation, aged from genuine
+  observations). Nav2 is demoted to advisory (cap/bias) in `CHASE_A`; `GOTO`
+  still navigates. Ops: motion-causing web endpoints require
+  `CAT_FOLLOW_WEB_CONTROL_TOKEN` when set (stops always open), calibration motor
+  tests are serialized by a hardware arbiter, the H.264 encoder-fail path no
+  longer leaks client counters, and a faulty/stuck ultrasonic fails closed.
+- **0.6.1** — Detector production-safety hardening. The deterministic no-NPU
+  stub is now opt-in via `CAT_FOLLOW_PERCEPTION_ALLOW_STUB` (default off); in
+  production a missing/broken `rknnlite` hard-fails instead of masquerading as
+  valid detection. The detector worker validates its backend once and reports
+  readiness to the supervisor through a startup handshake, so a failed init
+  aborts startup rather than silently killing the daemon thread. Failed NPU
+  reloads (after idle-unload) and repeated inference failures now escalate
+  (stopping the app; `CAT_FOLLOW_PERCEPTION_MAX_INFER_FAILURES`) instead of
+  returning empty detections forever, and surface via `perception.error` on
+  `/api/status`. Output-contract validation now checks box/score/class shape
+  alignment and score range, not just the boxes tensor.
+- **0.6.0** — RKNN NPU is now the only detection backend. Removed the CPU
+  TFLite backend, the `create_backend` fallback, the legacy
+  `vision.get_cat_bbox()`/`tflite_common` module (SSD parsing moved to
+  `vision/ssd_postprocess.py`), and the TFLite model downloader. The detector
+  hard-fails when the RKNN runtime is present but the model is missing, and
+  only runs the deterministic stub on machines without the RKNN runtime
+  (dev/CI). Added `CAT_FOLLOW_PERCEPTION_RKNN_INPUT` and
+  `scripts/convert_to_rknn.py`; `scripts/benchmark_detector.py` now benchmarks
+  the RKNN backend.
 - **0.5.2** — Live ROS occupancy map in the web UI. `ros_bridge` subscribes to
   `/map` and TF `map→base_link` (odom fallback), publishes a downsampled
   snapshot with scan-ray overlay; Control page polls `/api/map` and draws the

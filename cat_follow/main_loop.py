@@ -34,7 +34,12 @@ from cat_follow.memory.shared_state import SharedState
 # Worker threads
 from cat_follow.threads.camera import run_camera_loop
 from cat_follow.threads.tracker import run_tracker_loop
-from cat_follow.threads.detector import run_detector_loop
+from cat_follow.threads.detector import (
+    run_detector_loop,
+    DetectorHandshake,
+    DetectorFatalHook,
+    DETECTOR_READY_TIMEOUT_S,
+)
 
 # Web UI
 from cat_follow.web_ui.app import create_app, set_tracker_fps
@@ -71,13 +76,29 @@ def main():
     log.info("Memory pool allocated. SharedState created.")
 
     # ------------------------------------------------------------------
-    # 4. (TFLite interpreter would be created here — skipped in stub)
+    # 4. Detection backend is loaded lazily by the detector thread (RKNN NPU);
+    #    startup validation happens via preflight_perception() below.
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # 5. Start worker threads
     # ------------------------------------------------------------------
     stop_event = threading.Event()
+    detector_handshake = DetectorHandshake()
+
+    # A perception fatal error must stop the vehicle: latch a stop and cut the
+    # motors immediately.  The main loop below also observes ``stop_event``.
+    detector_fatal_hook = DetectorFatalHook()
+
+    def _on_detector_fatal(message: str) -> None:
+        log.error("Perception fatal (%s); stopping motors.", message)
+        try:
+            motion_driver.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        stop_event.set()
+
+    detector_fatal_hook.set_handler(_on_detector_fatal)
 
     camera_thread = threading.Thread(
         target=run_camera_loop, args=(shared, stop_event),
@@ -89,13 +110,26 @@ def main():
     )
     detector_thread = threading.Thread(
         target=run_detector_loop, args=(shared, stop_event),
+        kwargs={"handshake": detector_handshake, "on_fatal": detector_fatal_hook},
         name="CatFollow-Detector", daemon=True,
     )
 
     camera_thread.start()
     tracker_thread.start()
     detector_thread.start()
-    log.info("Camera, Tracker, Detector threads started.")
+
+    # Startup handshake: block until the detector worker validates its backend
+    # (or reports stub mode). A validation failure raises here and aborts
+    # startup instead of leaving the app running blind.
+    try:
+        npu_ready = detector_handshake.wait_ready(timeout=DETECTOR_READY_TIMEOUT_S)
+    except Exception:
+        stop_event.set()
+        raise
+    log.info(
+        "Camera, Tracker, Detector threads started (detector=%s).",
+        "NPU" if npu_ready else "stub",
+    )
 
     # ------------------------------------------------------------------
     # 6. Start Web UI (Flask) in a background thread
@@ -123,6 +157,11 @@ def main():
     search_prev_heading = None  # for full-circle accumulated turn
     search_accumulated_deg = 0.0
     obstacle_arc_start_time = 0.0  # when ultrasonic < target_cm we arc until clear
+    # Fail-closed sensor-fault handling: a genuinely faulty/stuck ultrasonic
+    # keeps returning None and used to look "clear".  Tolerate transient None
+    # (HC-SR04 out-of-range in open space) but stop after a sustained streak.
+    ultrasonic_none_streak = 0
+    ULTRASONIC_FAULT_TICKS = 15  # ~0.5 s at 30 Hz
 
     def on_cat_location(x: float, y: float):
         sm.dispatch(Event.CAT_LOCATION_RECEIVED, (x, y))
@@ -139,13 +178,22 @@ def main():
         while True:
             t0 = time.monotonic()
 
+            # A worker thread (e.g. the detector) escalating a fatal error sets
+            # stop_event; observe it here and fail safe rather than driving on.
+            if stop_event.is_set():
+                log.error("stop_event set (worker escalation); stopping motors.")
+                motion_driver.stop()
+                sm.dispatch(Event.STOP_COMMAND)
+                break
+
             # Poll commands (thread-safe via lock)
             poll_commands(on_cat_location=on_cat_location, on_stop=on_stop)
 
-            # Copy frame to detector every K frames
+            # NOTE: The detector thread now owns the detector-frame snapshot
+            # (``snapshot_detector_frame``) atomically with its generation
+            # counter, so the main loop no longer copies here (a second writer
+            # would desync the frame/bbox generation used by the tracker).
             frame_count += 1
-            if frame_count % DETECT_EVERY_K == 0:
-                shared.copy_latest_to_detector_frame()
 
             # Read bbox from shared state (from tracker thread)
             bbox = shared.get_bbox_tracker()
@@ -158,6 +206,29 @@ def main():
             # Read ultrasonic in all phases except IDLE (for display and obstacle avoid)
             ultrasonic_cm = range_sensor.get_distance_cm() if state != State.IDLE else None
             target_cm = calib.get_target_distance_cm()
+
+            # Track consecutive None reads while driving to detect a stuck/faulty
+            # sensor (fail-closed) instead of treating None as "clear".
+            if state != State.IDLE and ultrasonic_cm is None:
+                ultrasonic_none_streak += 1
+            else:
+                ultrasonic_none_streak = 0
+            ultrasonic_fault = ultrasonic_none_streak >= ULTRASONIC_FAULT_TICKS
+
+            if ultrasonic_fault:
+                # Sensor fault: refuse to drive blind.  Stop and hold until the
+                # sensor recovers (a valid read resets the streak).
+                if ultrasonic_none_streak == ULTRASONIC_FAULT_TICKS:
+                    log.error(
+                        "Ultrasonic returned None for %d ticks; failing closed (stop).",
+                        ultrasonic_none_streak,
+                    )
+                motion_driver.stop()
+                obstacle_arc_start_time = 0.0
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0, tick_sec - elapsed))
+                continue
+
             obstacle_close = (
                 state != State.IDLE
                 and ultrasonic_cm is not None

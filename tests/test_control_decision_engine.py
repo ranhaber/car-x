@@ -42,7 +42,9 @@ def _make_input(
     range_distance_cm=None,
     range_fresh: bool = False,
     range_critical: bool = False,
+    range_received_ms: int = None,
     command: CommandState = None,
+    vision: VisionState = None,
 ) -> DecisionInput:
     return DecisionInput(
         now_ms=now_ms,
@@ -52,9 +54,9 @@ def _make_input(
             sequence=1,
         ),
         home=HomeState(),
-        vision=VisionState(),
+        vision=vision if vision is not None else VisionState(),
         range=RangeState(
-            received_ms=now_ms,
+            received_ms=now_ms if range_received_ms is None else range_received_ms,
             fresh=range_fresh,
             distance_cm=range_distance_cm,
             obstacle_critical=range_critical,
@@ -125,7 +127,15 @@ def test_state_default_reasons_match_state():
     ]
     for state, expected_reason in cases:
         engine, fsm = _make_engine(state)
-        decision = engine.tick(_make_input(fsm_state=state))
+        # TRACK_B is only stable while a fresh, visible cat is locked; otherwise
+        # the wired CAT_LOST transition falls back to CHASE_A.  Provide one so
+        # this state's default reason (LOCAL_TRACK) is observable.
+        vision = None
+        if state == FsmState.TRACK_B:
+            vision = VisionState(
+                received_ms=1000, fresh=True, cat_visible=True, cat_visible_stable=True
+            )
+        decision = engine.tick(_make_input(fsm_state=state, vision=vision))
         # Chase states with no fresh overhead packet are still expected to
         # emit the state default reason in the V1 shell because the freshness
         # rule only fires when overhead has actually been received and is
@@ -173,11 +183,16 @@ def test_range_at_threshold_does_not_trigger_failsafe():
 
 def test_stale_range_does_not_trigger_obstacle_veto():
     engine, fsm = _make_engine(FsmState.CHASE_A)
+    # Very close but the sample is old (aged out); freshness is now computed
+    # from received_ms, not the sticky fresh flag.
     decision = engine.tick(
         _make_input(
             fsm_state=FsmState.CHASE_A,
-            range_distance_cm=1.0,  # very close, but stale
-            range_fresh=False,
+            now_ms=100_000,
+            overhead_received_ms=100_000,
+            range_distance_cm=1.0,
+            range_received_ms=1,
+            range_fresh=True,
         )
     )
 
@@ -200,6 +215,44 @@ def test_critical_obstacle_severity_triggers_failsafe():
     assert decision.brake is True
     assert decision.reason == ReasonCode.OBSTACLE_VETO
     assert "obstacle_veto" in decision.active_constraints
+
+
+# ── vision-driven chase handoff ────────────────────────────────────
+
+
+def test_chase_a_to_track_b_on_stable_vision():
+    engine, fsm = _make_engine(FsmState.CHASE_A)
+    vision = VisionState(
+        received_ms=1000, fresh=True, cat_visible=True, cat_visible_stable=True
+    )
+    engine.tick(_make_input(fsm_state=FsmState.CHASE_A, vision=vision))
+    assert fsm.state == FsmState.TRACK_B
+
+
+def test_track_b_to_chase_a_on_vision_aged_out():
+    engine, fsm = _make_engine(FsmState.TRACK_B)
+    # Vision was received long ago -> aged past VISION_STALE_MS -> cat lost.
+    vision = VisionState(
+        received_ms=1, fresh=True, cat_visible=True, cat_visible_stable=True
+    )
+    engine.tick(
+        _make_input(
+            fsm_state=FsmState.TRACK_B,
+            now_ms=100_000,
+            overhead_received_ms=100_000,
+            vision=vision,
+        )
+    )
+    assert fsm.state == FsmState.CHASE_A
+
+
+def test_track_b_stays_with_fresh_visible_cat():
+    engine, fsm = _make_engine(FsmState.TRACK_B)
+    vision = VisionState(
+        received_ms=1000, fresh=True, cat_visible=True, cat_visible_stable=True
+    )
+    engine.tick(_make_input(fsm_state=FsmState.TRACK_B, vision=vision))
+    assert fsm.state == FsmState.TRACK_B
 
 
 # ── overhead freshness ─────────────────────────────────────────────

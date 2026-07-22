@@ -1,4 +1,4 @@
-# Vision: detector, tracker, distance. Stubs for now.
-from .detector import get_cat_bbox
+# Vision: RKNN NPU detection backend and factory.
+from .backends import DetectionBackend, RknnBackend, create_backend
 
-__all__ = ["get_cat_bbox"]
+__all__ = ["DetectionBackend", "RknnBackend", "create_backend"]

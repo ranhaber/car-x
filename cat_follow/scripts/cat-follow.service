@@ -11,6 +11,10 @@ SupplementaryGroups=i2c gpio video
 WorkingDirectory=/opt/car-x
 EnvironmentFile=/etc/car-x/car-x.env
 ExecStartPre=-/usr/bin/v4l2-ctl -d ${CAT_FOLLOW_CAMERA_SENSOR_DEVICE} --set-ctrl=exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}
+# Fail fast (clear journal message) when the RKNN model has not been provisioned.
+# Path is relative to WorkingDirectory (/opt/car-x). Build it with
+# scripts/convert_to_rknn.py on a workstation and copy it to /opt/car-x/models/.
+ExecStartPre=/bin/sh -c 'test -f "${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}" || { echo "RKNN model missing: ${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}"; exit 1; }'
 ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception
 # Optional monitoring UI (non-authoritative). Uncomment to enable:
 # ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --web-ui --web-ui-port 5000

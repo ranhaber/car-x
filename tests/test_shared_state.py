@@ -45,6 +45,31 @@ def test_bbox_tracker_default_zero():
     assert result == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def test_detector_frame_generation_and_bbox_tagging():
+    shared = _make_shared()
+    dst = np.empty(FRAME_SHAPE, dtype=np.uint8)
+
+    # Publish a frame and snapshot it for the detector; the generation bumps.
+    src = np.full(FRAME_SHAPE, 7, dtype=np.uint8)
+    shared.set_frame_latest(src)
+    gen1 = shared.snapshot_detector_frame(dst)
+    assert gen1 == 1
+    assert np.array_equal(dst, src)
+
+    # A bbox tagged with gen1 reports gen1; a later snapshot advances the gen so
+    # the previously-tagged bbox no longer matches the current detector frame.
+    shared.set_bbox_detector(1.0, 2.0, 3.0, 4.0, 1.0, frame_gen=gen1)
+    x, y, w, h, valid, gen = shared.get_bbox_detector_with_gen()
+    assert (x, y, w, h, valid, gen) == (1.0, 2.0, 3.0, 4.0, 1.0, gen1)
+
+    gen2 = shared.snapshot_detector_frame(dst)
+    assert gen2 == 2
+    current_gen = shared.get_detector_frame_and_gen(dst)
+    assert current_gen == gen2
+    # Stale bbox (gen1) != current frame gen (gen2): the tracker would skip init.
+    assert shared.get_bbox_detector_with_gen()[5] != current_gen
+
+
 def test_bbox_detector_set_get():
     shared = _make_shared()
     shared.set_bbox_detector(100.0, 200.0, 50.0, 60.0, 1.0)

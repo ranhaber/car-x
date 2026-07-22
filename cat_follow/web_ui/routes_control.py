@@ -16,6 +16,7 @@ from flask import Blueprint, request, jsonify
 
 from cat_follow.logger import get_logger
 from cat_follow.commands import set_cat_location, set_stop_command
+from cat_follow.web_ui.auth import require_control_token
 
 control_bp = Blueprint("control", __name__)
 _log = get_logger("web_ui.control")
@@ -66,6 +67,7 @@ def init_control_routes(ctx):
 
 
 @control_bp.route("/api/target", methods=["POST"])
+@require_control_token
 def api_target():
     data = request.get_json(silent=True) or {}
     try:
@@ -107,6 +109,7 @@ def api_stop():
 
 
 @control_bp.route("/api/command/start_chase", methods=["POST"])
+@require_control_token
 def api_start_chase():
     from cat_follow.control.types import CommandName
 

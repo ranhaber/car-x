@@ -181,6 +181,49 @@ def test_default_jsonl_path_is_dated_jsonl_under_log_dir(tmp_path):
     assert path.suffix == ".jsonl"
 
 
+class _FlakySink:
+    """Fails ``fail_times`` write_batch calls, then records events."""
+
+    def __init__(self, fail_times: int) -> None:
+        self._lock = threading.Lock()
+        self._fail_times = fail_times
+        self.events: list = []
+
+    def write_batch(self, events, force_flush: bool = False) -> None:
+        with self._lock:
+            if self._fail_times > 0:
+                self._fail_times -= 1
+                raise RuntimeError("sink temporarily down")
+            self.events.extend(list(events))
+
+    def close(self) -> None:
+        pass
+
+    def severities(self):
+        with self._lock:
+            return [e["severity"] for e in self.events]
+
+
+def test_critical_event_survives_transient_sink_failure():
+    sink = _FlakySink(fail_times=2)
+    logger = _make_logger(sink, flush_interval_s=0.02)
+    logger.start()
+    try:
+        logger.log(
+            event_type=TelemetryEventType.FAILSAFE,
+            severity=TelemetrySeverity.CRITICAL,
+            source="test",
+        )
+        # Despite two failed sink writes, the dequeued CRITICAL event must not
+        # be lost -- it is re-buffered and retried until the sink recovers.
+        assert _wait_until(
+            lambda: "critical" in sink.severities(), timeout=2.0
+        )
+    finally:
+        logger.stop()
+    assert logger.stats()["sink_failures"] >= 2
+
+
 def test_stop_drains_remaining_events():
     sink = _CapturingSink()
     logger = _make_logger(sink, flush_interval_s=10.0)

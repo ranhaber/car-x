@@ -26,12 +26,13 @@ Confidence
 Per Interface spec section 5.4, V1 confidence is binary.  We emit ``1.0``
 when the prototype bbox is valid and ``0.0`` otherwise.
 
-Limitations
------------
-The prototype's bbox storage has no per-frame timestamp, so we cannot
-distinguish "no new vision frame" from "vision detection said no cat".
-For Milestone 3 we treat each ``update()`` as a fresh observation; the
-DecisionEngine's freshness rules still protect downstream logic.
+Freshness / generation
+----------------------
+The prototype tracker bbox carries a monotonic *generation* that bumps on
+every publish.  The adapter counts stability and advances ``received_ms``
+only when the generation changes (a genuinely new tracker observation), so a
+frozen/dead tracker ages out via the DecisionEngine's freshness rules instead
+of the adapter counting its own poll rate as "stable" frames.
 """
 
 from __future__ import annotations
@@ -62,6 +63,9 @@ class _PrototypeVisionStateLike(Protocol):
     """Subset of the prototype ``SharedState`` API used by the adapter."""
 
     def get_bbox_tracker(self) -> tuple:  # (x, y, w, h, valid)
+        ...
+
+    def get_bbox_tracker_with_gen(self) -> tuple:  # (x, y, w, h, valid, gen)
         ...
 
 
@@ -102,6 +106,8 @@ class VisionAdapter:
 
         self._consecutive_visible = 0
         self._last_seen_ms = 0
+        self._last_bbox_gen = -1
+        self._last_received_ms = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -128,7 +134,15 @@ class VisionAdapter:
     # ── single-step (for tests and synchronous use) ─────────────────
 
     def update(self) -> VisionState:
-        bbox = self._proto_ss.get_bbox_tracker()
+        # Prefer the generation-aware read so we can distinguish a new tracker
+        # observation from a repeated poll of an unchanged buffer.
+        getter = getattr(self._proto_ss, "get_bbox_tracker_with_gen", None)
+        if getter is not None:
+            bbox = getter()
+            gen = int(bbox[5])
+        else:  # pragma: no cover - fallback for minimal test doubles
+            bbox = self._proto_ss.get_bbox_tracker()
+            gen = self._last_bbox_gen + 1  # treat every poll as a new frame
         x, y, w, h, valid = (
             float(bbox[0]),
             float(bbox[1]),
@@ -137,25 +151,34 @@ class VisionAdapter:
             float(bbox[4]),
         )
         cat_visible = valid > 0.0
+        new_observation = gen != self._last_bbox_gen
+        self._last_bbox_gen = gen
 
-        if cat_visible:
-            self._consecutive_visible += 1
-        else:
+        now = now_monotonic_ms()
+
+        if not cat_visible:
+            # No cat: reset stability and let freshness age from the last
+            # genuine observation (do not advance received_ms).
             self._consecutive_visible = 0
+        elif new_observation:
+            # Genuinely new tracker frame with a visible cat: this is what
+            # counts toward stability and refreshes the freshness clock.
+            self._consecutive_visible += 1
+            self._last_seen_ms = now
+            self._last_received_ms = now
+        # else: cat_visible but stale (no new tracker frame) -> hold counters
+        #       and received_ms so DecisionEngine's age check can fail closed.
 
         x_offset_norm = self._compute_offset(x, w) if cat_visible else 0.0
         cat_visible_stable = (
             cat_visible and self._consecutive_visible >= self._stability_frames
         )
-
-        now = now_monotonic_ms()
-        if cat_visible:
-            self._last_seen_ms = now
+        received_ms = self._last_received_ms if cat_visible else now
 
         new_state = VisionState(
             timestamp_ms=int(time.time() * 1000),
-            received_ms=now,
-            fresh=True,
+            received_ms=received_ms,
+            fresh=cat_visible,
             authority=self._source,
             cat_visible=cat_visible,
             cat_visible_stable=cat_visible_stable,

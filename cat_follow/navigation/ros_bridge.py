@@ -67,6 +67,11 @@ MAX_PLANNER_YAW_RATE = 1.5
 # How often to sample TF for the web-UI pose (Hz).
 POSE_PUBLISH_HZ = 5.0
 
+# Age (ms) beyond which the last /cmd_vel is no longer allowed to drive.  A
+# silent planner (Nav2 stops publishing) must not keep the last velocity
+# authoritative just because /odom is still arriving.
+CMD_VEL_STALE_MS = 500
+
 
 def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     """Return the planar yaw (rad) from a quaternion."""
@@ -131,6 +136,10 @@ if _HAS_ROS:
             self._speed_limit = 0.0
             self._odom_x = 0.0
             self._odom_y = 0.0
+            # Per-topic receipt times so /cmd_vel can age out independently of
+            # /odom (a silent planner must not keep the last velocity alive).
+            self._odom_received_ms = 0
+            self._cmd_vel_received_ms = 0
 
             self._tf_buffer = None
             self._tf_listener = None
@@ -231,6 +240,7 @@ if _HAS_ROS:
             self._heading_valid = True
             self._odom_x = float(msg.pose.pose.position.x)
             self._odom_y = float(msg.pose.pose.position.y)
+            self._odom_received_ms = now_monotonic_ms()
             self._publish_navigation()
 
         # ── /cmd_vel -> path_correction + speed_limit ────────────────
@@ -242,20 +252,42 @@ if _HAS_ROS:
             self._speed_limit = max(
                 0.0, min(1.0, abs(msg.linear.x) / MAX_PLANNER_SPEED_MPS)
             )
+            self._cmd_vel_received_ms = now_monotonic_ms()
             self._publish_navigation()
 
         def _publish_navigation(self) -> None:
             now = now_monotonic_ms()
+
+            # Age /cmd_vel independently: if the planner has gone silent, drop
+            # the drive terms to zero so a continuing /odom stream cannot keep
+            # the stale velocity authoritative.
+            cmd_vel_fresh = (
+                self._cmd_vel_received_ms > 0
+                and (now - self._cmd_vel_received_ms) <= CMD_VEL_STALE_MS
+            )
+            speed_limit = self._speed_limit if cmd_vel_fresh else 0.0
+            path_correction = self._path_correction if cmd_vel_fresh else 0.0
+
+            # The NavigationState is only "fresh" for driving when BOTH odom and
+            # cmd_vel are within TTL.  Encoding this as the min receipt time lets
+            # the DecisionEngine's age check fail closed if either input stalls.
+            if self._odom_received_ms > 0 and self._cmd_vel_received_ms > 0:
+                drive_received_ms = min(
+                    self._odom_received_ms, self._cmd_vel_received_ms
+                )
+            else:
+                drive_received_ms = 0
+
             self._ss.update_navigation(
                 NavigationState(
                     timestamp_ms=int(time.time() * 1000),
-                    received_ms=now,
-                    fresh=True,
+                    received_ms=drive_received_ms,
+                    fresh=cmd_vel_fresh,
                     authority="RosBridge",
                     heading=self._heading,
                     heading_valid=self._heading_valid,
-                    speed_limit=self._speed_limit,
-                    path_correction=self._path_correction,
+                    speed_limit=speed_limit,
+                    path_correction=path_correction,
                 )
             )
 

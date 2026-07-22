@@ -131,6 +131,10 @@ Rules:
 - Commands must be idempotent.
 - Receiving the same `command_id` more than once must not re-execute side effects.
 - Duplicate command retries receive an ACK with the original accepted/rejected result.
+- When the UDP transport has `CAT_FOLLOW_COMMS_TOKEN` configured, every command
+  datagram must include a matching top-level JSON `token`. Missing or invalid
+  tokens are dropped before command parsing and receive no ACK.
+- Tracking datagrams do not require this command token.
 
 Recommended retry defaults:
 - Retry timeout: `200 ms`
@@ -1239,6 +1243,11 @@ High-priority events:
 
 These should be preserved ahead of `debug` telemetry when the queue is under pressure.
 
+If a telemetry sink fails after events have been dequeued, the failed batch is
+placed in a bounded retry buffer and retried before newer events. Overflow
+evicts the lowest-severity records first; CRITICAL failsafe/emergency-stop
+records are the last to be discarded.
+
 ## 12. Step 9: Thread Synchronization Rules
 **Status:** Done
 
@@ -1483,6 +1492,11 @@ Rules:
 | `OVERHEAD_STALE_WARNING_MS` | `300` | Reduce speed to safe crawl |
 | `OVERHEAD_STALE_FAILSAFE_MS` | `700` | Enter `FAILSAFE` |
 | `CAMERA_LOSS_FALLBACK_MS` | `350` | `TRACK_B -> CHASE_A` |
+| `VISION_STALE_MS` | `350` | Local visual observation expires |
+| `RANGE_STALE_MS` | `500` | Ultrasonic/range observation expires |
+| `LIDAR_STALE_MS` | `500` | Lidar observation expires |
+| `NAVIGATION_STALE_MS` | `500` | Navigation constraints expire |
+| `CMD_VEL_STALE_MS` | `500` | Planner drive terms are cleared |
 | `NO_PROGRESS_RECOVERY_MS` | `2000` | Trigger recovery behavior |
 | `RECOVERY_FAILSAFE_MS` | `5000` | Escalate to `FAILSAFE` |
 | `OBSTACLE_TOO_CLOSE_CM` | `10` | Immediate `FAILSAFE` |
@@ -1496,8 +1510,8 @@ Rules:
 | `CONTROL_TARGET_PERIOD_MS` | `20` | Target control loop period |
 | `CONTROL_MIN_DEGRADED_RATE_HZ` | `20` | Below this, reduce speed or stop |
 | `CONTROL_OVERRUN_MS` | `20` | One tick exceeded target budget |
-| `CONTROL_CONSECUTIVE_OVERRUN_LIMIT` | `3` | Apply conservative speed limiting |
-| `CONTROL_CRITICAL_OVERRUN_MS` | `100` | Safe stop / critical telemetry |
+| `CONTROL_CONSECUTIVE_OVERRUN_LIMIT` | `3` | Emergency-stop and latch `FAILSAFE` |
+| `CONTROL_CRITICAL_OVERRUN_MS` | `100` | Emergency-stop, latch `FAILSAFE`, critical telemetry |
 
 ### 13.15 Normalized Ranges
 | Field | Range | Meaning |
@@ -1583,9 +1597,11 @@ An overrun occurs when one control tick exceeds `20 ms`.
 
 Rules:
 - Single overrun: emit `control_tick_overrun` telemetry with measured duration.
-- `3` consecutive overruns: apply conservative speed limiting and emit warning telemetry.
-- Any tick over `100 ms`: command safe stop and emit critical telemetry.
-- Repeated overrun while already degraded may escalate to `FAILSAFE` if motion cannot be considered safe.
+- `3` consecutive overruns: emergency-stop, latch `FAILSAFE`, and emit critical telemetry.
+- Any tick over `100 ms`: emergency-stop, latch `FAILSAFE`, and emit critical telemetry.
+- Any unhandled control-tick exception: emergency-stop and latch `FAILSAFE`.
+- Once latched, later healthy ticks must not re-drive; only an accepted operator
+  `clear_failsafe` command may leave `FAILSAFE`.
 
 ### 15.4 Timing Telemetry
 Control timing telemetry should include:

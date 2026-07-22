@@ -34,11 +34,12 @@ class SharedState:
         self._lock_bbox_detector = threading.Lock()
         self._lock_odometry = threading.Lock()
 
-        # Detector model selection (string key). Web UI toggles this value
-        # and the detector thread reads it to decide which .tflite to load.
+        # Legacy detector-model selection slot. Detection is now RKNN-only and
+        # env-driven (CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH); this value is kept
+        # only for backward-compatible web UI reads and is not used to pick a
+        # model at runtime.
         self._lock_detector_model = threading.Lock()
-        # Default to SSD MobileNet V2 (key used by web UI and detector mapping)
-        self._detector_model = "ssd_mobilenet_v2"
+        self._detector_model = "rknn"
 
         # Ring buffer indices for rotating frame buffers. The camera writes
         # into the slot returned by ``get_write_buffer()``, then calls
@@ -48,6 +49,20 @@ class SharedState:
         self._ring_n = self._pool.frame_ring.shape[0]
         self._write_idx = 0
         self._latest_idx = -1
+
+        # Monotonic generation counter for the detector snapshot frame.  Each
+        # time a new frame is snapshotted for detection the generation is
+        # bumped, and the detector tags the bbox it produces with that
+        # generation (see ``set_bbox_detector``/``get_bbox_detector_with_gen``).
+        # The tracker uses this to init/re-init on the *same* frame the detector
+        # saw rather than a later ``frame_latest`` (avoids wrong-pixel init).
+        self._detector_frame_gen = 0
+        self._bbox_detector_gen = -1
+        # Monotonic generation for the tracker bbox, bumped on every publish.
+        # The vision adapter keys stability/freshness off *changes* in this
+        # generation so a frozen tracker (dead thread) ages out instead of the
+        # adapter counting its own poll rate as "stable" frames.
+        self._bbox_tracker_gen = 0
 
         # Optional hardware-scaled lores gray frame (motion source). Allocated
         # lazily on first publish so single-stream setups pay nothing.
@@ -111,6 +126,46 @@ class SharedState:
         with self._lock_frame:
             np.copyto(dst, self._pool.frame_for_detector)
 
+    def snapshot_detector_frame(self, dst: np.ndarray) -> int:
+        """Atomically publish ``frame_latest`` → ``frame_for_detector``, copy it
+        into *dst*, and return the new detector-frame generation.
+
+        Doing the publish + read under a single ``_lock_frame`` acquisition (and
+        bumping the generation) guarantees the returned generation identifies
+        exactly the frame now in *dst*, so a bbox the detector produces from
+        *dst* can be tagged with a generation the tracker can match.
+        """
+        if dst.shape != FRAME_SHAPE:
+            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
+        if dst.dtype != self._pool.frame_for_detector.dtype:
+            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
+
+        with self._lock_frame:
+            if self._latest_idx < 0:
+                self._pool.frame_for_detector.fill(0)
+            else:
+                np.copyto(
+                    self._pool.frame_for_detector,
+                    self._pool.frame_ring[self._latest_idx],
+                )
+            self._detector_frame_gen += 1
+            gen = self._detector_frame_gen
+            np.copyto(dst, self._pool.frame_for_detector)
+        return gen
+
+    def get_detector_frame_and_gen(self, dst: np.ndarray) -> int:
+        """Copy the current ``frame_for_detector`` into *dst* and return its
+        generation, under a single lock (for the tracker's frame-matched init).
+        """
+        if dst.shape != FRAME_SHAPE:
+            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
+        if dst.dtype != self._pool.frame_for_detector.dtype:
+            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
+
+        with self._lock_frame:
+            np.copyto(dst, self._pool.frame_for_detector)
+            return self._detector_frame_gen
+
     # ── ring helpers (camera use) ─────────────────────────────────────
 
     def get_write_buffer(self) -> np.ndarray:
@@ -153,6 +208,7 @@ class SharedState:
             buf[2] = w
             buf[3] = h
             buf[4] = valid
+            self._bbox_tracker_gen += 1
 
     def get_bbox_tracker(self) -> Tuple[float, float, float, float, float]:
         """Return a snapshot ``(x, y, w, h, valid)`` under lock.
@@ -165,12 +221,36 @@ class SharedState:
             return (float(buf[0]), float(buf[1]), float(buf[2]),
                     float(buf[3]), float(buf[4]))
 
+    def get_bbox_tracker_with_gen(
+        self,
+    ) -> Tuple[float, float, float, float, float, int]:
+        """Return ``(x, y, w, h, valid, gen)`` under lock.
+
+        ``gen`` increments on every publish, so a consumer can tell a genuinely
+        new tracker observation from a repeated poll of an unchanged buffer.
+        """
+        with self._lock_bbox_tracker:
+            buf = self._pool.bbox_tracker
+            return (float(buf[0]), float(buf[1]), float(buf[2]),
+                    float(buf[3]), float(buf[4]), int(self._bbox_tracker_gen))
+
     # ── bbox_detector ────────────────────────────────────────────────
 
     def set_bbox_detector(
-        self, x: float, y: float, w: float, h: float, valid: float
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        valid: float,
+        frame_gen: int = -1,
     ) -> None:
-        """Write detector bbox into the pre-allocated array under lock."""
+        """Write detector bbox into the pre-allocated array under lock.
+
+        ``frame_gen`` is the detector-frame generation this bbox was produced
+        from (see :meth:`snapshot_detector_frame`); it lets the tracker match
+        the bbox to the exact frame the detector inferred on.
+        """
         with self._lock_bbox_detector:
             buf = self._pool.bbox_detector
             buf[0] = x
@@ -178,6 +258,7 @@ class SharedState:
             buf[2] = w
             buf[3] = h
             buf[4] = valid
+            self._bbox_detector_gen = int(frame_gen)
 
     def get_bbox_detector(self) -> Tuple[float, float, float, float, float]:
         """Return a snapshot ``(x, y, w, h, valid)`` under lock."""
@@ -185,6 +266,15 @@ class SharedState:
             buf = self._pool.bbox_detector
             return (float(buf[0]), float(buf[1]), float(buf[2]),
                     float(buf[3]), float(buf[4]))
+
+    def get_bbox_detector_with_gen(
+        self,
+    ) -> Tuple[float, float, float, float, float, int]:
+        """Return ``(x, y, w, h, valid, frame_gen)`` under lock."""
+        with self._lock_bbox_detector:
+            buf = self._pool.bbox_detector
+            return (float(buf[0]), float(buf[1]), float(buf[2]),
+                    float(buf[3]), float(buf[4]), int(self._bbox_detector_gen))
 
     # ── odometry ─────────────────────────────────────────────────────
 

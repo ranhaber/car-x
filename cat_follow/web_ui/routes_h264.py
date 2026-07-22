@@ -88,12 +88,15 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
     if _ctx is not None and getattr(_ctx, "inc_stream_clients", None):
         _ctx.inc_stream_clients()
 
-    encoder = _get_encoder()
-    if encoder is None:
-        ws.close()
-        return
-
     try:
+        # Acquire the encoder inside the try so an encoder-start failure still
+        # runs the finally below.  Otherwise an early return here would leak the
+        # incremented _clients / stream-client counters, leaving the system
+        # convinced a viewer is attached (encode/processing never quiesces).
+        encoder = _get_encoder()
+        if encoder is None:
+            ws.close()
+            return
         while True:
             t0 = time.monotonic()
             if _ctx is None or _ctx.shared is None:

@@ -7,7 +7,6 @@ from cat_follow.perception.phase import Phase, PhaseMachine
 
 
 _ENV_NAMES = (
-    "BACKEND",
     "MOTION_GATING",
     "MOTION_SCALE",
     "MOTION_THRESHOLD",
@@ -22,6 +21,7 @@ _ENV_NAMES = (
     "CAMERA_CORES",
     "DETECTOR_CORES",
     "RKNN_MODEL_PATH",
+    "RKNN_INPUT",
 )
 
 
@@ -31,40 +31,43 @@ def _clear_env(monkeypatch):
         monkeypatch.delenv(f"CAT_FOLLOW_PERCEPTION_{name}", raising=False)
 
 
-def test_defaults_preserve_cpu_tflite_behaviour():
+def test_defaults_are_rknn_only():
     config = load_perception_config()
-    assert config.backend == "tflite"
-    assert config.uses_rknn is False
+    assert config.rknn_model_path == "models/ssd_mobilenet_v2.rknn"
+    assert config.rknn_input_size == (320, 320)
     assert config.motion_gating is True
     assert config.opencv_threads_idle == 1
     assert config.opencv_threads_active == 4
     assert config.affinity_enabled is False
     assert config.camera_cores == ()
     assert config.detector_cores == ()
+    # The backend is fixed to RKNN; there is no backend/uses_rknn selector.
+    assert not hasattr(config, "backend")
+    assert not hasattr(config, "uses_rknn")
 
 
 def test_env_driven_config(monkeypatch):
-    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_BACKEND", "rknn")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_MOTION_GATING", "0")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_AFFINITY_ENABLED", "1")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_CAMERA_CORES", "4,5")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_DETECTOR_CORES", "6, 7")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_DETECT_INTERVAL_TRACKING", "3")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH", "models/cat.rknn")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_INPUT", "320,240")
 
     config = load_perception_config()
-    assert config.backend == "rknn"
-    assert config.uses_rknn is True
     assert config.motion_gating is False
     assert config.affinity_enabled is True
     assert config.camera_cores == (4, 5)
     assert config.detector_cores == (6, 7)
     assert config.detect_interval_tracking == 3
+    assert config.rknn_model_path == "models/cat.rknn"
+    assert config.rknn_input_size == (320, 240)
 
 
-def test_invalid_backend_rejected(monkeypatch):
-    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_BACKEND", "coral")
-    with pytest.raises(ValueError):
-        load_perception_config()
+def test_rknn_input_square_shorthand(monkeypatch):
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_INPUT", "416")
+    assert load_perception_config().rknn_input_size == (416, 416)
 
 
 @pytest.mark.parametrize(
@@ -73,6 +76,7 @@ def test_invalid_backend_rejected(monkeypatch):
         ("MOTION_THRESHOLD", "0"),
         ("DETECT_INTERVAL_TRACKING", "0"),
         ("OPENCV_THREADS_IDLE", "0"),
+        ("RKNN_INPUT", "0,0"),
     ),
 )
 def test_below_minimum_rejected(monkeypatch, name, value):

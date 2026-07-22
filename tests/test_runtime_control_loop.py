@@ -208,6 +208,63 @@ def test_critical_overrun_calls_emergency_stop():
     assert backend.emergency_stops == 1
 
 
+def test_critical_overrun_latches_failsafe():
+    ss, fsm, _, backend, _, loop, *_ = _build_stack()
+    loop.tick(now_ms=now_monotonic_ms() - 150)  # critical overrun
+    assert fsm.state == FsmState.FAILSAFE
+    assert backend.emergency_stops >= 1
+    # Latch holds: a subsequent normal tick keeps FAILSAFE + safe stop.
+    loop.tick(now_ms=now_monotonic_ms())
+    assert fsm.state == FsmState.FAILSAFE
+    assert ss.get_decision().speed == 0.0
+
+
+def test_consecutive_overruns_latch_failsafe():
+    ss, fsm, _, backend, _, loop, *_ = _build_stack()
+    # Three non-critical overruns (40ms each: > 20ms budget, < 100ms critical)
+    # must escalate to a FAILSAFE latch at the consecutive-overrun limit (3).
+    for _ in range(3):
+        loop.tick(now_ms=now_monotonic_ms() - 40)
+    assert fsm.state == FsmState.FAILSAFE
+    assert backend.emergency_stops >= 1
+
+
+def test_tick_exception_latches_failsafe():
+    ss, fsm, engine, backend, _, loop, *_ = _build_stack()
+
+    def _boom(_decision_input):
+        raise RuntimeError("boom")
+
+    engine.tick = _boom  # type: ignore[assignment]
+    loop.start()
+    try:
+        assert _wait_until(lambda: fsm.state == FsmState.FAILSAFE, timeout=2.0)
+    finally:
+        loop.stop()
+    assert backend.emergency_stops >= 1
+
+
+def test_comms_emergency_stop_invokes_hook_synchronously():
+    ss = SharedState()
+    called = []
+    comms = CommsManager(
+        shared_state=ss,
+        ack_sink=lambda ack: None,
+        on_emergency_stop=lambda: called.append(True),
+    )
+    ack = comms.submit_command(
+        CommandMessage(
+            sequence=1,
+            timestamp_ms=1,
+            command_id="estop-1",
+            command=CommandName.EMERGENCY_STOP,
+        )
+    )
+    assert ack.status.value == "accepted"
+    # The hook fires synchronously, before the ACK is returned / next tick.
+    assert called == [True]
+
+
 # ── lifecycle (start/stop) ─────────────────────────────────────────
 
 

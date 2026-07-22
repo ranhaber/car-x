@@ -218,6 +218,149 @@ def test_receiver_logs_schema_version_error():
         logger.stop()
 
 
+# ── receiver: command auth ────────────────────────────────────────
+
+
+def _start_receiver_with_token(manager, token, *, logger=None):
+    receiver = UdpReceiver(
+        comms_manager=manager,
+        bind_host="127.0.0.1",
+        bind_port=0,
+        logger=logger,
+        recv_timeout_s=0.05,
+        command_token=token,
+    )
+    receiver.start()
+    address = receiver.bound_address
+    assert address is not None
+    return receiver, address
+
+
+def test_command_rejected_without_token_when_configured():
+    captured = []
+    logger = AsyncLogger(
+        sink=CallableSink(captured.append),
+        max_queue=32,
+        flush_interval_s=0.05,
+    )
+    logger.start()
+    manager, ss, acks = _make_manager_and_acks()
+    receiver, address = _start_receiver_with_token(
+        manager, "s3cret", logger=logger
+    )
+    client = _client_socket()
+    try:
+        cmd = CommandMessage(
+            sequence=3001,
+            timestamp_ms=0,
+            command_id="cmd-unauth",
+            command=CommandName.SET_HOME,
+            params={"home": {"x": 1.0, "y": 1.0, "frame_id": "yard"}},
+        )
+        # No token attached -> must be dropped.
+        client.sendto(json.dumps(cmd.to_dict()).encode("utf-8"), address)
+        assert _wait_until(
+            lambda: any(
+                e["data"].get("cause") == "unauthorized_command"
+                for e in captured
+                if e["event_type"] == TelemetryEventType.THREAD_HEALTH.value
+            )
+        )
+        # The command must not have been applied.
+        assert ss.get_home().set is False
+        assert not acks
+    finally:
+        client.close()
+        receiver.stop()
+        logger.stop()
+
+
+def test_command_rejected_with_wrong_token():
+    manager, ss, acks = _make_manager_and_acks()
+    receiver, address = _start_receiver_with_token(manager, "s3cret")
+    client = _client_socket()
+    try:
+        payload = CommandMessage(
+            sequence=3002,
+            timestamp_ms=0,
+            command_id="cmd-wrong",
+            command=CommandName.SET_HOME,
+            params={"home": {"x": 1.0, "y": 1.0, "frame_id": "yard"}},
+        ).to_dict()
+        payload["token"] = "wrong"
+        client.sendto(json.dumps(payload).encode("utf-8"), address)
+        time.sleep(0.3)
+        assert ss.get_home().set is False
+        assert not acks
+    finally:
+        client.close()
+        receiver.stop()
+
+
+def test_command_accepted_with_correct_token():
+    manager, ss, acks = _make_manager_and_acks()
+    receiver, address = _start_receiver_with_token(manager, "s3cret")
+    client = _client_socket()
+    try:
+        payload = CommandMessage(
+            sequence=3003,
+            timestamp_ms=0,
+            command_id="cmd-auth",
+            command=CommandName.SET_HOME,
+            params={"home": {"x": 7.0, "y": 8.0, "frame_id": "yard"}},
+        ).to_dict()
+        payload["token"] = "s3cret"
+        client.sendto(json.dumps(payload).encode("utf-8"), address)
+        assert _wait_until(lambda: ss.get_home().set is True)
+        assert acks[-1].status == AckStatus.ACCEPTED
+        assert ss.get_home().x == 7.0
+    finally:
+        client.close()
+        receiver.stop()
+
+
+def test_tracking_not_gated_by_command_token():
+    manager, ss, _ = _make_manager_and_acks()
+    receiver, address = _start_receiver_with_token(manager, "s3cret")
+    client = _client_socket()
+    try:
+        msg = TrackingMessage(
+            sequence=7,
+            timestamp_ms=0,
+            car=TrackingCar(x=1.0, y=2.0, confidence=1.0),
+            cat=TrackingCat(x=3.0, y=4.0, confidence=1.0),
+        )
+        client.sendto(json.dumps(msg.to_dict()).encode("utf-8"), address)
+        assert _wait_until(lambda: ss.get_overhead().sequence == 7)
+    finally:
+        client.close()
+        receiver.stop()
+
+
+def test_command_auth_disabled_logs_warning():
+    captured = []
+    logger = AsyncLogger(
+        sink=CallableSink(captured.append),
+        max_queue=32,
+        flush_interval_s=0.05,
+    )
+    logger.start()
+    manager, _, _ = _make_manager_and_acks()
+    # Explicit empty string -> auth disabled regardless of environment.
+    receiver, _address = _start_receiver_with_token(manager, "", logger=logger)
+    try:
+        assert _wait_until(
+            lambda: any(
+                e["data"].get("event") == "udp_command_auth_disabled"
+                for e in captured
+                if e["event_type"] == TelemetryEventType.THREAD_HEALTH.value
+            )
+        )
+    finally:
+        receiver.stop()
+        logger.stop()
+
+
 # ── sender ────────────────────────────────────────────────────────
 
 

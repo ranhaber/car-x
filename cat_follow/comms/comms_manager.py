@@ -68,12 +68,17 @@ class CommsManager:
         logger: Optional[AsyncLogger] = None,
         command_id_cache_size: int = DEFAULT_COMMAND_ID_CACHE_SIZE,
         source: str = "CommsManager",
+        on_emergency_stop: Optional[Callable[[], None]] = None,
     ) -> None:
         self._ss = shared_state
         self._ack_sink = ack_sink
         self._logger = logger
         self._cache_size = command_id_cache_size
         self._source = source
+        # Synchronous e-stop actuation hook: invoked the moment an
+        # emergency_stop command is accepted, so motors stop immediately
+        # instead of waiting for the next ControlLoop tick (which may be hung).
+        self._on_emergency_stop = on_emergency_stop
         self._lock = threading.Lock()
         self._command_results: "OrderedDict[str, _CommandResult]" = OrderedDict()
         self._last_tracking_sequence: int = -1
@@ -323,6 +328,14 @@ class CommsManager:
     # emergency_stop ────────────────────────────────────────────────
 
     def _handle_emergency_stop(self, msg: CommandMessage, state: FsmState) -> _CommandResult:
+        # Actuate the stop synchronously (motor e-stop + FAILSAFE latch) before
+        # ACKing.  The DecisionEngine still consumes the accepted command to keep
+        # FSM state consistent, but safety must not wait for the control tick.
+        if self._on_emergency_stop is not None:
+            try:
+                self._on_emergency_stop()
+            except Exception:
+                pass
         return _CommandResult(
             ack_type=AckType.COMMAND,
             status=AckStatus.ACCEPTED,

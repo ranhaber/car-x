@@ -1,10 +1,10 @@
 """Environment-driven perception/resource configuration.
 
 Mirrors :mod:`cat_follow.camera_config` but governs the *processing* side of
-the perception pipeline: which detection backend to use (CPU TFLite or the
-RK3576 NPU via RKNN), how aggressively to gate the detector behind motion,
-model lifecycle (lazy load + idle unload), OpenCV thread parallelism, CPU
-affinity, and the optional hardware-scaled lores stream device.
+the perception pipeline: the RK3576 NPU (RKNN) detection model, how
+aggressively to gate the detector behind motion, model lifecycle (lazy load +
+idle unload), OpenCV thread parallelism, CPU affinity, and the optional
+hardware-scaled lores stream device.
 
 All settings are read once from ``CAT_FOLLOW_PERCEPTION_*`` variables so the
 same code runs unchanged on a laptop (defaults) and on the ROCK 4D (env file).
@@ -79,12 +79,30 @@ def _core_set(name: str, default: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(cores)
 
 
+def _size_pair(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
+    """Parse a ``"W,H"`` (or ``"N"`` for square) model input size."""
+    raw = _raw(name)
+    if raw is None:
+        return default
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) == 1:
+        n = int(parts[0])
+        parts = [parts[0], parts[0]]
+    if len(parts) != 2:
+        raise ValueError(f"{_PREFIX}{name} must be 'W,H' or 'N'")
+    w, h = int(parts[0]), int(parts[1])
+    if w < 1 or h < 1:
+        raise ValueError(f"{_PREFIX}{name} dimensions must be >= 1")
+    return (w, h)
+
+
 @dataclass(frozen=True)
 class PerceptionConfig:
-    """Processing-side settings loaded once when perception threads start."""
+    """Processing-side settings loaded once when perception threads start.
 
-    # Detection backend: "tflite" (CPU) or "rknn" (RK3576 NPU).
-    backend: str = "tflite"
+    Detection runs exclusively on the RK3576 NPU via RKNN; there is no CPU/
+    TFLite fallback.
+    """
 
     # Motion gating: only invoke the detector when motion is present, and at a
     # reduced cadence while a lock is held.  Disable to always run the model.
@@ -103,6 +121,17 @@ class PerceptionConfig:
     idle_unload_sec: float = 10.0
     warmup_on_start: bool = True
 
+    # Allow the deterministic no-NPU stub. This must be explicitly enabled for
+    # development / CI; in production (default False) a missing RKNN runtime is
+    # a hard error so a broken/uninstalled rknnlite never masquerades as valid
+    # detection.
+    allow_stub: bool = False
+
+    # Runtime health: escalate (stop the app) after this many consecutive NPU
+    # inference failures so a wedged/failed-reload NPU cannot silently return
+    # empty detections forever.
+    max_infer_failures: int = 15
+
     # OpenCV parallelism: single-threaded when idle, wider when tracking.
     opencv_threads_idle: int = 1
     opencv_threads_active: int = 4
@@ -113,24 +142,15 @@ class PerceptionConfig:
     camera_cores: Tuple[int, ...] = field(default_factory=tuple)
     detector_cores: Tuple[int, ...] = field(default_factory=tuple)
 
-    # RKNN model path (used only when backend == "rknn").
+    # RKNN model path and input geometry (W, H) for the NPU backend.  The input
+    # size must match the converted .rknn (the documented model is 320x320).
     rknn_model_path: str = "models/ssd_mobilenet_v2.rknn"
-
-    @property
-    def uses_rknn(self) -> bool:
-        return self.backend == "rknn"
+    rknn_input_size: Tuple[int, int] = (320, 320)
 
 
 def load_perception_config() -> PerceptionConfig:
     """Load perception settings from ``CAT_FOLLOW_PERCEPTION_*`` variables."""
-    backend = _str("BACKEND", "tflite").lower()
-    if backend not in {"tflite", "rknn"}:
-        raise ValueError(
-            f"{_PREFIX}BACKEND must be 'tflite' or 'rknn', got {backend!r}"
-        )
-
     return PerceptionConfig(
-        backend=backend,
         motion_gating=_bool("MOTION_GATING", True),
         motion_scale=_float("MOTION_SCALE", 0.35, minimum=0.05),
         motion_threshold=_int("MOTION_THRESHOLD", 25, minimum=1),
@@ -139,10 +159,13 @@ def load_perception_config() -> PerceptionConfig:
         detect_interval_tracking=_int("DETECT_INTERVAL_TRACKING", 2, minimum=1),
         idle_unload_sec=_float("IDLE_UNLOAD_SEC", 10.0, minimum=0.0),
         warmup_on_start=_bool("WARMUP_ON_START", True),
+        allow_stub=_bool("ALLOW_STUB", False),
+        max_infer_failures=_int("MAX_INFER_FAILURES", 15, minimum=1),
         opencv_threads_idle=_int("OPENCV_THREADS_IDLE", 1, minimum=1),
         opencv_threads_active=_int("OPENCV_THREADS_ACTIVE", 4, minimum=1),
         affinity_enabled=_bool("AFFINITY_ENABLED", False),
         camera_cores=_core_set("CAMERA_CORES", ()),
         detector_cores=_core_set("DETECTOR_CORES", ()),
         rknn_model_path=_str("RKNN_MODEL_PATH", "models/ssd_mobilenet_v2.rknn"),
+        rknn_input_size=_size_pair("RKNN_INPUT", (320, 320)),
     )

@@ -56,6 +56,11 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | VM-22 | Lidar obstacle veto | Place obstacle <10 cm in the front sector during `CHASE_A`/`GOTO` | Lidar `RangeState` (LIDAR_C1) drives `FAILSAFE` alongside ultrasonic | `obstacle_too_close` + `lidar_obstacle` constraints logged; hard-stop; no collision; UI constraint chips show veto |
 | VM-23 | Lidar-assisted navigation | `go_to` target with Nav2 running and fresh `NavigationState` | Steering follows `path_correction`; speed capped by `speed_limit` | Reaches target tolerance; `navigation` constraint logged; precedence preserved; UI shows path_correction/speed_limit |
 | VM-24 | Perception headless efficiency | Stop MJPEG/H.264 stream / disconnect browser | Detection + tracking continue; model unloads after idle; CPU drops | Detection events continue with no viewer (`stream_clients=0`); idle CPU reduced vs. streaming |
+| VM-25 | Sensor/nav freshness expiry | Freeze range/lidar/nav producers while retaining their last values | `DecisionEngine` ages each input from monotonic `received_ms`; stale values lose authority | No motor output based on stale data; navigation stops with an explicit constraint |
+| VM-26 | Planner silence with live odometry | Stop `/cmd_vel` while `/odom` continues | Cached planner speed/steering terms clear after 500 ms | `speed_limit=0`, `path_correction=0`; no stale planner command revives |
+| VM-27 | Failsafe latch | Inject detector fatal, control exception, critical overrun, or three consecutive overruns | Synchronous e-stop and `FAILSAFE`; healthy later ticks cannot re-drive | Motors remain inhibited until accepted operator `clear_failsafe` |
+| VM-28 | Control-channel authentication | Configure web and UDP secrets; send missing/wrong/correct tokens | Motion routes/UDP commands reject invalid tokens and accept valid tokens; web stop/e-stop remain open | HTTP 401 or UDP drop for invalid token; no side effect; valid command succeeds |
+| VM-29 | Monitoring and telemetry resilience | Fail telemetry sink transiently; age map/pose/scan; provide odom pose after map TF failure | Failed CRITICAL event is retried; stale status is reported; odom pose is not drawn over map grid | CRITICAL record persists after sink recovery; `pose_on_map=false` for odom pose |
 
 ### 5.1 ROCK 4D platform bring-up evidence (2026-07-19)
 
@@ -68,7 +73,7 @@ This document defines the minimum test matrix, pass/fail criteria, and evidence 
 | Runtime service | Pass | Real `PiCarXBackend` service started and stopped cleanly |
 | Power stability | Pass (bench) | Dual-rail test completed without ROCK reset |
 | MIPI camera | Pass | Radxa Camera 4K / IMX415 detected at I2C5 `0x1a`; RKISP captured 30 frames at 30 FPS and produced a visible image |
-| Perception optimization | Pass (host) | Motion-gated detector, lazy/idle-unload backend, adaptive OpenCV threads + affinity, and hardware-lores motion path landed; 274 unit tests green |
+| Perception optimization | Pass (host) | Motion-gated detector, lazy/idle-unload backend, adaptive OpenCV threads + affinity, hardware-lores motion path, and safety-review regressions landed; 334 tests green |
 | ROS 2 / Nav2 / C1 integration | Ready (pending HW) | `cat_follow_bringup` package (lidar/TF/URDF/slam/Nav2 launch + params), `ros_bridge`/`odom_publisher`, `--ros-nav`, and DecisionEngine fusion implemented; awaiting C1 hardware for VM-21..VM-23 |
 | Contract web UI monitoring | Pass (host) | `--web-ui` on `runtime.app`; `/api/status` exposes SharedSnapshot + perception diagnostics; Control page shows constraints / lidar / nav / phase; stream_clients reported for VM-24; `/api/map` canvas for occupancy + pose (needs `--ros-nav` + `/map`) |
 | RPLidar C1 | Pending | Hardware not yet available |
@@ -94,6 +99,8 @@ Any critical fail blocks release.
 2. Safety/timeout tests: VM-08 through VM-14.
 3. Command/return tests: VM-15 through VM-17.
 4. Robustness tests: VM-18 through VM-20.
+5. ROS/headless integration tests: VM-21 through VM-24.
+6. Safety-hardening regression tests: VM-25 through VM-29.
 
 ## 9. Exit Criteria
 Validation suite is considered complete when:

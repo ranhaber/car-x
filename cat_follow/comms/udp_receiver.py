@@ -8,7 +8,9 @@ without ever killing the receiver thread.
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import socket
 import threading
 from typing import Optional, Tuple
@@ -36,6 +38,14 @@ DEFAULT_RECV_BUFSIZE = 65535
 # requiring asynchronous I/O.
 DEFAULT_RECV_TIMEOUT_S = 0.1
 
+# Environment variable holding the shared secret required on command
+# datagrams.  When set, a COMMAND packet must carry a matching top-level
+# ``token`` field or it is dropped.  When unset, command auth is disabled
+# (backwards-compatible), and a warning is emitted at startup.  UDP is an
+# unauthenticated, spoofable transport and commands can move the car, so
+# operators binding beyond localhost should always configure this.
+COMMAND_TOKEN_ENV = "CAT_FOLLOW_COMMS_TOKEN"
+
 
 class UdpReceiver:
     """Receives JSON-encoded contract messages via UDP."""
@@ -50,6 +60,7 @@ class UdpReceiver:
         recv_timeout_s: float = DEFAULT_RECV_TIMEOUT_S,
         thread_name: str = "CatFollow-Comms-RX",
         source: str = "UdpReceiver",
+        command_token: Optional[str] = None,
     ) -> None:
         self._comms = comms_manager
         self._bind_host = bind_host
@@ -59,6 +70,12 @@ class UdpReceiver:
         self._recv_timeout_s = recv_timeout_s
         self._thread_name = thread_name
         self._source = source
+        # Explicit argument overrides the environment; an empty string means
+        # "no token" (auth disabled).
+        if command_token is None:
+            command_token = os.environ.get(COMMAND_TOKEN_ENV, "")
+        command_token = command_token.strip()
+        self._command_token: Optional[str] = command_token or None
 
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -74,6 +91,8 @@ class UdpReceiver:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self._bind_host, self._bind_port))
         self._sock.settimeout(self._recv_timeout_s)
+        if self._command_token is None:
+            self._log_auth_disabled()
         self._thread = threading.Thread(
             target=self._run,
             name=self._thread_name,
@@ -135,6 +154,15 @@ class UdpReceiver:
                 self._comms.submit_tracking(TrackingMessage.from_dict(payload))
                 return
             if msg_type == MessageType.COMMAND.value:
+                # Commands can move the car; reject unauthenticated datagrams
+                # when a shared secret is configured.
+                if not self._command_authorized(payload):
+                    self._log_packet_error(
+                        addr,
+                        "unauthorized_command",
+                        "missing or invalid token",
+                    )
+                    return
                 self._comms.submit_command(CommandMessage.from_dict(payload))
                 return
         except SchemaVersionError as exc:
@@ -149,6 +177,36 @@ class UdpReceiver:
             addr,
             "unsupported_message_type",
             f"type={msg_type!r}",
+        )
+
+    def _command_authorized(self, payload: dict) -> bool:
+        """Return True if a command datagram is allowed to be dispatched.
+
+        Auth is only enforced when a token is configured.  The comparison is
+        constant-time to avoid leaking the secret via timing.
+        """
+        if self._command_token is None:
+            return True
+        provided = payload.get("token")
+        if not isinstance(provided, str):
+            return False
+        return hmac.compare_digest(provided, self._command_token)
+
+    def _log_auth_disabled(self) -> None:
+        if self._logger is None:
+            return
+        self._logger.log(
+            event_type=TelemetryEventType.THREAD_HEALTH,
+            severity=TelemetrySeverity.WARNING,
+            source=self._source,
+            state=None,
+            data={
+                "event": "udp_command_auth_disabled",
+                "detail": (
+                    f"{COMMAND_TOKEN_ENV} not set; UDP commands are "
+                    f"unauthenticated on {self._bind_host}:{self._bind_port}"
+                ),
+            },
         )
 
     def _log_packet_error(

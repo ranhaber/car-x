@@ -24,6 +24,12 @@ from cat_follow.comms.udp_receiver import UdpReceiver
 from cat_follow.comms.udp_sender import UdpSender
 from cat_follow.control.decision_engine import DecisionEngine
 from cat_follow.control.fsm import FSM
+from cat_follow.control.types import (
+    FsmState,
+    ReasonCode,
+    TelemetryEventType,
+    TelemetrySeverity,
+)
 from cat_follow.motion.motor_interface import (
     MotorBackend,
     MotorInterface,
@@ -61,6 +67,7 @@ class App:
     prototype_perception_threads: Tuple[threading.Thread, ...] = field(
         default_factory=tuple
     )
+    prototype_detector_handshake: Optional[Any] = None
     ros_nav: bool = False
     ros_bridge_thread: Optional[threading.Thread] = None
     web_ui_thread: Optional[threading.Thread] = None
@@ -69,6 +76,17 @@ class App:
         self.logger.start()
         for thread in self.prototype_perception_threads:
             thread.start()
+        # Startup handshake: block until the detector worker validates its
+        # RKNN backend (or reports the dev/CI stub).  A validation failure
+        # raises here and aborts startup instead of running the app blind.
+        if self.prototype_detector_handshake is not None:
+            try:
+                self.prototype_detector_handshake.wait_ready()
+            except Exception:
+                self.stop_event.set()
+                if self.prototype_perception_stop_event is not None:
+                    self.prototype_perception_stop_event.set()
+                raise
         if self.vision_adapter is not None:
             self.vision_adapter.start()
         if self.range_adapter is not None:
@@ -137,6 +155,8 @@ def build_app(
     range_read_distance: Optional[Callable[[], Optional[float]]] = None,
     prototype_perception_threads: Tuple[threading.Thread, ...] = (),
     prototype_perception_stop_event: Optional[threading.Event] = None,
+    prototype_detector_handshake: Optional[Any] = None,
+    prototype_detector_fatal_hook: Optional[Any] = None,
     ros_nav: bool = False,
     web_ui: bool = False,
     web_ui_port: int = 5000,
@@ -200,6 +220,52 @@ def build_app(
         target_rate_hz=target_rate_hz,
     )
 
+    app_stop_event = stop_event or threading.Event()
+
+    def _enter_failsafe(reason: str) -> None:
+        """Synchronously stop motors and latch the FSM into FAILSAFE.
+
+        Shared by the comms emergency-stop path and the perception fatal-error
+        escalation.  Latching means only an operator ``clear_failsafe`` leaves
+        FAILSAFE, so subsequent control ticks keep emitting a safe stop.
+        """
+        # Emit CRITICAL telemetry first so the failsafe reason is durable even
+        # if the motor/FSM calls below raise (CRITICAL triggers a sync flush).
+        try:
+            logger.log(
+                event_type=TelemetryEventType.FAILSAFE,
+                severity=TelemetrySeverity.CRITICAL,
+                source="Runtime",
+                state=fsm.state,
+                data={"event": "failsafe_latched", "reason": reason},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            motor.emergency_stop(reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if fsm.state != FsmState.FAILSAFE:
+                fsm.force_state(
+                    FsmState.FAILSAFE, reason=ReasonCode.FAILSAFE_TRIGGERED
+                )
+                shared_state.update_fsm(fsm.snapshot())
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Wire the perception fatal-error escalation to e-stop + FAILSAFE + app
+    # teardown.  A detector escalation (failed NPU reload, repeated inference
+    # failures) must stop the whole vehicle, not just the perception threads.
+    if prototype_detector_fatal_hook is not None:
+        def _on_detector_fatal(message: str) -> None:
+            _enter_failsafe(f"perception_fatal: {message}")
+            app_stop_event.set()
+            if prototype_perception_stop_event is not None:
+                prototype_perception_stop_event.set()
+
+        prototype_detector_fatal_hook.set_handler(_on_detector_fatal)
+
     udp_sender: Optional[UdpSender] = None
     if udp_target_host is not None and udp_target_port is not None:
         udp_sender = UdpSender(
@@ -215,6 +281,7 @@ def build_app(
         shared_state=shared_state,
         ack_sink=ack_sink,
         logger=logger,
+        on_emergency_stop=lambda: _enter_failsafe("comms_emergency_stop"),
     )
 
     udp_receiver: Optional[UdpReceiver] = None
@@ -266,13 +333,14 @@ def build_app(
         logger=logger,
         control_loop=control_loop,
         comms_manager=comms_manager,
-        stop_event=stop_event or threading.Event(),
+        stop_event=app_stop_event,
         udp_receiver=udp_receiver,
         udp_sender=udp_sender,
         vision_adapter=vision_adapter,
         range_adapter=range_adapter,
         prototype_perception_threads=prototype_perception_threads,
         prototype_perception_stop_event=prototype_perception_stop_event,
+        prototype_detector_handshake=prototype_detector_handshake,
         ros_nav=ros_nav,
         web_ui_thread=web_ui_thread,
     )
@@ -408,6 +476,8 @@ class _PrototypePerception:
     image_width: int
     image_height: int
     range_read_distance: Callable[[], Optional[float]]
+    detector_handshake: Any = None
+    detector_fatal_hook: Any = None
 
 
 def _build_prototype_perception(
@@ -430,7 +500,11 @@ def _build_prototype_perception(
             SharedState as PrototypeSharedState,
         )
         from cat_follow.threads.camera import run_camera_loop
-        from cat_follow.threads.detector import run_detector_loop
+        from cat_follow.threads.detector import (
+            DetectorFatalHook,
+            DetectorHandshake,
+            run_detector_loop,
+        )
         from cat_follow.threads.tracker import run_tracker_loop
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(
@@ -451,6 +525,8 @@ def _build_prototype_perception(
             )
 
     stop_event = threading.Event()
+    detector_handshake = DetectorHandshake()
+    detector_fatal_hook = DetectorFatalHook()
     threads = [
         threading.Thread(
             target=run_camera_loop,
@@ -467,6 +543,10 @@ def _build_prototype_perception(
         threading.Thread(
             target=run_detector_loop,
             args=(proto_ss, stop_event),
+            kwargs={
+                "handshake": detector_handshake,
+                "on_fatal": detector_fatal_hook,
+            },
             name="CatFollow-Proto-Detector",
             daemon=True,
         ),
@@ -481,6 +561,8 @@ def _build_prototype_perception(
         image_width=image_width,
         image_height=image_height,
         range_read_distance=proto_range_sensor.get_distance_cm,
+        detector_handshake=detector_handshake,
+        detector_fatal_hook=detector_fatal_hook,
     )
 
 
@@ -621,6 +703,8 @@ def main(argv: Optional[list] = None) -> int:
             range_read_distance=proto.range_read_distance,
             prototype_perception_threads=tuple(proto.threads),
             prototype_perception_stop_event=proto.stop_event,
+            prototype_detector_handshake=proto.detector_handshake,
+            prototype_detector_fatal_hook=proto.detector_fatal_hook,
             web_ui_shared_state=proto.shared_state,
         )
 

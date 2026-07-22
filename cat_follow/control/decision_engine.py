@@ -29,6 +29,7 @@ from cat_follow.control.types import (
     DecisionOutput,
     FsmEvent,
     FsmState,
+    RangeState,
     ReasonCode,
     TargetSource,
 )
@@ -43,6 +44,18 @@ OBSTACLE_TOO_CLOSE_CM = 10.0
 # Overhead packet ages that trigger downgraded behavior or failsafe.
 OVERHEAD_STALE_WARNING_MS = 300
 OVERHEAD_STALE_FAILSAFE_MS = 700
+
+# Age (ms) beyond which a producer's last sample is no longer trusted for
+# safety/control decisions.  Per Interface spec 12.6 the stored ``fresh`` flag
+# is advisory only: freshness MUST be recomputed at decision time from
+# ``received_ms`` against local monotonic time.  A dead adapter/bridge thread
+# stops advancing ``received_ms`` and therefore ages out (fail-closed) instead
+# of leaving its last sample authoritative forever.
+RANGE_STALE_MS = 500
+LIDAR_STALE_MS = 500
+NAVIGATION_STALE_MS = 500
+# Vision loss window mirrors CAMERA_LOSS_FALLBACK_MS (TRACK_B -> CHASE_A).
+VISION_STALE_MS = 350
 
 # Normalized full-scale speed used when navigation drives the chassis. Speeds
 # and steering are normalized to [0, 1] and [-1, 1] respectively.
@@ -121,11 +134,18 @@ class DecisionEngine:
             )
 
         # 2. Critical obstacle veto (severity-based), from ultrasonic or lidar.
+        #    Freshness is recomputed from received_ms (not the sticky flag).
         range_critical = (
-            decision_input.range.fresh and decision_input.range.obstacle_critical
+            self._age_fresh(
+                decision_input.range.received_ms, RANGE_STALE_MS, decision_input.now_ms
+            )
+            and decision_input.range.obstacle_critical
         )
         lidar_critical = (
-            decision_input.lidar.fresh and decision_input.lidar.obstacle_critical
+            self._age_fresh(
+                decision_input.lidar.received_ms, LIDAR_STALE_MS, decision_input.now_ms
+            )
+            and decision_input.lidar.obstacle_critical
         )
         if range_critical or lidar_critical:
             self._fsm.apply(
@@ -173,6 +193,10 @@ class DecisionEngine:
             if overhead_age_ms > OVERHEAD_STALE_WARNING_MS:
                 constraints.append("overhead_stale")
 
+        # 4b. Vision-driven chase handoff.  Without this the CAT_VISIBLE_STABLE
+        #     / CAT_LOST transitions are unreachable and TRACK_B is dead.
+        self._apply_vision_events(decision_input)
+
         # 5. State-specific shell behavior.
         current_state = self._fsm.state
 
@@ -186,11 +210,32 @@ class DecisionEngine:
 
         # 6. Navigation-assisted drive (CHASE_A / GOTO) when Nav2 is publishing
         #    fresh constraints via the ros_bridge.  Safety precedence above is
-        #    already enforced (failsafe > obstacle veto > this).
-        if (
-            current_state in _NAV_DRIVE_STATES
-            and decision_input.navigation.fresh
-        ):
+        #    already enforced (failsafe > obstacle veto > this).  Navigation
+        #    freshness is recomputed from received_ms so a dead ros_bridge (or a
+        #    silent planner, via the bridge's cmd_vel aging) fails closed here.
+        nav_fresh = self._age_fresh(
+            decision_input.navigation.received_ms,
+            NAVIGATION_STALE_MS,
+            decision_input.now_ms,
+        )
+        if current_state in _NAV_DRIVE_STATES and nav_fresh:
+            # Fail-closed: only drive when at least one obstacle sensor is fresh
+            # AND returning a valid reading.  With no usable proximity sensing we
+            # refuse to drive blind (review findings #1, #11).
+            range_usable = self._obstacle_sensor_usable(
+                decision_input.range, RANGE_STALE_MS, decision_input.now_ms
+            )
+            lidar_usable = self._obstacle_sensor_usable(
+                decision_input.lidar, LIDAR_STALE_MS, decision_input.now_ms
+            )
+            if not (range_usable or lidar_usable):
+                constraints.append("obstacle_sensor_unavailable")
+                return self._safe_stop_output(
+                    decision_input,
+                    reason=ReasonCode.OBSTACLE_VETO,
+                    constraints=constraints,
+                    brake=False,
+                )
             return self._navigation_drive_output(
                 decision_input, current_state, constraints
             )
@@ -238,6 +283,37 @@ class DecisionEngine:
         event, reason = mapping
         self._fsm.apply(event, reason=reason, now_ms=decision_input.now_ms)
 
+    def _apply_vision_events(self, decision_input: DecisionInput) -> None:
+        """Emit vision-driven FSM events for the chase handoff.
+
+        - ``CHASE_A`` + fresh, stable cat  -> ``CAT_VISIBLE_STABLE`` (-> TRACK_B)
+        - ``TRACK_B`` + cat lost/aged out   -> ``CAT_LOST``          (-> CHASE_A)
+
+        Vision freshness is recomputed from ``received_ms`` (the adapter only
+        advances it on a genuinely new tracker observation), so a frozen tracker
+        ages out and reads as "cat lost" rather than a sticky visible lock.
+        """
+        vision = decision_input.vision
+        state = self._fsm.state
+        vision_fresh = self._age_fresh(
+            vision.received_ms, VISION_STALE_MS, decision_input.now_ms
+        )
+
+        if state == FsmState.CHASE_A:
+            if vision_fresh and vision.cat_visible_stable:
+                self._fsm.apply(
+                    FsmEvent.CAT_VISIBLE_STABLE,
+                    reason=ReasonCode.LOCAL_TRACK,
+                    now_ms=decision_input.now_ms,
+                )
+        elif state == FsmState.TRACK_B:
+            if not vision_fresh or not vision.cat_visible:
+                self._fsm.apply(
+                    FsmEvent.CAT_LOST,
+                    reason=ReasonCode.CAT_LOST_FALLBACK,
+                    now_ms=decision_input.now_ms,
+                )
+
     @staticmethod
     def _overhead_age_ms(decision_input: DecisionInput) -> Optional[int]:
         """Return monotonic age of latest overhead packet, or None if never received."""
@@ -247,22 +323,51 @@ class DecisionEngine:
         return decision_input.now_ms - decision_input.overhead.received_ms
 
     @staticmethod
-    def _range_obstacle_too_close(decision_input: DecisionInput) -> bool:
+    def _age_fresh(received_ms: int, ttl_ms: int, now_ms: int) -> bool:
+        """Age-based freshness computed at decision time (Interface spec 12.6).
+
+        Ignores the sticky published ``fresh`` flag: a group is only trusted
+        when it was actually received (``received_ms > 0``) and its age is
+        within ``ttl_ms``.  A dead producer thread ages out and fails closed.
+        """
+        if received_ms <= 0:
+            return False
+        return (now_ms - received_ms) <= ttl_ms
+
+    @classmethod
+    def _range_obstacle_too_close(cls, decision_input: DecisionInput) -> bool:
         rs = decision_input.range
-        if not rs.fresh:
+        if not cls._age_fresh(rs.received_ms, RANGE_STALE_MS, decision_input.now_ms):
             return False
         if rs.distance_cm is None:
             return False
         return rs.distance_cm < OBSTACLE_TOO_CLOSE_CM
 
-    @staticmethod
-    def _lidar_obstacle_too_close(decision_input: DecisionInput) -> bool:
+    @classmethod
+    def _lidar_obstacle_too_close(cls, decision_input: DecisionInput) -> bool:
         ls = decision_input.lidar
-        if not ls.fresh:
+        if not cls._age_fresh(ls.received_ms, LIDAR_STALE_MS, decision_input.now_ms):
             return False
         if ls.distance_cm is None:
             return False
         return ls.distance_cm < OBSTACLE_TOO_CLOSE_CM
+
+    @staticmethod
+    def _obstacle_sensor_usable(rs: RangeState, ttl_ms: int, now_ms: int) -> bool:
+        """True when an obstacle sensor is fresh AND returning a valid reading.
+
+        Fail-closed helper for the drive-permission gate: a fresh-but-faulted
+        sensor (``distance_cm is None`` / ``confidence == 0``) does NOT count as
+        "clear" -- otherwise a stuck sensor that keeps publishing ``None`` would
+        silently disable obstacle protection (see review finding #11).
+        """
+        if rs.received_ms <= 0:
+            return False
+        if (now_ms - rs.received_ms) > ttl_ms:
+            return False
+        if rs.distance_cm is None or rs.confidence <= 0.0:
+            return False
+        return True
 
     def _navigation_drive_output(
         self,
@@ -272,18 +377,33 @@ class DecisionEngine:
     ) -> DecisionOutput:
         """Blend Nav2 constraints into the motion command.
 
-        ``final_steer = clamp(pursuit_steer + path_correction)`` and
-        ``final_speed = min(pursuit_speed, speed_limit * MAX_SPEED)``.  The V1
-        shell has no pursuit term yet, so pursuit_steer = 0 and pursuit_speed =
-        MAX_SPEED, i.e. Nav2 drives directly while safety precedence is owned
-        by the checks above.
+        Authority model (``final_steer = clamp(pursuit_steer + path_correction)``,
+        ``final_speed = min(pursuit_speed, speed_limit * MAX_SPEED)``):
+
+        - ``GOTO`` is a legitimate autonomous navigation goal, so Nav2 drives to
+          the target with ``speed_limit`` acting as the throttle.
+        - ``CHASE_A`` pursuit authority is *local* (owned by vision pursuit, not
+          the ROS bridge).  Nav2 is advisory only here: ``speed_limit`` is a cap
+          and ``path_correction`` a steering bias on top of the local pursuit
+          term.  The V1 shell has no pursuit term yet, so ``pursuit_speed = 0``
+          and the car holds in CHASE_A until vision pursuit is wired -- Nav2 is
+          no longer the sole motor driver.
         """
         nav = decision_input.navigation
         pursuit_steer = 0.0
-        pursuit_speed = MAX_SPEED
+        speed_cap = max(0.0, nav.speed_limit) * MAX_SPEED
 
         final_steer = max(-1.0, min(1.0, pursuit_steer + nav.path_correction))
-        final_speed = max(0.0, min(pursuit_speed, nav.speed_limit * MAX_SPEED))
+
+        if current_state == FsmState.GOTO:
+            final_speed = speed_cap
+            target_source = TargetSource.GO_TO
+        else:
+            # CHASE_A: local pursuit owns speed; Nav2 only caps it (advisory).
+            pursuit_speed = 0.0
+            final_speed = max(0.0, min(pursuit_speed, speed_cap))
+            constraints.append("nav_advisory")
+            target_source = TargetSource.CAT_GLOBAL
 
         constraints.append("navigation")
         if nav.no_progress:
@@ -291,11 +411,6 @@ class DecisionEngine:
         if nav.dead_end:
             constraints.append("dead_end")
 
-        target_source = (
-            TargetSource.GO_TO
-            if current_state == FsmState.GOTO
-            else TargetSource.CAT_GLOBAL
-        )
         return DecisionOutput(
             timestamp_ms=decision_input.now_ms,
             requested_state=self._fsm.state,
