@@ -1,10 +1,19 @@
 """Publish cat_follow dead-reckoning odometry as ROS 2 ``nav_msgs/Odometry``.
 
-PiCar-X has no wheel encoders, so slam_toolbox/Nav2 are fed the bicycle-model
-estimate from :mod:`cat_follow.odometry` (corrected downstream by scan
-matching).  This node publishes ``/odom`` and broadcasts the dynamic
-``odom -> base_link`` transform; the static ``base_link -> laser/camera`` tree
-comes from ``robot_state_publisher`` (see ``tf_urdf.launch.py``).
+PiCar-X has no wheel encoders, so this node was intended to feed slam_toolbox /
+Nav2 the bicycle-model estimate from :mod:`cat_follow.odometry` (corrected
+downstream by scan matching).
+
+**Disabled source.** The contract runtime (``runtime/app.py`` +
+``DecisionEngine``) never calls :func:`cat_follow.odometry.update`, so this
+publisher would emit a *frozen* pose (a static ``odom -> base_link``). Feeding
+a stationary odometry estimate to SLAM/Nav2 is unsafe, so constructing
+:class:`OdomPublisher` (and :func:`main`) now fails closed with a clear error.
+Lidar RF2O is the production owner of ``/odom`` and ``odom -> base_link`` (see
+:mod:`cat_follow.navigation.odom_source`).
+
+The pure helpers (:func:`yaw_to_quaternion`, :func:`odometry_reading_m`) remain
+importable for unit tests.
 
 ``rclpy`` and message imports are guarded so this file imports cleanly on
 machines without ROS 2; :func:`main` raises a clear error there.
@@ -18,9 +27,6 @@ from typing import Callable, Optional, Tuple
 try:
     import rclpy
     from rclpy.node import Node
-    from nav_msgs.msg import Odometry
-    from geometry_msgs.msg import TransformStamped
-    from tf2_ros import TransformBroadcaster
 
     _HAS_ROS = True
 except Exception:  # pragma: no cover - ROS absent on dev machines
@@ -28,6 +34,7 @@ except Exception:  # pragma: no cover - ROS absent on dev machines
     Node = object  # type: ignore
 
 from cat_follow import odometry as odom
+from cat_follow.navigation.odom_source import BICYCLE_ODOM_DISABLED_MSG
 
 
 def yaw_to_quaternion(yaw_rad: float) -> Tuple[float, float, float, float]:
@@ -60,46 +67,11 @@ if _HAS_ROS:
             odom_frame: str = "odom",
             base_frame: str = "base_link",
         ) -> None:
-            super().__init__("cat_follow_odom_publisher")
-            self._reader = reader
-            self._odom_frame = odom_frame
-            self._base_frame = base_frame
-            self._pub = self.create_publisher(Odometry, "odom", 10)
-            self._tf = TransformBroadcaster(self)
-            self.create_timer(1.0 / max(rate_hz, 1e-3), self._on_timer)
-
-        def _on_timer(self) -> None:
-            x_m, y_m, yaw = self._reader()
-            qx, qy, qz, qw = yaw_to_quaternion(yaw)
-            stamp = self.get_clock().now().to_msg()
-
-            msg = Odometry()
-            msg.header.stamp = stamp
-            msg.header.frame_id = self._odom_frame
-            msg.child_frame_id = self._base_frame
-            msg.pose.pose.position.x = x_m
-            msg.pose.pose.position.y = y_m
-            msg.pose.pose.orientation.x = qx
-            msg.pose.pose.orientation.y = qy
-            msg.pose.pose.orientation.z = qz
-            msg.pose.pose.orientation.w = qw
-            # High covariance on unmeasured DOFs (no encoders / IMU yet).
-            msg.pose.covariance[0] = 0.05
-            msg.pose.covariance[7] = 0.05
-            msg.pose.covariance[35] = 0.1
-            self._pub.publish(msg)
-
-            tf = TransformStamped()
-            tf.header.stamp = stamp
-            tf.header.frame_id = self._odom_frame
-            tf.child_frame_id = self._base_frame
-            tf.transform.translation.x = x_m
-            tf.transform.translation.y = y_m
-            tf.transform.rotation.x = qx
-            tf.transform.rotation.y = qy
-            tf.transform.rotation.z = qz
-            tf.transform.rotation.w = qw
-            self._tf.sendTransform(tf)
+            # Fail closed: the bicycle odometry source is disabled because the
+            # contract runtime never integrates commanded motion, which would
+            # make this publisher emit a frozen pose.  Refuse to construct so no
+            # stationary /odom or static odom->base_link is ever published.
+            raise RuntimeError(BICYCLE_ODOM_DISABLED_MSG)
 
 
 def main(args: Optional[list] = None) -> int:

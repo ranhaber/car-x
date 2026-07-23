@@ -14,9 +14,14 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <exec_depend>sllidar_ros2</exec_depend>
+  <exec_depend>rf2o_laser_odometry</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <!-- map_saver_cli, used to save the yard map after a mapping session. -->
+  <exec_depend>nav2_map_server</exec_depend>
+  <!-- Manual teleop used to drive the survey during mapping.launch.py. -->
+  <exec_depend>teleop_twist_keyboard</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>xacro</exec_depend>

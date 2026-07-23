@@ -2,7 +2,9 @@
 # ROS 2 navigation stack for the ROCK 4D: C1 lidar + slam_toolbox localization
 # + Nav2 (composed). Runs as separate ROS processes; cat_follow bridges topics
 # only (see cat-follow-ros.service with --ros-nav). Publishes /scan, /map,
-# Nav2 /cmd_vel; consumes /odom from the cat_follow ros_bridge.
+# Nav2 /cmd_vel. When CAT_FOLLOW_ODOM_SOURCE=lidar (default), RF2O in this
+# launch owns /odom and odom->base_link; when bicycle, cat_follow --ros-nav
+# owns those instead.
 Description=Cat Follow ROS 2 navigation bringup (C1 lidar + slam + Nav2)
 After=network-online.target
 Wants=network-online.target
@@ -15,6 +17,11 @@ SupplementaryGroups=dialout
 EnvironmentFile=/etc/car-x/car-x.env
 # Wait for the deterministic lidar symlink from 99-rplidar.rules.
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e "$CAT_FOLLOW_LIDAR_PORT" ] && exit 0; sleep 1; done; exit 1'
+# Fail fast with a clear journal message when no saved map is configured/present.
+# Localization (this launch) must not start against an empty/missing map. Run a
+# mapping session first (see mapping.launch.py) and set CAT_FOLLOW_MAP_FILE.
+ExecStartPre=/bin/sh -c '[ -n "$CAT_FOLLOW_MAP_FILE" ] || { echo "CAT_FOLLOW_MAP_FILE is unset; run a mapping session and set it to the saved map basename"; exit 1; }'
+ExecStartPre=/bin/sh -c 'test -f "$CAT_FOLLOW_MAP_FILE.posegraph" -a -f "$CAT_FOLLOW_MAP_FILE.data" || { echo "saved map incomplete: expected $CAT_FOLLOW_MAP_FILE.posegraph and .data"; exit 1; }'
 ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/car-x/ros_ws/install/setup.bash && exec ros2 launch cat_follow_bringup rock4d_nav.launch.py'
 Restart=on-failure
 RestartSec=3

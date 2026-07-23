@@ -10,8 +10,12 @@
 #   python3 -m venv --system-site-packages /opt/car-x/venv
 # and keep /opt/ros/jazzy sourced (below) so the ROS libraries resolve.
 Description=Cat Follow control runtime (with ROS 2 navigation bridge)
+# The --ros-nav bridge consumes /scan, /odom and Nav2 /cmd_vel_smoothed from
+# ros-nav.service, so order after it and pull it in. Wants (not Requires): if
+# the ROS stack drops, the bridge inputs age out and the DecisionEngine fails
+# closed rather than the control runtime being killed.
 After=network-online.target ros-nav.service
-Wants=network-online.target
+Wants=network-online.target ros-nav.service
 
 [Service]
 Type=simple
@@ -20,10 +24,16 @@ Group=picarx
 SupplementaryGroups=i2c gpio video dialout
 WorkingDirectory=/opt/car-x
 EnvironmentFile=/etc/car-x/car-x.env
+# Allow this service's ultrasonic worker to request SCHED_FIFO when
+# CAT_FOLLOW_ULTRASONIC_REQUIRE_REALTIME=1. Production currently uses
+# REQUIRE_REALTIME=0 (affinity-only). Configured priority stays below LimitRTPRIO.
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+LimitRTPRIO=80
 ExecStartPre=-/usr/bin/v4l2-ctl -d ${CAT_FOLLOW_CAMERA_SENSOR_DEVICE} --set-ctrl=exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}
 # Fail fast (clear journal message) when the RKNN model has not been provisioned.
-# Path is relative to WorkingDirectory (/opt/car-x). Build it with
-# scripts/convert_to_rknn.py on a workstation and copy it to /opt/car-x/models/.
+# Path is relative to WorkingDirectory (/opt/car-x). Build YOLOv8n with
+# scripts/convert_yolo_to_rknn.py (rk3576) and copy to /opt/car-x/models/.
 ExecStartPre=/bin/sh -c 'test -f "${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}" || { echo "RKNN model missing: ${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}"; exit 1; }'
 ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && exec /opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --ros-nav'
 # Optional monitoring UI (non-authoritative). Append --web-ui --web-ui-port 5000.

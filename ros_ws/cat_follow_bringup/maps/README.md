@@ -22,6 +22,35 @@ This directory holds the saved occupancy grid used for localization and Nav2.
 
    This writes `yard_map.yaml` + `yard_map.pgm`. Copy both back here and commit.
 
+4. slam_toolbox *localization* loads a serialized pose-graph, not the pgm.
+   Serialize it during the same session:
+
+   ```bash
+   ros2 service call /slam_toolbox/serialize_map \
+     slam_toolbox/srv/SerializePoseGraph \
+     "{filename: '$(ros2 pkg prefix cat_follow_bringup)/share/cat_follow_bringup/maps/yard_map'}"
+   ```
+
+   This writes `yard_map.posegraph` + `yard_map.data`. Commit those too.
+
+## Configuring localization / Nav2 with a saved map
+
+`rock4d_nav.launch.py` (and `ros-nav.service`) require a saved map and refuse
+to start localization without one. Point them at the serialized map basename
+(no extension) via either:
+
+- `CAT_FOLLOW_MAP_FILE` in `/etc/car-x/car-x.env`, or
+- the `map_file:=` launch argument.
+
+```bash
+ros2 launch cat_follow_bringup rock4d_nav.launch.py \
+  map_file:=$(ros2 pkg prefix cat_follow_bringup)/share/cat_follow_bringup/maps/yard_map
+```
+
+The launch validates that `<basename>.posegraph` and `<basename>.data` exist
+and aborts with a clear error otherwise. First-time mapping
+(`mapping.launch.py`) is map-free and ignores this setting.
+
 ## Origin alignment with the overhead *yard* frame
 
 The overhead camera yard frame (Interface Spec §14) uses **+X right, +Y

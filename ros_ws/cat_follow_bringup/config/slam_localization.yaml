@@ -12,8 +12,11 @@ slam_toolbox:
     base_frame: base_link
     scan_topic: /scan
 
-    # Set to the saved map basename, e.g.
-    #   /home/picarx/ros2_ws/install/cat_follow_bringup/share/cat_follow_bringup/maps/yard_map
+    # Saved map basename (no extension). This placeholder is normally overridden
+    # at launch by rock4d_nav.launch.py from CAT_FOLLOW_MAP_FILE / the map_file
+    # argument, which also validates that <basename>.posegraph / .data exist.
+    # Setting it directly here is only for manual runs, e.g.
+    #   /opt/car-x/ros_ws/install/cat_follow_bringup/share/cat_follow_bringup/maps/yard_map
     map_file_name: ""
     map_start_at_dock: true
 

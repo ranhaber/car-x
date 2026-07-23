@@ -123,14 +123,23 @@ behavior_server:
     local_frame: odom
     global_frame: map
     robot_base_frame: base_link
-    behavior_plugins: ["backup", "wait"]
-    backup:
-      plugin: "nav2_behaviors::BackUp"
+    # Reverse (BackUp) recovery is intentionally omitted: the robot senses only
+    # forward (front ultrasonic + the cat_follow front-sector lidar veto), so
+    # driving backward during recovery is unsafe (no rear obstacle protection in
+    # the cat_follow veto path). Only the in-place-safe Wait recovery is enabled.
+    # Re-enable "backup" only after rear sensing / a rear veto exists.
+    behavior_plugins: ["wait"]
     wait:
       plugin: "nav2_behaviors::Wait"
 
+# Nav2 command chain: controller_server -> /cmd_vel -> velocity_smoother ->
+# /cmd_vel_smoothed. cat_follow's ros_bridge consumes the SMOOTHED output
+# (CAT_FOLLOW_CMD_VEL_TOPIC, default "cmd_vel_smoothed") so it respects the
+# accel/decel limits below rather than the raw controller command.
 velocity_smoother:
   ros__parameters:
     smoothing_frequency: 5.0
+    # Forward-only: min linear x is 0.0 (no reverse) to match the front-only
+    # sensing and the disabled BackUp recovery above.
     max_velocity: [0.30, 0.0, 1.0]
-    min_velocity: [-0.30, 0.0, -1.0]
+    min_velocity: [0.0, 0.0, -1.0]

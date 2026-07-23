@@ -1,0 +1,17 @@
+# RF2O local odometry from consecutive RPLidar C1 scans.
+#
+# This node is the sole owner of /odom and odom -> base_link when lidar
+# odometry is selected. Do not run cat_follow's bicycle OdomPublisher at the
+# same time.
+rf2o_laser_odometry:
+  ros__parameters:
+    laser_scan_topic: /scan
+    odom_topic: /odom
+    publish_tf: true
+    base_frame_id: base_link
+    odom_frame_id: odom
+    init_pose_from_topic: ""
+
+    # Match the C1 Standard-mode scan frequency. Running faster only causes
+    # RF2O to repeatedly report that it is waiting for a new scan.
+    freq: 10.0
