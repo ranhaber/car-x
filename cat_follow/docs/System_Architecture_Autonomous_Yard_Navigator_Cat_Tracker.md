@@ -36,9 +36,10 @@ This document defines the implementation architecture for the autonomous chase s
 - **Onboard vision thread**
   - Detects cat in local camera FOV.
   - Outputs target centroid and detection confidence.
-- **Range/obstacle thread**
-  - Polls the Lidar C1 and ultrasonic sensors.
-  - Produces obstacle veto and range-to-target data.
+- **Range/obstacle threads**
+  - **Ultrasonic (production):** `CatFollow-UltrasonicIRQ` edge worker caches distance; `CatFollow-RangeAdapter` publishes `SharedState.range` at ~20 Hz.
+  - **Lidar C1 (when `--ros-nav`):** `ros_bridge` publishes lidar `RangeState` from `/scan`.
+  - Produce obstacle veto and range-to-target data.
 - **SLAM/navigation thread**
   - Computes local obstacle-aware steering path.
   - Accepts global goal vector or local camera target cue.
@@ -68,7 +69,8 @@ This document defines the implementation architecture for the autonomous chase s
   - `last_seen_ms`
 
 ### 4.4 `RangeSafety`
-- Wraps Lidar C1 and ultrasonic sampling and filtering. _(TMF8829 dToF is on hold; not used in the current build.)_
+- Wraps Lidar C1 and ultrasonic inputs and filtering. _(TMF8829 dToF is on hold.)_
+- **Implemented today:** ultrasonic via `edge_ultrasonic.py` → `range_sensor` → `RangeAdapter`; lidar via `ros_bridge`.
 - Provides:
   - `target_distance_cm` (when target measurable)
   - `obstacle_veto: bool`

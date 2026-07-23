@@ -4,6 +4,8 @@ This document defines the **high-level design**, **state machine**, and **baby s
 
 **Clarifications (camera straight, car centers cat, calibration, modular file plan):** see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md**.
 
+**Distance source:** Legacy `main_loop.py` may use bbox-area calibration for approach distance. The contract runtime (`runtime.app`) uses ultrasonic via `range_sensor` / `RangeAdapter` (ROCK 4D: `edge_ultrasonic.py`). See **DESIGN_ULTRASONIC_DISTANCE.md**.
+
 ---
 
 ## 1. High-Level Design

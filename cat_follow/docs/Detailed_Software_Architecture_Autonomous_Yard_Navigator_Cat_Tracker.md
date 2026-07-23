@@ -14,6 +14,13 @@ The architecture keeps existing useful patterns from `cat_follow` and `cat_ball_
 - `DecisionEngine` runs in a dedicated control thread.
 - Target FSM states replace the current prototype state names.
 - Range sensing supports ultrasonic and Lidar C1 backends. Both are used in the current build: ultrasonic for near-field obstacle detection and Lidar C1 for final approach ranging. The TMF8829 dToF backend is on hold and not used in the current build.
+- No IMU is installed in the current hardware. Runtime, localization,
+  navigation, and safety logic must operate without inertial input; IMU fusion
+  is a future optional capability only after hardware installation and
+  validation.
+- Local odometry will use C1 scan matching as the intended primary source and
+  commanded-motion bicycle odometry as an explicit fallback. Exactly one node
+  may publish `/odom` and the dynamic `odom -> base_link` transform at a time.
 - `CommsManager` is the production overhead ingress path.
 - Existing web/API command injection remains useful for dev/test, not production chase control.
 - All coordinates and distances use centimeters (`cm`) for coherence with local range sensing and final stop behavior.
@@ -40,10 +47,10 @@ cat_follow/
     interface.py
     local_planner.py
   perception/
-    vision_tracker.py
-    range_safety.py
+    vision_adapter.py
+    range_adapter.py
+    edge_ultrasonic.py       # libgpiod v1 HC-SR04 edge worker (production ROCK 4D)
     range_backends/
-      ultrasonic.py
       lidar_c1.py
       tmf8829.py  # on hold
   motion/
@@ -83,7 +90,9 @@ The web UI must not be required for detection, tracking, or control.
 | Control | `CatFollow-Control` | `DecisionEngine`, FSM validation, arbitration, motor command | 50 Hz target, 20 Hz degraded minimum |
 | Overhead | `CatFollow-Comms` | receive overhead packets and commands | ~10 Hz input |
 | Vision | `CatFollow-Vision` | local cat detection/tracking | camera-dependent |
-| Range | `CatFollow-Range` | Lidar C1 / ultrasonic polling and obstacle state | 20-30 Hz target |
+| Range (hardware) | `CatFollow-UltrasonicIRQ` | libgpiod HC-SR04 edge events; cached distance | ~17 Hz ping (60 ms min) |
+| Range (contract) | `CatFollow-RangeAdapter` | Polls `range_sensor` → `SharedState.range` | ~20 Hz |
+| Lidar (ROS) | via `ros_bridge` | `/scan` → lidar `RangeState` | ~10 Hz |
 | Navigation | `CatFollow-Nav` | local obstacle-aware constraints | TBD |
 | Telemetry | `CatFollow-Log` | bounded async event logging | event-driven |
 | Web UI | `CatFollow-Flask` | monitoring/config/dev injection only | request-driven |
@@ -230,8 +239,11 @@ Implementation should preserve the existing `camera`, `tracker`, and `detector` 
 Hardware abstraction for local range and obstacle safety.
 
 Supported backends:
-- `UltrasonicRangeBackend`: PiCar-X ultrasonic range path for near-field obstacle detection
-- `LidarC1RangeBackend`: Slamtec RPLIDAR C1 backend used for final approach ranging
+- **Production (ROCK 4D):** `EdgeTimedUltrasonic` in `perception/edge_ultrasonic.py`
+  → `range_sensor.set_reader()` → `RangeAdapter` → `SharedState.range`
+- **Legacy prototype:** `range_sensor.set_car(Picarx)` → polling `robot_hat.Ultrasonic`
+  (still used by `main_loop.py`; not migrated)
+- `LidarC1RangeBackend`: Slamtec RPLIDAR C1 via `ros_bridge` → lidar `RangeState`
 - `TMF8829RangeBackend`: on hold; retained as a placeholder but not used in the current build
 
 Responsibilities:
@@ -420,9 +432,12 @@ Reuse ideas from:
 ### 11.2 Optional CPU Affinity
 CPU affinity may be enabled by configuration on Linux.
 
-Recommended target:
-- control/comms/range threads: one reserved core when enabled
-- AI/vision work: remaining cores
+Recommended target (ROCK 4D production, when enabled):
+- camera threads: cores `0,1`
+- detector/tracker: core `2`
+- ultrasonic edge worker: core `3` (best-effort `SCHED_FIFO` priority 70)
+- control/comms/range adapter: unpinned or shared with remaining A53 capacity
+- ROS/Nav2: A72 cores `4–7`
 
 Affinity must be optional and must safely no-op on Windows or unsupported platforms.
 
@@ -473,7 +488,7 @@ Systemd journal should still receive operational logs for service debugging.
 ## 13. Current Code Migration Notes
 
 ### 13.1 Main Loop
-Current `main_loop.py` runs the control behavior in the main thread at approximately 30 Hz. Target architecture moves this into `CatFollow-Control`.
+Current `main_loop.py` runs the control behavior in the main thread at approximately 30 Hz. Target architecture moves this into `CatFollow-Control`. The edge-timed ultrasonic redesign applies to **`runtime.app --with-prototype-perception`** only; `main_loop.py` still uses `range_sensor.set_car(Picarx)` and the legacy polling path.
 
 Migration:
 - extract control branches into `DecisionEngine`
@@ -490,12 +505,21 @@ Migration:
 - add explicit `BRAKE`, `RETURN_HOME`, and `FAILSAFE`
 
 ### 13.3 Range Sensor
-Current `range_sensor.py` should become the ultrasonic backend under `RangeSafety`.
+`range_sensor.py` is the public cache/throttle facade. On ROCK 4D production
+the hardware path is `EdgeTimedUltrasonic` injected via `set_reader()`; the
+contract publisher remains `RangeAdapter`. Full `RangeSafety` normalization
+(lidar + ultrasonic under one backend interface) is still the target.
 
-Migration:
-- preserve throttled/cached read behavior
-- add Lidar C1 backend (TMF8829 backend is on hold)
-- normalize all outputs to the same range/obstacle model
+Current production wiring (contract runtime):
+- `Picarx(enable_ultrasonic=False)` avoids GPIO double-ownership
+- `EdgeTimedUltrasonic.from_env()` started before `RangeAdapter`
+- `range_sensor.set_reader(latest_distance_cm)`; 60 ms throttle preserved
+- `RangeAdapter` polls at 20 Hz; `DecisionEngine` freshness TTL remains 500 ms
+
+Migration still pending:
+- Wrap as explicit `UltrasonicRangeBackend` under `RangeSafety`
+- Migrate legacy `main_loop.py` off `set_car()` polling path
+- Add Lidar C1 backend (TMF8829 backend is on hold)
 
 ### 13.4 Web Control Routes
 Current web routes that inject target/stop commands should remain as dev/test controls.
@@ -529,4 +553,4 @@ Migration:
 9. Wrap current range sensor as `UltrasonicRangeBackend`.
 10. Add `RangeSafety` interface and Lidar C1 backend (TMF8829 backend on hold).
 11. Add navigation interface placeholder.
-12. Add optional CPU affinity config after runtime behavior is stable.
+12. Add optional CPU affinity config after runtime behavior is stable. _(Partially done: camera/detector/ultrasonic affinity on ROCK 4D.)_

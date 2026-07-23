@@ -30,7 +30,7 @@ This repository combines three SunFounder libraries for the **PiCar-X** Raspberr
   - **Servos:** Camera pan/tilt (P0, P1), direction/steering (P2). Calibration and angle limits (e.g. direction ±30°, pan ±90°, tilt -35°..65°).
   - **Motors:** Two wheels via pins D4, D5 (direction), P13, P12 (PWM). `set_motor_speed(motor, speed)`, `forward(speed)`, `backward(speed)`, `stop()`, with steering compensation.
   - **Grayscale:** 3-channel ADC (A0, A1, A2) for line reference and cliff reference; `get_grayscale_data()`, `get_line_status()`, `get_cliff_status()`, `set_grayscale_reference()`, `set_cliff_reference()`.
-  - **Ultrasonic:** Trig D2, Echo D3; `get_distance()`.
+  - **Ultrasonic:** Trig D2, Echo D3; `get_distance()` when `enable_ultrasonic=True` (default). Contract runtime sets `enable_ultrasonic=False` and uses `cat_follow/perception/edge_ultrasonic.py` instead.
   - **Lifecycle:** `reset()`, `close()`.
 
 - **preset_actions.py** — Preset motion/behavior sequences.

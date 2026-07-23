@@ -88,6 +88,9 @@ cat_follow/
   ``read_distance`` callable (default usage:
   ``cat_follow.range_sensor.get_distance_cm``) and publishes
   ``RangeState`` into the contract ``SharedState.range``.
+- [x] On ROCK 4D production (`--with-prototype-perception`), distance is
+  sourced from ``EdgeTimedUltrasonic`` via ``range_sensor.set_reader()``;
+  ``Picarx(enable_ultrasonic=False)`` avoids D2/D3 GPIO double-ownership.
 - [x] Linear severity ramp from ``obstacle_detected_cm`` to
   ``obstacle_critical_cm`` (default 50 cm -> 10 cm).
 - [x] Emits ``range_update`` telemetry per update; ``thread_health`` on
@@ -112,10 +115,10 @@ cat_follow/
   ``--udp-target-host`` / ``--udp-target-port`` flags enable UDP
   ingress/egress alongside the in-process API.
 - [x] ``--with-prototype-perception`` flag spins up the prototype
-  camera/tracker/detector threads and wires their bbox + the range
-  sensor through ``VisionAdapter`` / ``RangeAdapter``.  A single shared
-  ``Picarx`` instance is reused between the motor backend and the range
-  sensor wiring so both reference the same hardware object.
+  camera/tracker/detector threads and wires their bbox + range through
+  ``VisionAdapter`` / ``RangeAdapter``. A single shared ``Picarx`` instance
+  is reused for the motor backend; ultrasonic GPIO is **not** owned by
+  Picarx in this mode (`enable_ultrasonic=False` + ``EdgeTimedUltrasonic``).
 - [x] App lifecycle starts and stops prototype perception threads as
   part of ``App.start()`` / ``App.stop()``; integration test verifies
   the lifecycle (`tests/test_runtime_app.py::test_app_with_prototype_perception_threads_lifecycle`).
@@ -148,8 +151,8 @@ Milestone 3 is complete when:
   ``--udp-target-host``, ``--udp-target-port``.  Single-command Pi
   bring-up is now possible.
 
-**Current repository baseline:** 334 tests passing across all milestones,
-including safety-review regression coverage.
+**Current repository baseline:** 376 tests passing across all milestones,
+including edge-ultrasonic, range_sensor, and safety-review regression coverage.
 
 **Remaining open item:** Manual smoke test on the actual PiCar-X
 hardware.  All software pieces are in place and verified end-to-end on

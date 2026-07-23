@@ -682,7 +682,6 @@ Home validity:
     "authority": "Navigation",
     "heading": 0.0,
     "heading_valid": false,
-    "steering_constraint": 0.0,
     "speed_limit": 0.0,
     "path_correction": 0.0,
     "no_progress": false,
@@ -1493,7 +1492,7 @@ Rules:
 | `OVERHEAD_STALE_FAILSAFE_MS` | `700` | Enter `FAILSAFE` |
 | `CAMERA_LOSS_FALLBACK_MS` | `350` | `TRACK_B -> CHASE_A` |
 | `VISION_STALE_MS` | `350` | Local visual observation expires |
-| `RANGE_STALE_MS` | `500` | Ultrasonic/range observation expires |
+| `RANGE_STALE_MS` | `500` | `RangeAdapter` / `DecisionEngine` authority TTL for `SharedState.range`. Separate from hardware cache staleness (`CAT_FOLLOW_ULTRASONIC_STALE_AFTER_S=0.250` in the edge worker). Production ROCK 4D path: `edge_ultrasonic.py` → `range_sensor.set_reader()` → `RangeAdapter`. |
 | `LIDAR_STALE_MS` | `500` | Lidar observation expires |
 | `NAVIGATION_STALE_MS` | `500` | Navigation constraints expire |
 | `CMD_VEL_STALE_MS` | `500` | Planner drive terms are cleared |

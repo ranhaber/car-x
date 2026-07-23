@@ -27,8 +27,8 @@ From the codebase (`robot-hat/robot_hat/pin.py`, `device.py`) and [Robot HAT Har
 | **I2C** SCL          | GPIO3             | I2C (MCU + port)      |
 | D0                   | GPIO17            | Available              |
 | D1                   | GPIO4             | UART TX                |
-| D2                   | GPIO27            | **Ultrasonic (trig)**  |
-| D3                   | GPIO22            | **Ultrasonic (echo)**  |
+| D2                   | GPIO27            | **Ultrasonic (trig)** — production ROCK 4D uses `gpiochip2:16` via `edge_ultrasonic.py` |
+| D3                   | GPIO22            | **Ultrasonic (echo)** — production ROCK 4D uses `gpiochip1:21` via libgpiod edge events |
 | D4                   | GPIO23            | **Motor 1 direction**  |
 | D5                   | GPIO24            | **Motor 2 direction**  |
 | P0, P1, P2           | via MCU I2C       | **Servos (cam pan, tilt, steering)** |

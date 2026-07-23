@@ -2,6 +2,8 @@
 
 This document refines the cat-follow design with your clarifications, adds **calibration** (speed–time–distance, max U-turn radius), and defines a **modular file plan**.
 
+**Range sensing:** Production contract runtime publishes ultrasonic distance through `range_sensor` → `RangeAdapter` (ROCK 4D: libgpiod edge worker). Legacy prototype paths may still reference bbox-area distance calibration.
+
 ---
 
 ## 1. Clarifications (Camera Straight, Car Centers Cat)

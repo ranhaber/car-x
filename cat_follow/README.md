@@ -10,10 +10,14 @@ Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and dr
 - **commands.py** — Stub: `set_cat_location(x,y)`, `set_stop_command()`; `poll_commands(on_cat_location, on_stop)`.
 - **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits (incl. target approach distance). Stored in `cat_follow/calibration/*.json`; loaded once at startup.
 - **motion/** — `driver`, `center_cat_control()`, `limits`, `goto_xy` (runtime goto), `search`. Runtime goto uses **motion/goto_xy.py**; **calibration/goto_xy.py** is for calibration runs only.
-- **vision/** — RKNN NPU detection backend (`backends.py` + `rknn_backend.py`, SSD parsing in `ssd_postprocess.py`). RKNN is the only backend; there is no CPU/TFLite fallback.
-- **threads/** — Camera, tracker (OpenCV single-object tracker, generation-matched re-init via IoU), detector (RKNN NPU loop; writes to SharedState). Camera writes into a pre-allocated frame ring; the detector snapshots its own source frame so detection remains independent of the web UI and tracker initialization uses the exact inferred frame.
+- **vision/** — YOLOv8n COCO RKNN backend (`rknn_backend.py`) with 9-tensor model-zoo DFL/NMS decoding (`yolo_postprocess.py`). P1 publishes the best cat into the existing single-bbox contract; RKNN is the only backend.
+- **threads/** — Camera, role-aware `PredictiveTracker` (constant velocity, two-stage high/low-confidence association), and RKNN detector. The tracker keeps sticky `PRIMARY_CAT`/`SECONDARY_CAT` identities but publishes only the primary through the existing chase bbox. Camera capture and detection remain independent of the web UI.
 - **odometry.py** — Bicycle-model dead reckoning (position, heading). Used via **location/** facade.
-- **main_loop.py** — Tick loop: commands → state machine → motion.
+- **range_sensor.py** — Throttled/cached distance facade; `set_reader()` for edge worker or `set_car()` for legacy polling.
+- **perception/edge_ultrasonic.py** — libgpiod v1 HC-SR04 edge worker (`CatFollow-UltrasonicIRQ`); production ROCK 4D path.
+- **perception/range_adapter.py** — Polls `range_sensor.get_distance_cm()` → `SharedState.range` (~20 Hz).
+- **runtime/app.py** — Contract runtime (`--picarx`, `--with-prototype-perception`, optional `--ros-nav`, `--web-ui`); wires edge ultrasonic + adapters.
+- **main_loop.py** — Legacy tick loop (polling ultrasonic via `set_car`); production uses `runtime.app`.
 - **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`. Starts from `main_loop` or `runtime.app --web-ui`.
 
 ## Run (stub mode, no hardware)
@@ -77,15 +81,25 @@ CAT_FOLLOW_WEB_CONTROL_TOKEN=<strong-random-secret>
 CAT_FOLLOW_COMMS_TOKEN=<strong-random-secret>
 ```
 
-`CAT_FOLLOW_WEB_CONTROL_TOKEN` protects motion-causing control and calibration
-routes. Supply it as `X-Control-Token` (preferred), a `token` query parameter,
-or a JSON/form `token` field. Stop and emergency-stop routes intentionally
+`CAT_FOLLOW_WEB_CONTROL_TOKEN` protects motion-causing control, calibration,
+and stream-resolution routes. Supply it as the `X-Control-Token` header
+(preferred) or a JSON/form `token` field. Query-string tokens are not accepted
+(they leak into access logs). Stop and emergency-stop routes intentionally
 remain open so any operator can halt the vehicle.
 
 `CAT_FOLLOW_COMMS_TOKEN` protects UDP command datagrams. Senders must include a
 matching top-level JSON `"token"` field; missing or invalid tokens are dropped.
-Tracking datagrams are not gated. If either secret is unset, the corresponding
-channel remains open for development compatibility and logs a startup warning.
+Tracking datagrams are not gated.
+
+Production requires both tokens to be non-empty. For explicit unauthenticated
+bench/dev operation only, set:
+
+```bash
+CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL=1
+```
+
+Without that override, missing tokens cause control endpoints to fail closed.
+Do not commit real token values to git; keep them in the deployment env file.
 
 The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
 
@@ -105,6 +119,27 @@ These values live in `scripts/car-x.env`. The service applies the sensor
 controls once before startup and launches the headless camera, tracker, and
 detector threads with `--with-prototype-perception`. The web UI remains
 optional.
+
+### Ultrasonic (event-driven HC-SR04)
+
+Production on ROCK 4D uses `EdgeTimedUltrasonic` (`CatFollow-UltrasonicIRQ`)
+instead of `robot_hat.Ultrasonic` GPIO polling. TRIG/ECHO are owned exclusively
+by the edge worker; `Picarx(enable_ultrasonic=False)` keeps motors/servos on
+the shared Picarx instance without claiming D2/D3.
+
+Key env vars in `/etc/car-x/car-x.env`:
+
+```text
+CAT_FOLLOW_ULTRASONIC_CPU_CORE=3
+CAT_FOLLOW_ULTRASONIC_RT_PRIORITY=70
+CAT_FOLLOW_ULTRASONIC_REQUIRE_REALTIME=0
+CAT_FOLLOW_PERCEPTION_DETECTOR_CORES=2
+```
+
+`REQUIRE_REALTIME=0` is the current stable production setting: core-3 affinity
+works even when `SCHED_FIFO` is denied. Install `scripts/99-cat-follow-rtprio.conf`
+to `/etc/security/limits.d/` if pursuing full RT scheduling. See
+`docs/Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md` §4.7.
 
 The systemd unit is installed but intentionally disabled until camera and
 floor-drive testing are complete. Start and stop it explicitly:
@@ -162,17 +197,30 @@ python -c "from cat_follow.calibration import Calibration; c=Calibration(); asse
 ```
 
 Or install pytest and run: `python -m pytest tests/ -v`. The current host
-baseline is **334 passing tests**.
+baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
+`test_range_sensor.py`).
 
 ## Next steps
 
 1. **Validate the C1 lidar** — Connect it over USB, install/verify the `/dev/rplidar` udev rule, launch `sllidar_ros2` at 460800 baud, and confirm `/scan`.
 2. **Complete ROCK 4D validation** — Run floor-drive and thermal tests and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
-3. **RKNN model** — Convert an SSD MobileNet model to `.rknn` on a workstation with `rknn-toolkit2` (`python scripts/convert_to_rknn.py --src model.tflite --dst models/ssd_mobilenet_v2.rknn --dataset dataset.txt`) and point `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at it. On the ROCK 4D a missing model is a hard error (no CPU fallback).
+3. **RKNN model** — YOLOv8n COCO 320×320 for rk3576 is provisioned as
+   `models/yolov8n_coco_320_rk3576.rknn` (built with
+   `scripts/convert_yolo_to_rknn.py --platform rk3576 --no-quant`). Point
+   `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at it. On the ROCK 4D a missing model
+   is a hard error (no CPU fallback). Decoding uses `vision/yolo_postprocess.py`
+   (9-tensor model-zoo layout); chase-start warmup preloads the NPU when
+   `CAT_FOLLOW_PERCEPTION_WARMUP_ON_START=0`.
 
 ## 📝 Version History
 
-- **0.7.1** — Ops/monitoring hardening (medium-priority review items).
+- **0.7.1** — Ops/monitoring hardening (medium-priority review items) plus
+  ROCK 4D event-driven HC-SR04 acquisition. Legacy `robot_hat.Ultrasonic` GPIO
+  polling replaced in the contract runtime by `EdgeTimedUltrasonic`
+  (`CatFollow-UltrasonicIRQ`, libgpiod both-edge on `gpiochip2:16` /
+  `gpiochip1:21`, core 3, best-effort `SCHED_FIFO`). `range_sensor.set_reader()`
+  injects cached nonblocking reads; `Picarx(enable_ultrasonic=False)` avoids
+  D2/D3 double-ownership. Legacy `main_loop.py` still uses the polling path.
   Telemetry no longer loses already-dequeued events (CRITICAL failsafe
   forensics in particular) when the sink write fails: failed batches are
   re-buffered and retried on the next drain, bounded and dropping the
@@ -213,15 +261,12 @@ baseline is **334 passing tests**.
   returning empty detections forever, and surface via `perception.error` on
   `/api/status`. Output-contract validation now checks box/score/class shape
   alignment and score range, not just the boxes tensor.
-- **0.6.0** — RKNN NPU is now the only detection backend. Removed the CPU
-  TFLite backend, the `create_backend` fallback, the legacy
-  `vision.get_cat_bbox()`/`tflite_common` module (SSD parsing moved to
-  `vision/ssd_postprocess.py`), and the TFLite model downloader. The detector
-  hard-fails when the RKNN runtime is present but the model is missing, and
-  only runs the deterministic stub on machines without the RKNN runtime
-  (dev/CI). Added `CAT_FOLLOW_PERCEPTION_RKNN_INPUT` and
-  `scripts/convert_to_rknn.py`; `scripts/benchmark_detector.py` now benchmarks
-  the RKNN backend.
+- **0.6.0** — RKNN NPU became the only production detection backend. Removed
+  the legacy software backend and model downloader. The detector hard-fails
+  when the RKNN runtime is present but the model is missing, and only runs the
+  deterministic stub on machines without the RKNN runtime (dev/CI). Added
+  `CAT_FOLLOW_PERCEPTION_RKNN_INPUT`; `scripts/benchmark_detector.py` now
+  benchmarks the RKNN backend.
 - **0.5.2** — Live ROS occupancy map in the web UI. `ros_bridge` subscribes to
   `/map` and TF `map→base_link` (odom fallback), publishes a downsampled
   snapshot with scan-ray overlay; Control page polls `/api/map` and draws the
@@ -233,9 +278,8 @@ baseline is **334 passing tests**.
   routing from the Control page, and a read-only config panel. Removed orphaned
   legacy `web_ui/main.html` / `main.js` / `style.css`.
 - **0.5.0** — Perception resource optimization + ROS 2 navigation integration.
-  Added motion-gated detection with a perception phase FSM, a pluggable
-  detection backend (CPU TFLite / RK3576 NPU RKNN) with lazy load, boot warmup
-  and idle unload (`malloc_trim` reclaim), adaptive OpenCV threads and CPU
+  Added motion-gated detection with a perception phase FSM, lazy model load,
+  boot warmup and idle unload (`malloc_trim` reclaim), adaptive image-processing threads and CPU
   affinity, an optional hardware-scaled RKISP lores motion stream, decoupled
   MJPEG (encode only with viewers, `simplejpeg` when available), and an
   optional Rockchip MPP H.264 WebSocket stream. Added the ROS 2 Jazzy track:

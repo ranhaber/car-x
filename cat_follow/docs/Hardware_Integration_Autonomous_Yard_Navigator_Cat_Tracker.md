@@ -1,9 +1,9 @@
 # Hardware Integration
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
 **Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis  
-**Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic  
-**Version:** 1.0  
-**Status:** ROCK 4D and Radxa Camera 4K bring-up validated; lidar, grayscale, and thermal tests pending
+**Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic; no IMU installed  
+**Version:** 1.1  
+**Status:** ROCK 4D and Radxa Camera 4K bring-up validated; event-driven ultrasonic on ROCK 4D; lidar, grayscale, and thermal tests pending
 
 ## 1. Purpose
 This document defines how PiCar-X hardware connects to the Radxa ROCK 4D for
@@ -24,6 +24,7 @@ Architecture contracts remain in the PRD, HLD, and Interface Specification.
 | **PiCar-X chassis** | 2× rear hub motors, 3× servos, grayscale module, ultrasonic |
 | **RPLidar C1** | 360° 2D lidar for mapping and obstacle-aware navigation |
 | **Overhead camera system** | Global cat/car pose via UDP (external to this board) |
+| **IMU** | Not installed; current software must not depend on inertial measurements |
 
 ### 2.1 Critical compatibility note
 The Robot HAT 40-pin header is **physically** the same size as Raspberry Pi,
@@ -47,8 +48,8 @@ From `picar-x/picarx/picarx.py` and SunFounder Robot HAT V4 docs.
 | Right motor direction | D5 | Direct GPIO | GPIO24 |
 | Left motor speed | P13 | MCU PWM ch 13 via I2C | — |
 | Right motor speed | P12 | MCU PWM ch 12 via I2C | — |
-| Ultrasonic TRIG | D2 | Direct GPIO | GPIO27 |
-| Ultrasonic ECHO | D3 | Direct GPIO input | GPIO22 |
+| Ultrasonic TRIG | D2 | Direct GPIO | GPIO27 | `gpiochip2` line 16 |
+| Ultrasonic ECHO | D3 | Direct GPIO input | GPIO22 | `gpiochip1` line 21 |
 | Grayscale ×3 | A0–A2 | MCU ADC ch 0–2 via I2C | — |
 | MCU I2C bus | — | Pi I2C1 | GPIO2 (SDA), GPIO3 (SCL) |
 | MCU reset | MCURST | Direct GPIO | GPIO5 |
@@ -68,8 +69,8 @@ Physical pin positions match the Pi header. **Signal names differ.**
 | 2, 4 | 5V | 5V | Power in to ROCK 4D | See §5 — marginal alone |
 | 3 | GPIO2 / SDA | GPIO1_C7 | I2C8_SDA_M1 → MCU | Enable I2C overlay |
 | 5 | GPIO3 / SCL | GPIO1_C6 | I2C8_SCL_M1 → MCU | Enable I2C overlay |
-| 13 | GPIO27 | GPIO2_C0 | D2 ultrasonic TRIG | libgpiod output |
-| 15 | GPIO22 | GPIO1_C5 | D3 ultrasonic ECHO | libgpiod input |
+| 13 | GPIO27 | GPIO2_C0 | D2 ultrasonic TRIG | libgpiod output (`gpiochip2:16`) |
+| 15 | GPIO22 | GPIO1_C5 | D3 ultrasonic ECHO | libgpiod input, both-edge events (`gpiochip1:21`) |
 | 16 | GPIO23 | GPIO2_B6 | D4 left motor DIR | libgpiod output |
 | 18 | GPIO24 | GPIO2_B7 | D5 right motor DIR | libgpiod output |
 | 29 | GPIO5 | GPIO3_A2 | MCURST | libgpiod output |
@@ -149,7 +150,7 @@ Use a **powered USB hub** for the C1 only if the main 5 V rail has headroom.
 |--------|-------|----------------------|
 | RPLidar C1 | Centered on chassis, scan plane ~10–15 cm above ground | USB `/dev/ttyUSB0` (typical) |
 | Camera | PiCar-X pan/tilt | MIPI CSI (Radxa cable; not Pi CSI ribbon) |
-| Ultrasonic HC-SR04 | Front bumper | D2/D3 via Robot HAT |
+| Ultrasonic HC-SR04 | Front bumper | D2/D3 via Robot HAT; production uses dedicated libgpiod worker (see §6.3) |
 | Grayscale (optional) | Underside | A0–A2 via MCU |
 
 ### 6.1 Lidar
@@ -201,6 +202,24 @@ The original PiCar-X OV5647 module is not used on the ROCK 4D. Its Pi ribbon
 and control-voltage requirements are not compatible with this validated
 31-pin IMX415 integration.
 
+### 6.3 HC-SR04 acquisition (ROCK 4D production)
+
+The HC-SR04 has no sensor-side interrupt mode; distance is derived from the
+ECHO pulse width after a TRIG pulse. On ROCK 4D the contract runtime uses
+`cat_follow/perception/edge_ultrasonic.py` instead of `robot_hat.Ultrasonic`
+busy-wait polling:
+
+| Signal | HAT | libgpiod |
+|--------|-----|----------|
+| TRIG (D2) | phys pin 13 | `gpiochip2` line 16, output |
+| ECHO (D3) | phys pin 15 | `gpiochip1` line 21, both-edge events |
+
+GPIO exclusivity: `Picarx(enable_ultrasonic=False)` so motors/servos use I2C/PWM
+while the edge worker owns D2/D3 with consumer `"cat-follow-ultrasonic"`.
+The worker thread `CatFollow-UltrasonicIRQ` pins to A53 core 3 and attempts
+`SCHED_FIFO` priority 70 (production currently runs affinity-only when RT is
+denied). See `Software_Integration_*.md` §4.7 for the full data path.
+
 ## 7. Integration options
 
 ### Option A — Dual board (lowest risk)
@@ -228,7 +247,8 @@ Best long-term if power and GPIO port succeed.
 
 ### Phase H2 — GPIO
 - [x] Configure D2, D3, D4, D5, MCURST as libgpiod lines.
-- [x] Ultrasonic returns a plausible distance.
+- [x] Ultrasonic returns a plausible distance (legacy polling path during bring-up).
+- [x] Production contract runtime uses libgpiod edge events on D2/D3 (`edge_ultrasonic.py`).
 - [x] Motor direction pins toggle (wheels off ground).
 
 ### Phase H3 — PWM via MCU
@@ -266,5 +286,5 @@ The values are stored in `/opt/picar-x/picar-x.conf`.
 - Radxa ROCK 4D GPIO: https://docs.radxa.com/en/rock4/rock4d/hardware-use/pin-gpio
 - Radxa ROCK 4D power: https://docs.radxa.com/en/rock4/rock4d/hardware-use/usb-type-c
 - Radxa product brief: https://dl.radxa.com/rock4/4d/docs/radxa_rock4d_product_brief.pdf
-- Repo: `picar-x/picarx/picarx.py`, `robot-hat/robot_hat/pin.py`, `robot-hat/robot_hat/pwm.py`
+- Repo: `picar-x/picarx/picarx.py`, `cat_follow/perception/edge_ultrasonic.py`, `robot-hat/robot_hat/pin.py`, `robot-hat/robot_hat/pwm.py`
 - Slamtec C1 SDK: `rplidar_sdk-master/` (repo root)

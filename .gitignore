@@ -20,3 +20,12 @@ env/
 build/
 bk/
 *secret*
+
+# Local dev credentials (contains SSH/sudo password)
+AGENTS.md
+
+# Remote dev/diagnostic helper scripts (hardcode host + password)
+cat_follow/scripts/_remote-*.sh
+
+# Runtime telemetry / captured artifacts
+logs/

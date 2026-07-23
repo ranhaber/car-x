@@ -15,12 +15,13 @@ The module is a well-structured cat-follow feature for PiCar-X with clear separa
 
 - **State machine:** `StateMachine` uses a lock for `state`, `target_xy`, `last_bbox`, and `dispatch()`; safe for main loop (writer) and Flask (reader).
 - **Commands:** `poll_commands` uses a lock and runs callbacks outside the lock.
-- **Range sensor:** `_last_distance_cm` and `_last_read_time` are protected by a lock; `get_distance_cm()` and `get_last_distance_cm()` are thread-safe.
+- **Range sensor:** `_last_distance_cm` and `_last_read_time` are protected by a lock; `get_distance_cm()` and `get_last_distance_cm()` are thread-safe. Production contract runtime injects `EdgeTimedUltrasonic.latest_distance_cm` via `set_reader()`; legacy `main_loop.py` still uses `set_car(Picarx)` polling.
 - **Calibration:** All reads and writes (`get_*`, `set_all_calibration_data`, `get_all_calibration_data`, `reload`, `save`) are under a single lock.
 - **Web UI FPS:** Tracker FPS and stream FPS use locks for cross-thread access.
 - **Streaming:** MJPEG route uses `get_stream_resolution()` only (no nested lock); stream resolution and options are consistent.
 - **Memory:** Pre-allocated pool and `SharedState` with per-resource locks; no per-frame allocations in the hot path.
-- **Detector:** Single `run_detector_loop` (TFLite when model available, stub otherwise); model selection via `SharedState`.
+- **Detector:** Single RKNN `run_detector_loop`; the deterministic stub is explicitly enabled for development only.
+- **Tracker:** `PredictiveTracker` maintains sticky primary/secondary identities; only PRIMARY_CAT feeds behavior.
 
 ---
 

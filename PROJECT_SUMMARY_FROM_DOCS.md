@@ -130,7 +130,7 @@ Total ~1.8 MB + small structs; TFLite interpreter and input buffer created once.
 - **Cat target (x,y)** - From Web UI (meters), file, or MQTT; optional from camera later.
 - **Cat detector** - TFLite/COCO class 16 (cat); every K frames; returns bbox or None.
 - **Cat tracker** - OpenCV (e.g. KCF); every frame; 30 FPS; re-init from detector.
-- **Distance to cat** - From bbox size (calibration) or ultrasonic; "15 cm" threshold.
+- **Distance to cat** — From ultrasonic via `range_sensor` (production: edge worker + `RangeAdapter`; legacy: `Picarx.get_distance()` polling) or bbox calibration in `main_loop`.
 - **Motion** - go_to_xy, center_cat (steer + drive to center bbox, camera straight), search_arc, stop; uses calibration limits.
 - **Commands** - set_cat_location(x,y) in meters, stop; protected by lock; polled by main (sources: Web UI, file, MQTT, etc.).
 - **Web UI** - See section 4.6 for finalized design.

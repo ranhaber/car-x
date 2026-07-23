@@ -2,8 +2,8 @@
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
 **Compute target:** Radxa ROCK 4D (primary)  
 **Navigation:** ROS 2 Jazzy hybrid (Nav2 + slam_toolbox) + `cat_follow` runtime  
-**Version:** 1.1  
-**Status:** Software safety review complete; ROS 2 stack deployed; C1 hardware validation pending
+**Version:** 1.2  
+**Status:** Software safety review complete; ROS 2 stack deployed; C1 bring-up complete; event-driven ultrasonic on ROCK 4D; mapping/navigation validation pending
 
 ## 1. Purpose
 This document defines how software components integrate on the ROCK 4D:
@@ -74,8 +74,10 @@ sudo apt update
 sudo apt install -y python3-libgpiod python3-smbus2 i2c-tools
 sudo groupadd -f gpio
 sudo usermod -aG gpio "$USER"
-sudo install -m 0644 cat_follow/scripts/99-rock4d-gpio.rules \
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/99-rock4d-gpio.rules \
   /etc/udev/rules.d/99-rock4d-gpio.rules
+sudo install -m 0644 /opt/car-x/cat_follow/scripts/99-cat-follow-rtprio.conf \
+  /etc/security/limits.d/99-cat-follow-rtprio.conf
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=gpio
 
@@ -116,21 +118,25 @@ sudo systemctl disable ros-nav.service cat-follow-ros.service
 ```
 
 #### Provision the RKNN detection model (required)
-Detection is RKNN-only; the runtime has no CPU/TFLite fallback, so a fresh
+Detection is RKNN-only; the runtime has no software inference fallback, so a fresh
 deployment is not functional until a `.rknn` model is present. Build it once on
-an x86 workstation with `rknn-toolkit2`, copy it to the board, and point the env
-at it:
+an x86 workstation / WSL with `rknn-toolkit2`, copy it to the board, and point
+the env at it. Production uses **YOLOv8n COCO 320×320** (airockchip 9-tensor
+head) targeting **rk3576**. This project does not use a calibration image set;
+build with `--no-quant`.
 
 ```bash
-# On an x86 workstation (rknn-toolkit2 installed):
-python scripts/convert_to_rknn.py \
-  --src models/ssd_mobilenet_v2_320x320.tflite \
-  --dst models/ssd_mobilenet_v2.rknn \
-  --dataset dataset.txt
+# On x86 Linux / WSL (rknn-toolkit2 installed); ONNX must be the 9-tensor
+# model-zoo head (not a plain Ultralytics single-tensor export):
+python scripts/convert_yolo_to_rknn.py \
+  --onnx yolov8n_320.onnx \
+  --output models/yolov8n_coco_320_rk3576.rknn \
+  --platform rk3576 \
+  --no-quant
 
 # Copy to the board (path must match CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH,
 # resolved relative to /opt/car-x):
-scp models/ssd_mobilenet_v2.rknn picarx@<board>:/opt/car-x/models/
+scp models/yolov8n_coco_320_rk3576.rknn picarx@<board>:/opt/car-x/models/
 ```
 
 The board runs the lightweight `rknnlite` runtime (install it into the venv on
@@ -144,6 +150,9 @@ file-existence guard for a clearer message. Ensure
 `CAT_FOLLOW_PERCEPTION_RKNN_INPUT` matches the converted model's input geometry
 (320,320 for the documented model).
 
+Perception CPU affinity uses **A53 cores only** (`0–3`): camera `0,1`,
+detector `2`, ultrasonic edge worker `3`. Leave A72 `4–7` for ROS/Nav2/control.
+
 ### 3.5 Deployment progress (2026-07-20)
 - [x] ROS 2 Jazzy `ros-base` installed on ROCK 4D.
 - [x] `slam_toolbox` and Nav2 bringup installed.
@@ -151,12 +160,12 @@ file-existence guard for a clearer message. Ensure
 - [x] ROS environment, udev rule, WiFi tuning, and systemd units deployed.
 - [x] Launch-file argument loading and systemd unit syntax validated.
 - [x] `picarx` user confirmed in the `dialout` group.
-- [ ] Connect the C1 and verify that the installed udev rule creates `/dev/rplidar`.
-- [ ] Launch the C1 at 460800 baud and verify `/scan`.
+- [x] C1 connected; installed udev rule creates `/dev/rplidar` -> `ttyUSB0` (verified 2026-07-22).
+- [x] C1 launched at 460800 baud; health OK and `/scan` measured at a steady ~10 Hz (verified 2026-07-22).
 
 ### 3.6 NPU / RKNN (sole detection backend)
-Detection runs exclusively on the RK3576 NPU via RKNN; there is no CPU/TFLite
-fallback. When the RKNN runtime (`rknnlite`) is present but the `.rknn` model
+Detection runs exclusively on the RK3576 NPU via RKNN; there is no software
+inference fallback. When the RKNN runtime (`rknnlite`) is present but the `.rknn` model
 is missing or fails to load, startup hard-fails with a `RuntimeError`. The
 deterministic stub is **opt-in**: it only runs on machines that both lack the
 RKNN runtime *and* set `CAT_FOLLOW_PERCEPTION_ALLOW_STUB=1` (dev laptop / CI).
@@ -167,8 +176,9 @@ failures escalate: the detector records the error in `perception.error` on
 `/api/status` and stops the app (systemd restarts the unit) rather than
 returning empty detections forever.
 
-- Use **Python 3.11 venv** (Miniforge) for RKNN-Toolkit-Lite2 (`rknnlite`) runtime wheels on the board.
-- Convert the model on an x86 workstation with `rknn-toolkit2` (`scripts/convert_to_rknn.py`), then set `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` (and `CAT_FOLLOW_PERCEPTION_RKNN_INPUT`).
+- Use **Python 3.12 venv** (`/opt/car-x/venv`) with RKNN-Toolkit-Lite2 (`rknnlite`) on the board.
+- Convert YOLOv8n (9-tensor ONNX) on an x86 workstation/WSL with `rknn-toolkit2` (`scripts/convert_yolo_to_rknn.py --platform rk3576 --no-quant`), then set `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH=models/yolov8n_coco_320_rk3576.rknn` (and `CAT_FOLLOW_PERCEPTION_RKNN_INPUT=320,320`).
+- Pin perception to A53 cores `0–3` (camera `0,1`, detector `2`, ultrasonic `3`); leave A72 `4–7` for ROS/Nav2/control.
 - Add udev rule for `/dev/rknpu` group access.
 - Consider `cma=512M` or `1024M` in boot env for large camera buffers.
 
@@ -230,23 +240,25 @@ I2C8_M1 must be enabled on physical pins 3 and 5.
 | `robot_hat/i2c.py` | Default bus → Radxa I2C device (post-overlay) |
 | `robot_hat/pwm.py` | Unchanged protocol to MCU 0x14 if I2C works |
 | `robot_hat/adc.py` | Unchanged protocol to MCU 0x14 |
-| `picarx/picarx.py` | No pin label changes if `robot_hat` API preserved |
+| `picarx/picarx.py` | Add `enable_ultrasonic=False` for contract runtime so D2/D3 are not claimed by `robot_hat` polling |
 
 ### 4.3 Verified GPIO map (libgpiod)
-| HAT signal | Phys pin | ROCK 4D line |
-|------------|----------|-------------|
-| I2C SDA | 3 | I2C8_SDA_M1 / GPIO1_C7 |
-| I2C SCL | 5 | I2C8_SCL_M1 / GPIO1_C6 |
-| D2 TRIG | 13 | GPIO2_C0 |
-| D3 ECHO | 15 | GPIO1_C5 |
-| D4 motor L | 16 | GPIO2_B6 |
-| D5 motor R | 18 | GPIO2_B7 |
-| MCURST | 29 | GPIO3_A2 |
+| HAT signal | Phys pin | ROCK 4D line | libgpiod (production) |
+|------------|----------|-------------|------------------------|
+| I2C SDA | 3 | I2C8_SDA_M1 / GPIO1_C7 | — |
+| I2C SCL | 5 | I2C8_SCL_M1 / GPIO1_C6 | — |
+| D2 TRIG | 13 | GPIO2_C0 | `gpiochip2` line **16** |
+| D3 ECHO | 15 | GPIO1_C5 | `gpiochip1` line **21** |
+| D4 motor L | 16 | GPIO2_B6 | via `robot_hat` |
+| D5 motor R | 18 | GPIO2_B7 | via `robot_hat` |
+| MCURST | 29 | GPIO3_A2 | via `robot_hat` |
 
 The map was verified on the target Armbian image with `gpioinfo`. Motor
 direction lines and MCU reset were exercised with the motors disconnected;
-the MCU returned at `0x14` after reset. The ultrasonic trigger and echo lines
-were also verified with a successful range reading.
+the MCU returned at `0x14` after reset. Ultrasonic TRIG/ECHO were verified
+with a successful range reading during bring-up; production now uses
+`cat_follow/perception/edge_ultrasonic.py` (libgpiod v1 both-edge events) instead
+of `robot_hat.Ultrasonic` busy-wait polling.
 
 ### 4.4 Bring-up test sequence
 1. `i2cdetect` → `0x14` — **done**
@@ -287,17 +299,54 @@ The live ROCK 4D deployment uses:
 | PiCar-X calibration | `/opt/picar-x/picar-x.conf` |
 | systemd unit | `/etc/systemd/system/cat-follow.service` |
 | GPIO permissions | `/etc/udev/rules.d/99-rock4d-gpio.rules` |
+| RT priority limits | `/etc/security/limits.d/99-cat-follow-rtprio.conf` |
 
-The environment file sets:
+The environment file sets (see `scripts/car-x.env` for the full template):
 
 ```text
 ROBOT_HAT_GPIO_BACKEND=rock4d
 ROBOT_HAT_I2C_BUS=8
+CAT_FOLLOW_PERCEPTION_CAMERA_CORES=0,1
+CAT_FOLLOW_PERCEPTION_DETECTOR_CORES=2
+CAT_FOLLOW_ULTRASONIC_CPU_CORE=3
+CAT_FOLLOW_ULTRASONIC_RT_PRIORITY=70
+CAT_FOLLOW_ULTRASONIC_REQUIRE_REALTIME=0
+CAT_FOLLOW_ULTRASONIC_PING_INTERVAL_S=0.060
+CAT_FOLLOW_ULTRASONIC_ECHO_TIMEOUT_S=0.040
+CAT_FOLLOW_ULTRASONIC_STALE_AFTER_S=0.250
 CAT_FOLLOW_WEB_CONTROL_TOKEN=<deployment secret>
 CAT_FOLLOW_COMMS_TOKEN=<deployment secret>
 PYTHONPATH=/opt/car-x
 PYTHONUNBUFFERED=1
 ```
+
+`CAT_FOLLOW_ULTRASONIC_REQUIRE_REALTIME=0` is the current production default:
+the worker still pins to core 3 but degrades to affinity-only scheduling when
+`SCHED_FIFO` is denied by the kernel despite `CAP_SYS_NICE` / `LimitRTPRIO=80`.
+Set it to `1` only after validating RT scheduling on the target image.
+
+### 4.7 Event-driven HC-SR04 acquisition (ROCK 4D production)
+
+Legacy `robot_hat.Ultrasonic` polls the ECHO GPIO in a tight loop and can
+saturate one CPU core. The contract runtime (`runtime.app
+--with-prototype-perception`) uses a dedicated libgpiod edge-event worker instead:
+
+```text
+EdgeTimedUltrasonic (CatFollow-UltrasonicIRQ, libgpiod v1 both-edge, core 3)
+ └─ latest_distance_cm()  [nonblocking cache; kernel event timestamps]
+ └─ range_sensor.set_reader(...)
+ └─ range_sensor.get_distance_cm()  [60 ms throttle]
+ └─ RangeAdapter (CatFollow-RangeAdapter, ~20 Hz)
+ └─ SharedState.range → DecisionEngine
+Picarx(enable_ultrasonic=False)  # motors/servos only; avoids D2/D3 conflict
+App.start/stop → range_source.start/stop
+```
+
+GPIO ownership: only one consumer may request D2/D3. Production constructs
+`Picarx(enable_ultrasonic=False)` and lets `EdgeTimedUltrasonic` own TRIG/ECHO
+with consumer `"cat-follow-ultrasonic"`. The legacy prototype path
+`main_loop.py` still uses `range_sensor.set_car(px)` and the polling
+`Picarx.get_distance()` path; it has **not** been migrated to the edge reader.
 
 The persisted hardware calibration is:
 
@@ -356,17 +405,35 @@ Tune for embedded:
 - `online_async` slam_toolbox, not sync.
 
 ### 5.4 Odometry gap (PiCar-X)
-PiCar-X has **no wheel encoders**. Nav2 and slam_toolbox expect `/odom`.
+PiCar-X has **no wheel encoders**, and the current hardware has **no IMU
+installed**. Nav2 and slam_toolbox expect `/odom`.
 
 | Source | Quality |
 |--------|---------|
-| `cat_follow/odometry.py` (bicycle model) | Drifty; OK for short paths |
+| ROS 2 lidar-odometry scan matcher (RF2O — production/default) | Local `odom -> base_link` from consecutive C1 scans; may degrade in feature-poor or dynamic scenes |
+| `cat_follow/odometry.py` (bicycle model) | **Disabled.** The contract runtime never integrates commanded motion, so it would publish a *frozen* `/odom` |
 | slam_toolbox scan matching | Corrects pose on saved map |
 | Overhead `car` pose | Global hint only; not authoritative for local steering |
-| IMU (future) | Better heading |
+| IMU (future; not installed) | Better heading after hardware is added and validated |
 
-Publish `/odom` from a small ROS node wrapping `odometry.py` until encoders
-or IMU are added.
+The architecture uses a ROS 2 lidar-odometry node (RF2O) to publish `/odom`
+and the dynamic `odom -> base_link` transform. It is the production/default and
+only supported odometry source.
+
+The `cat_follow/odometry.py` bicycle publisher (`OdomPublisher`) is **disabled**:
+the contract runtime (`runtime/app.py` + `DecisionEngine`) never calls
+`odometry.update()`, so the publisher would emit a stationary pose. Feeding a
+frozen `/odom` and a static `odom -> base_link` to slam_toolbox / Nav2 is
+unsafe, so `CAT_FOLLOW_ODOM_SOURCE=bicycle` (or `--odom-source bicycle`) is
+rejected: the tolerant resolver warns and falls back to `lidar`, and any direct
+activation path (`OdomPublisher`, `spin_in_thread(start_bicycle_odom=True)`)
+raises a clear error. Re-enabling bicycle odometry requires wiring a real
+commanded-motion integration source into the runtime first.
+Exactly one component may publish `odom -> base_link`.
+
+Current software must not require, consume, or assume an IMU measurement for
+startup, localization, navigation, or safety decisions. Any future IMU fusion
+must remain disabled until the hardware is installed and validated.
 
 ### 5.5 TF / URDF
 Provide minimal URDF:
@@ -386,10 +453,22 @@ radians per Interface Specification §14).
 |-------|---------------------------|
 | `heading` | Localized pose yaw (rad) |
 | `heading_valid` | Localization active + fresh |
-| `path_correction` | Lateral/heading delta from Nav2 `/cmd_vel` or local plan |
-| `speed_limit` | Scale from obstacle proximity / Nav2 |
+| `path_correction` | Heading delta from Nav2 `cmd_vel_smoothed` angular.z |
+| `speed_limit` | Scale from Nav2 `cmd_vel_smoothed` linear.x |
 | `no_progress` | Nav2 progress checker |
 | `dead_end` | Nav2 goal failed after recoveries |
+
+**Command topic.** The Nav2 chain is `controller_server -> /cmd_vel ->
+velocity_smoother -> /cmd_vel_smoothed`. The bridge consumes the *smoothed*
+command (`CAT_FOLLOW_CMD_VEL_TOPIC`, default `cmd_vel_smoothed`) so it respects
+the configured accel/decel limits rather than the raw controller output.
+Non-finite `cmd_vel`/`odom` fields fail closed (a NaN is never clamped into
+full authority; the sample is dropped and ages out).
+
+**Reverse recovery disabled.** The robot senses only forward (front ultrasonic
++ the front-sector lidar veto), so Nav2's `BackUp` recovery is removed from
+`behavior_server` and the velocity smoother's minimum linear velocity is
+clamped to `0.0`. Re-enable reverse only after rear sensing exists.
 
 ### 6.2 Planned module layout
 ```text
@@ -446,7 +525,8 @@ wrapper unless ROS is unavailable.
 | `cat_follow` main | FSM, DecisionEngine, adapters | 50 Hz control |
 | `CatFollow-Proc` | Camera + RKNN NPU detection | independent |
 | `CatFollow-Comms` | Overhead UDP | ~10 Hz |
-| `CatFollow-Range` | Ultrasonic adapter | ~20 Hz |
+| `CatFollow-UltrasonicIRQ` | libgpiod HC-SR04 edge worker (cached distance) | ~17 Hz ping (60 ms min interval) |
+| `CatFollow-RangeAdapter` | Polls `range_sensor.get_distance_cm()` → `SharedState.range` | ~20 Hz |
 | ROS 2 `sllidar_ros2` | `/scan` | ~10 Hz |
 | ROS 2 `slam_toolbox` | localize | async |
 | ROS 2 Nav2 (composed) | plan + avoid + recover | 5–20 Hz |
@@ -469,17 +549,17 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 - [x] Official `sllidar_ros2` built from source in `/opt/car-x/ros_ws`.
 - [x] `sllidar_ros2` C1 launch authored (`cat_follow_bringup/launch/sllidar_c1.launch.py`, 460800, `/dev/rplidar` udev symlink).
 - [x] `/dev/rplidar` udev rule installed on the ROCK 4D.
-- [ ] Verify that the rule creates `/dev/rplidar`. _(pending C1 connection)_
-- [ ] `/scan` visible on hardware; RViz on PC optional. _(pending C1 connection)_
+- [x] Verified that the rule creates `/dev/rplidar` -> `ttyUSB0` on hardware.
+- [x] `/scan` visible on hardware at ~10 Hz; C1 reports health OK (RViz on PC optional).
 
 ### M4c — Mapping session
 - [x] `slam_toolbox` online_async mapping launch + params authored (`mapping.launch.py`, `config/slam_mapper.yaml`).
-- [ ] Teleop-map the yard and save `yard_map.yaml` + pgm into `cat_follow_bringup/maps/`. _(pending C1)_
+- [ ] Teleop-map the yard and save `yard_map.yaml` + pgm into `cat_follow_bringup/maps/`. _(C1 ready; mapping session pending)_
 - [x] Map origin alignment procedure documented (`cat_follow_bringup/maps/README.md`).
 
 ### M4d — Navigation
 - [x] Nav2 composed bringup + embedded-tuned params authored (`rock4d_nav.launch.py`, `config/nav2_params.yaml`, `config/slam_localization.yaml`).
-- [ ] Localize on saved map; Nav2 reaches goals; dead-end recovery observed. _(pending C1)_
+- [ ] Localize on saved map; Nav2 reaches goals; dead-end recovery observed. _(pending saved yard map)_
 
 ### M4e — cat_follow bridge
 - [x] `navigation/ros_bridge.py` publishes `NavigationState` + lidar `RangeState` (LIDAR_C1); `navigation/odom_publisher.py` publishes `/odom` + `odom->base_link`.
@@ -490,11 +570,38 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 ### M4f — Production hardening
 - [x] WiFi power-save-off config authored (`scripts/default-wifi-powersave-off.conf`).
 - [x] systemd units authored (`scripts/ros-nav.service`, `scripts/cat-follow-ros.service`).
-- [x] Safety review findings covered by automated regression tests (334 passing).
+- [x] Safety review findings covered by automated regression tests (376 passing).
+- [x] Event-driven HC-SR04 reader (`edge_ultrasonic.py`) wired into contract runtime; GPIO exclusivity via `enable_ultrasonic=False`.
 - [x] Web/UDP motion paths support shared-secret authentication and warn when open.
 - [x] CRITICAL telemetry survives transient sink failure through bounded retry.
 - [ ] Thermal/fan policy documented.
 - [ ] JSONL telemetry includes navigation + scan health end-to-end on hardware.
+
+### M4g — Lidar odometry (no encoders / no IMU)
+- [x] Define odometry-source contract: lidar scan matching is the intended
+  primary local odometry source; bicycle-model odometry remains the fallback.
+- [x] Require exclusive ownership of `/odom` and `odom -> base_link`.
+- [x] Selected `rf2o_laser_odometry` (`ros2` branch) and built it successfully
+  from source for ROS 2 Jazzy on the aarch64 ROCK 4D.
+- [x] Add configurable lidar-odometry launch and parameter files
+  (`cat_follow_bringup/launch/lidar_odom.launch.py`,
+  `cat_follow_bringup/config/lidar_odom.yaml`).
+- [x] Disable the `cat_follow` bicycle odometry source entirely: it would
+  publish a frozen `/odom` in the contract runtime, so it is rejected (tolerant
+  resolver falls back to `lidar`; direct activation raises). Lidar RF2O is the
+  production/default (`CAT_FOLLOW_ODOM_SOURCE`, `--odom-source`, default `lidar`).
+- [x] Require a saved map for localization/Nav2: `CAT_FOLLOW_MAP_FILE` (or the
+  `map_file` launch argument) is validated at launch (`rock4d_nav.launch.py`)
+  and by `ros-nav.service`; localization fails clearly when unset or when the
+  serialized `<basename>.posegraph` / `.data` files are missing. Mapping
+  (`mapping.launch.py`) remains map-free.
+- [x] Integrate lidar odometry into mapping and navigation launch files, with
+  RF2O enablement tied to ``CAT_FOLLOW_ODOM_SOURCE`` and slam_toolbox lifecycle
+  autostart.
+- [x] Validate scan-matching odometry and its failure behavior on C1 hardware
+  (2026-07-22: mapping launch with `CAT_FOLLOW_ODOM_SOURCE=lidar` shows RF2O as
+  sole `/odom` publisher, slam_toolbox lifecycle `active`, `/map` publishing).
+- [ ] Keep IMU fusion disabled until an IMU is installed and validated.
 
 ### Deployment units (added in 0.5.0)
 | Unit | Role |
@@ -503,6 +610,8 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 | `scripts/cat-follow-ros.service` | cat_follow runtime + in-process `--ros-nav` bridge/odom (use instead of `cat-follow.service` when navigating) |
 | `scripts/99-rplidar.rules` | Stable `/dev/rplidar` symlink for the C1 |
 | `scripts/default-wifi-powersave-off.conf` | Disable WiFi power save for DDS stability |
+| `scripts/99-cat-follow-rtprio.conf` | PAM rtprio/memlock limits for `picarx` (install to `/etc/security/limits.d/`) |
+| `scripts/cat-follow.service` | `AmbientCapabilities=CAP_SYS_NICE`, `LimitRTPRIO=80`; ultrasonic RT is best-effort when `REQUIRE_REALTIME=0` |
 
 The venv must expose `rclpy` for `--ros-nav` (create with
 `python3 -m venv --system-site-packages /opt/car-x/venv` and keep
