@@ -43,9 +43,14 @@ def _make_input(
     range_fresh: bool = False,
     range_critical: bool = False,
     range_received_ms: int = None,
+    range_confidence: float | None = None,
     command: CommandState = None,
     vision: VisionState = None,
 ) -> DecisionInput:
+    if range_confidence is None:
+        range_confidence = (
+            1.0 if range_fresh and range_distance_cm is not None else 0.0
+        )
     return DecisionInput(
         now_ms=now_ms,
         overhead=OverheadState(
@@ -59,6 +64,7 @@ def _make_input(
             received_ms=now_ms if range_received_ms is None else range_received_ms,
             fresh=range_fresh,
             distance_cm=range_distance_cm,
+            confidence=range_confidence,
             obstacle_critical=range_critical,
         ),
         navigation=NavigationState(),
@@ -465,3 +471,133 @@ def test_clear_failsafe_command_returns_to_idle():
     )
     assert fsm.state == FsmState.IDLE
     assert decision.requested_state == FsmState.IDLE
+
+
+def test_manual_sequence_drives_when_sensors_usable():
+    from cat_follow.motion.action_plan import DriveAction
+    from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+
+    executor = MotionSequenceExecutor(heartbeat_timeout_ms=1000)
+    executor.start([DriveAction(speed_pct=30, duration_s=1.0)], now_ms=1000)
+    fsm = FSM(initial_state=FsmState.IDLE)
+    engine = DecisionEngine(fsm, sequence_executor=executor)
+
+    decision = engine.tick(
+        _make_input(
+            fsm_state=FsmState.IDLE,
+            now_ms=1100,
+            range_distance_cm=OBSTACLE_TOO_CLOSE_CM + 5.0,
+            range_fresh=True,
+            range_received_ms=1100,
+        )
+    )
+    assert decision.reason == ReasonCode.MANUAL_SEQUENCE
+    assert decision.speed == 0.3
+    assert "manual_sequence" in decision.active_constraints
+
+
+def test_manual_sequence_aborts_when_fsm_leaves_idle():
+    from cat_follow.motion.action_plan import DriveAction
+    from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+
+    executor = MotionSequenceExecutor(heartbeat_timeout_ms=1000)
+    executor.start([DriveAction(speed_pct=30, duration_s=5.0)], now_ms=1000)
+    fsm = FSM(initial_state=FsmState.CHASE_A)
+    engine = DecisionEngine(fsm, sequence_executor=executor)
+
+    decision = engine.tick(
+        _make_input(
+            fsm_state=FsmState.CHASE_A,
+            now_ms=1100,
+            range_distance_cm=OBSTACLE_TOO_CLOSE_CM + 5.0,
+            range_fresh=True,
+            range_received_ms=1100,
+        )
+    )
+
+    assert not executor.is_running
+    assert decision.brake is True
+    assert "sequence_blocked_fsm" in decision.active_constraints
+
+
+def test_manual_sequence_aborts_on_obstacle_without_resuming():
+    from cat_follow.motion.action_plan import DriveAction
+    from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+
+    executor = MotionSequenceExecutor(heartbeat_timeout_ms=1000)
+    executor.start([DriveAction(speed_pct=30, duration_s=5.0)], now_ms=1000)
+    fsm = FSM(initial_state=FsmState.IDLE)
+    engine = DecisionEngine(fsm, sequence_executor=executor)
+
+    blocked = engine.tick(
+        _make_input(
+            fsm_state=FsmState.IDLE,
+            now_ms=1100,
+            range_distance_cm=OBSTACLE_TOO_CLOSE_CM - 1.0,
+            range_fresh=True,
+            range_received_ms=1100,
+        )
+    )
+    assert blocked.reason == ReasonCode.OBSTACLE_TOO_CLOSE
+    assert not executor.is_running
+
+    cleared = engine.tick(
+        _make_input(
+            fsm_state=FsmState.IDLE,
+            now_ms=1200,
+            range_distance_cm=OBSTACLE_TOO_CLOSE_CM + 5.0,
+            range_fresh=True,
+            range_received_ms=1200,
+        )
+    )
+    assert cleared.reason != ReasonCode.MANUAL_SEQUENCE
+    assert cleared.speed == 0.0
+
+
+def test_ultrasonic_obstacle_wired_at_ten_cm_not_twenty():
+    """Default failsafe threshold is 10 cm; configurable via DecisionEngine."""
+
+    engine, fsm = _make_engine(FsmState.IDLE)
+    at_15cm = engine.tick(
+        _make_input(
+            now_ms=1000,
+            range_distance_cm=15.0,
+            range_fresh=True,
+            range_received_ms=1000,
+        )
+    )
+    assert fsm.state == FsmState.IDLE
+    assert at_15cm.reason != ReasonCode.OBSTACLE_TOO_CLOSE
+
+    engine2, fsm2 = _make_engine(FsmState.IDLE)
+    at_9cm = engine2.tick(
+        _make_input(
+            now_ms=1000,
+            range_distance_cm=9.0,
+            range_fresh=True,
+            range_received_ms=1000,
+        )
+    )
+    assert fsm2.state == FsmState.FAILSAFE
+    assert at_9cm.reason == ReasonCode.OBSTACLE_TOO_CLOSE
+    assert at_9cm.brake is True
+
+
+def test_configurable_obstacle_threshold():
+    from cat_follow.safety_config import SafetyConfig
+
+    fsm = FSM(initial_state=FsmState.IDLE)
+    engine = DecisionEngine(fsm, obstacle_too_close_cm=20.0)
+    engine.set_safety_thresholds(
+        SafetyConfig(obstacle_too_close_cm=20.0, obstacle_detected_cm=50.0)
+    )
+    decision = engine.tick(
+        _make_input(
+            now_ms=1000,
+            range_distance_cm=15.0,
+            range_fresh=True,
+            range_received_ms=1000,
+        )
+    )
+    assert fsm.state == FsmState.FAILSAFE
+    assert decision.reason == ReasonCode.OBSTACLE_TOO_CLOSE

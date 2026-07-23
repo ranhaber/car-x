@@ -37,6 +37,7 @@ class Picarx(object):
                 motor_pins:list=['D4', 'D5', 'P13', 'P12'],
                 grayscale_pins:list=['A0', 'A1', 'A2'],
                 ultrasonic_pins:list=['D2','D3'],
+                enable_ultrasonic: bool = True,
                 config:str=CONFIG,
                 ):
 
@@ -89,9 +90,14 @@ class Picarx(object):
         self.grayscale.reference(self.line_reference)
 
         # --------- ultrasonic init ---------
-        trig, echo= ultrasonic_pins
-        self.ultrasonic = Ultrasonic(Pin(trig), Pin(echo, mode=Pin.IN, pull=Pin.PULL_DOWN))
-        
+        if enable_ultrasonic:
+            trig, echo = ultrasonic_pins
+            self.ultrasonic = Ultrasonic(
+                Pin(trig), Pin(echo, mode=Pin.IN, pull=Pin.PULL_DOWN)
+            )
+        else:
+            self.ultrasonic = None
+
     def set_motor_speed(self, motor, speed):
         ''' set motor speed
         
@@ -218,6 +224,8 @@ class Picarx(object):
             time.sleep(0.002)
 
     def get_distance(self):
+        if self.ultrasonic is None:
+            return -1
         return self.ultrasonic.read()
 
     def set_grayscale_reference(self, value):
@@ -258,7 +266,8 @@ class Picarx(object):
 
     def close(self):
         self.reset()
-        self.ultrasonic.close()
+        if self.ultrasonic is not None:
+            self.ultrasonic.close()
 
 if __name__ == "__main__":
     px = Picarx()

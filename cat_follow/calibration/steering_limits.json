@@ -5,5 +5,7 @@
     "right": 40.0
   },
   "target_distance_cm": 15,
-  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle. target_distance_cm = closest approach distance (cm) for obstacle/approach logic."
+  "obstacle_too_close_cm": 10,
+  "obstacle_detected_cm": 50,
+  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle. target_distance_cm = closest approach distance (cm) for obstacle/approach logic. obstacle_too_close_cm = hard failsafe distance; obstacle_detected_cm = veto ramp start (must be greater)."
 }

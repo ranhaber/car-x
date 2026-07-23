@@ -40,6 +40,7 @@ from cat_follow.threads.detector import (
     DetectorFatalHook,
     DETECTOR_READY_TIMEOUT_S,
 )
+from cat_follow.perception_config import load_perception_config
 
 # Web UI
 from cat_follow.web_ui.app import create_app, set_tracker_fps
@@ -100,17 +101,24 @@ def main():
 
     detector_fatal_hook.set_handler(_on_detector_fatal)
 
+    perception_config = load_perception_config()
     camera_thread = threading.Thread(
         target=run_camera_loop, args=(shared, stop_event),
         name="CatFollow-Camera", daemon=True,
     )
     tracker_thread = threading.Thread(
         target=run_tracker_loop, args=(shared, stop_event),
+        kwargs={"on_fps": set_tracker_fps},
         name="CatFollow-Tracker", daemon=True,
     )
     detector_thread = threading.Thread(
         target=run_detector_loop, args=(shared, stop_event),
-        kwargs={"handshake": detector_handshake, "on_fatal": detector_fatal_hook},
+        kwargs={
+            "config": perception_config,
+            "score_threshold": perception_config.score_threshold,
+            "handshake": detector_handshake,
+            "on_fatal": detector_fatal_hook,
+        },
         name="CatFollow-Detector", daemon=True,
     )
 
@@ -150,8 +158,6 @@ def main():
     tick_sec = 1.0 / 30.0
     lost_count = 0
     frame_count = 0
-    tracker_fps_counter = 0
-    tracker_fps_timer = time.monotonic()
     prev_state = sm.state
     search_start_time = 0.0  # set when entering GOTO_TARGET, SEARCH, or LOST_SEARCH
     search_prev_heading = None  # for full-circle accumulated turn
@@ -338,15 +344,6 @@ def main():
             pos = location.get_position()
             heading = location.get_heading_deg()
             shared.set_odometry(pos[0], pos[1], heading)
-
-            # Tracker FPS reporting
-            tracker_fps_counter += 1
-            now = time.monotonic()
-            if now - tracker_fps_timer >= 1.0:
-                fps = tracker_fps_counter / (now - tracker_fps_timer)
-                set_tracker_fps(fps)
-                tracker_fps_counter = 0
-                tracker_fps_timer = now
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0, tick_sec - elapsed))

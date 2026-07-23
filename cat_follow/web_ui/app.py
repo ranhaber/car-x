@@ -175,6 +175,8 @@ def create_app(
     *,
     runtime_shared: Any = None,
     comms_manager: Any = None,
+    sequence_executor: Any = None,
+    apply_safety_config: Any = None,
 ) -> Flask:
     """Create and configure the Flask application with Blueprint routes.
 
@@ -194,6 +196,7 @@ def create_app(
     ctx.picarx = picarx
     ctx.runtime_shared = runtime_shared
     ctx.comms_manager = comms_manager
+    ctx.apply_safety_config = apply_safety_config
     ctx.h264_available = False
     ctx.get_tracker_fps = get_tracker_fps
     ctx.get_stream_fps = _get_stream_fps
@@ -212,6 +215,9 @@ def create_app(
     # Serializes web-initiated direct hardware access (calibration motor tests)
     # so two routines cannot drive the shared Picarx concurrently.
     ctx.hardware_lock = threading.Lock()
+    ctx.sequence_executor = None
+    ctx.prototype_sequence_runner = None
+    ctx.web_command_seq = {"value": 0}
 
     # Warn once if motion-causing endpoints are unauthenticated.
     from cat_follow.web_ui.auth import warn_if_unauthenticated
@@ -235,6 +241,17 @@ def create_app(
     from cat_follow.web_ui.routes_calibration import calibration_bp, init_calibration_routes
     from cat_follow.web_ui.routes_config import config_bp, init_config_routes
     from cat_follow.web_ui.routes_map import map_bp, init_map_routes
+    from cat_follow.web_ui.routes_movement import movement_bp, init_movement_routes
+    from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+    from cat_follow.motion.prototype_sequence_runner import PrototypeSequenceRunner
+
+    ctx.sequence_executor = sequence_executor or MotionSequenceExecutor()
+    if picarx is not None:
+        ctx.prototype_sequence_runner = PrototypeSequenceRunner(
+            picarx=picarx,
+            hardware_lock=ctx.hardware_lock,
+            executor=ctx.sequence_executor,
+        )
 
     init_pages_routes()
     init_streaming_routes(ctx)
@@ -245,6 +262,7 @@ def create_app(
     init_calibration_routes(ctx)
     init_config_routes(ctx)
     init_map_routes(ctx)
+    init_movement_routes(ctx)
 
     # Optional hardware H.264 WebSocket stream (guarded: no-op if flask-sock /
     # GStreamer mpph264enc are unavailable).
@@ -265,5 +283,6 @@ def create_app(
     app.register_blueprint(calibration_bp)
     app.register_blueprint(config_bp)
     app.register_blueprint(map_bp)
+    app.register_blueprint(movement_bp)
 
     return app

@@ -19,9 +19,12 @@ The shell is enough to:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from cat_follow.control.fsm import FSM
+
+if TYPE_CHECKING:
+    from cat_follow.motion.sequence_executor import MotionSequenceExecutor
 from cat_follow.control.types import (
     AckStatus,
     CommandName,
@@ -39,6 +42,7 @@ from cat_follow.control.types import (
 
 
 # Distance below which any obstacle is treated as a critical safety event.
+# Instance thresholds on :class:`DecisionEngine` may override this at runtime.
 OBSTACLE_TOO_CLOSE_CM = 10.0
 
 # Overhead packet ages that trigger downgraded behavior or failsafe.
@@ -69,6 +73,9 @@ _CHASE_STATES = frozenset(
 # States where a fresh NavigationState (from Nav2 via the ros_bridge) is
 # allowed to drive path_correction / speed_limit into the motion command.
 _NAV_DRIVE_STATES = frozenset({FsmState.CHASE_A, FsmState.GOTO})
+
+# FSM states that allow the Movement-tab open-loop sequence executor.
+_SEQUENCE_DRIVE_STATES = frozenset({FsmState.IDLE, FsmState.HOME})
 
 
 # Mapping of accepted command -> (FSM event, reason code) used to translate
@@ -107,9 +114,26 @@ class DecisionEngine:
     the caller's responsibility.
     """
 
-    def __init__(self, fsm: FSM) -> None:
+    def __init__(
+        self,
+        fsm: FSM,
+        sequence_executor: Optional["MotionSequenceExecutor"] = None,
+        *,
+        obstacle_too_close_cm: float = OBSTACLE_TOO_CLOSE_CM,
+    ) -> None:
         self._fsm = fsm
+        self._sequence = sequence_executor
         self._last_consumed_command_id: Optional[str] = None
+        self._obstacle_too_close_cm = float(obstacle_too_close_cm)
+
+    def set_safety_thresholds(self, config) -> None:
+        """Apply runtime safety threshold updates from :mod:`safety_config`."""
+
+        self._obstacle_too_close_cm = float(config.obstacle_too_close_cm)
+
+    @property
+    def obstacle_too_close_cm(self) -> float:
+        return self._obstacle_too_close_cm
 
     def tick(self, decision_input: DecisionInput) -> DecisionOutput:
         constraints: List[str] = []
@@ -118,6 +142,7 @@ class DecisionEngine:
         range_close = self._range_obstacle_too_close(decision_input)
         lidar_close = self._lidar_obstacle_too_close(decision_input)
         if range_close or lidar_close:
+            self._abort_sequence("obstacle_too_close")
             self._fsm.apply(
                 FsmEvent.OBSTACLE_TOO_CLOSE,
                 reason=ReasonCode.OBSTACLE_TOO_CLOSE,
@@ -148,6 +173,7 @@ class DecisionEngine:
             and decision_input.lidar.obstacle_critical
         )
         if range_critical or lidar_critical:
+            self._abort_sequence("obstacle_veto")
             self._fsm.apply(
                 FsmEvent.FAILSAFE_TRIGGERED,
                 reason=ReasonCode.OBSTACLE_VETO,
@@ -178,6 +204,7 @@ class DecisionEngine:
 
         if is_chase and overhead_age_ms is not None:
             if overhead_age_ms > OVERHEAD_STALE_FAILSAFE_MS:
+                self._abort_sequence("overhead_expired")
                 self._fsm.apply(
                     FsmEvent.FAILSAFE_TRIGGERED,
                     reason=ReasonCode.OVERHEAD_EXPIRED,
@@ -201,12 +228,18 @@ class DecisionEngine:
         current_state = self._fsm.state
 
         if current_state == FsmState.FAILSAFE:
+            self._abort_sequence("failsafe")
             return self._safe_stop_output(
                 decision_input,
                 reason=ReasonCode.FAILSAFE_TRIGGERED,
                 constraints=constraints,
                 brake=True,
             )
+
+        # 5b. Movement-tab open-loop sequence (contract runtime only).
+        sequence_output = self._sequence_drive_output(decision_input, constraints)
+        if sequence_output is not None:
+            return sequence_output
 
         # 6. Navigation-assisted drive (CHASE_A / GOTO) when Nav2 is publishing
         #    fresh constraints via the ros_bridge.  Safety precedence above is
@@ -334,23 +367,21 @@ class DecisionEngine:
             return False
         return (now_ms - received_ms) <= ttl_ms
 
-    @classmethod
-    def _range_obstacle_too_close(cls, decision_input: DecisionInput) -> bool:
+    def _range_obstacle_too_close(self, decision_input: DecisionInput) -> bool:
         rs = decision_input.range
-        if not cls._age_fresh(rs.received_ms, RANGE_STALE_MS, decision_input.now_ms):
+        if not self._age_fresh(rs.received_ms, RANGE_STALE_MS, decision_input.now_ms):
             return False
         if rs.distance_cm is None:
             return False
-        return rs.distance_cm < OBSTACLE_TOO_CLOSE_CM
+        return rs.distance_cm < self._obstacle_too_close_cm
 
-    @classmethod
-    def _lidar_obstacle_too_close(cls, decision_input: DecisionInput) -> bool:
+    def _lidar_obstacle_too_close(self, decision_input: DecisionInput) -> bool:
         ls = decision_input.lidar
-        if not cls._age_fresh(ls.received_ms, LIDAR_STALE_MS, decision_input.now_ms):
+        if not self._age_fresh(ls.received_ms, LIDAR_STALE_MS, decision_input.now_ms):
             return False
         if ls.distance_cm is None:
             return False
-        return ls.distance_cm < OBSTACLE_TOO_CLOSE_CM
+        return ls.distance_cm < self._obstacle_too_close_cm
 
     @staticmethod
     def _obstacle_sensor_usable(rs: RangeState, ttl_ms: int, now_ms: int) -> bool:
@@ -368,6 +399,73 @@ class DecisionEngine:
         if rs.distance_cm is None or rs.confidence <= 0.0:
             return False
         return True
+
+    def _sequence_drive_output(
+        self,
+        decision_input: DecisionInput,
+        constraints: List[str],
+    ) -> Optional[DecisionOutput]:
+        """Apply Movement-tab sequence motion when the executor is active."""
+
+        if self._sequence is None or not self._sequence.is_running:
+            return None
+
+        current_state = self._fsm.state
+        if current_state not in _SEQUENCE_DRIVE_STATES:
+            self._abort_sequence(f"fsm_blocked:{current_state.value}")
+            constraints.append("sequence_blocked_fsm")
+            return self._safe_stop_output(
+                decision_input,
+                reason=ReasonCode.MANUAL_SEQUENCE,
+                constraints=constraints,
+                brake=True,
+            )
+
+        range_usable = self._obstacle_sensor_usable(
+            decision_input.range, RANGE_STALE_MS, decision_input.now_ms
+        )
+        lidar_usable = self._obstacle_sensor_usable(
+            decision_input.lidar, LIDAR_STALE_MS, decision_input.now_ms
+        )
+        if not (range_usable or lidar_usable):
+            self._abort_sequence("obstacle_sensor_unavailable")
+            constraints.append("obstacle_sensor_unavailable")
+            return self._safe_stop_output(
+                decision_input,
+                reason=ReasonCode.MANUAL_SEQUENCE,
+                constraints=constraints,
+                brake=True,
+            )
+
+        # Advance only after all state and safety gates pass. A blocked sequence
+        # is aborted above, so elapsed wall time can never fast-forward an
+        # open-loop plan and later resume it without a new operator request.
+        self._sequence.advance(decision_input.now_ms)
+        cmd = self._sequence.motion_command(decision_input.now_ms)
+        if cmd is None:
+            return self._safe_stop_output(
+                decision_input,
+                reason=ReasonCode.MANUAL_SEQUENCE,
+                constraints=constraints,
+                brake=True,
+            )
+
+        constraints.append("manual_sequence")
+        return DecisionOutput(
+            timestamp_ms=decision_input.now_ms,
+            requested_state=current_state,
+            speed=cmd.speed,
+            steering=cmd.steering,
+            brake=cmd.brake,
+            reason=ReasonCode.MANUAL_SEQUENCE,
+            active_constraints=tuple(constraints),
+        )
+
+    def _abort_sequence(self, reason: str) -> None:
+        """Abort an active Movement sequence without allowing auto-resume."""
+
+        if self._sequence is not None and self._sequence.is_running:
+            self._sequence.stop(reason)
 
     def _navigation_drive_output(
         self,

@@ -35,6 +35,13 @@ from cat_follow.motion.motor_interface import (
     MotorInterface,
     NoOpMotorBackend,
 )
+from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+from cat_follow.perception_config import load_perception_config
+from cat_follow.safety_config import (
+    apply_safety_config_to_runtime,
+    resolve_safety_config,
+)
+from cat_follow.web_ui.control_policy import require_production_control_tokens
 from cat_follow.perception.range_adapter import RangeAdapter
 from cat_follow.perception.vision_adapter import VisionAdapter
 from cat_follow.runtime.control_loop import ControlLoop
@@ -63,47 +70,65 @@ class App:
     udp_sender: Optional[UdpSender] = None
     vision_adapter: Optional[VisionAdapter] = None
     range_adapter: Optional[RangeAdapter] = None
+    range_source: Optional[Any] = None
     prototype_perception_stop_event: Optional[threading.Event] = None
     prototype_perception_threads: Tuple[threading.Thread, ...] = field(
         default_factory=tuple
     )
     prototype_detector_handshake: Optional[Any] = None
     ros_nav: bool = False
+    start_bicycle_odom: bool = False
     ros_bridge_thread: Optional[threading.Thread] = None
+    ros_bridge_holder: dict = field(default_factory=dict)
     web_ui_thread: Optional[threading.Thread] = None
+    apply_safety_config: Optional[Callable[..., Any]] = None
+    safety_config: Optional[Any] = None
 
     def start(self) -> None:
         self.logger.start()
-        for thread in self.prototype_perception_threads:
-            thread.start()
-        # Startup handshake: block until the detector worker validates its
-        # RKNN backend (or reports the dev/CI stub).  A validation failure
-        # raises here and aborts startup instead of running the app blind.
-        if self.prototype_detector_handshake is not None:
-            try:
+        try:
+            if self.range_source is not None:
+                self.range_source.start()
+            for thread in self.prototype_perception_threads:
+                thread.start()
+            # Startup handshake: block until the detector worker validates its
+            # RKNN backend (or reports the dev/CI stub). A validation failure
+            # aborts startup instead of running the app blind.
+            if self.prototype_detector_handshake is not None:
                 self.prototype_detector_handshake.wait_ready()
-            except Exception:
-                self.stop_event.set()
-                if self.prototype_perception_stop_event is not None:
-                    self.prototype_perception_stop_event.set()
+            if self.vision_adapter is not None:
+                self.vision_adapter.start()
+            if self.range_adapter is not None:
+                self.range_adapter.start()
+            if self.ros_nav:
+                self._start_ros_bridge()
+            if self.web_ui_thread is not None:
+                self.web_ui_thread.start()
+            self.control_loop.start()
+            if self.udp_receiver is not None:
+                self.udp_receiver.start()
+        except BaseException:
+            # A partially-started runtime must release every resource it
+            # acquired. In particular, ultrasonic/RT-policy failures must not
+            # leave telemetry or perception workers orphaned.
+            self.stop_event.set()
+            if self.prototype_perception_stop_event is not None:
+                self.prototype_perception_stop_event.set()
+            try:
+                self.stop()
+            finally:
                 raise
-        if self.vision_adapter is not None:
-            self.vision_adapter.start()
-        if self.range_adapter is not None:
-            self.range_adapter.start()
-        if self.ros_nav:
-            self._start_ros_bridge()
-        if self.web_ui_thread is not None:
-            self.web_ui_thread.start()
-        self.control_loop.start()
-        if self.udp_receiver is not None:
-            self.udp_receiver.start()
 
     def _start_ros_bridge(self) -> None:
         try:
             from cat_follow.navigation.ros_bridge import spin_in_thread
 
-            self.ros_bridge_thread = spin_in_thread(self.shared_state)
+            self.ros_bridge_thread = spin_in_thread(
+                self.shared_state,
+                start_bicycle_odom=self.start_bicycle_odom,
+                safety_config=self.safety_config,
+                bridge_holder=self.ros_bridge_holder,
+            )
         except Exception as exc:  # noqa: BLE001
             sys.stderr.write(
                 f"warning: --ros-nav requested but the ROS bridge could not "
@@ -125,6 +150,8 @@ class App:
         self.control_loop.stop(timeout=timeout)
         if self.range_adapter is not None:
             self.range_adapter.stop(timeout=timeout)
+        if self.range_source is not None:
+            self.range_source.stop(timeout=timeout)
         if self.vision_adapter is not None:
             self.vision_adapter.stop(timeout=timeout)
         if self.prototype_perception_stop_event is not None:
@@ -153,15 +180,18 @@ def build_app(
     vision_image_height: Optional[int] = None,
     range_adapter: Optional[RangeAdapter] = None,
     range_read_distance: Optional[Callable[[], Optional[float]]] = None,
+    range_source: Optional[Any] = None,
     prototype_perception_threads: Tuple[threading.Thread, ...] = (),
     prototype_perception_stop_event: Optional[threading.Event] = None,
     prototype_detector_handshake: Optional[Any] = None,
     prototype_detector_fatal_hook: Optional[Any] = None,
     ros_nav: bool = False,
+    start_bicycle_odom: bool = False,
     web_ui: bool = False,
     web_ui_port: int = 5000,
     web_ui_shared_state: Optional[object] = None,
     web_ui_picarx: Optional[Any] = None,
+    calibration: Optional[Any] = None,
 ) -> App:
     """Construct the runtime stack without starting any threads.
 
@@ -201,9 +231,35 @@ def build_app(
       ``web_ui_shared_state`` (frame ring) for streaming.
     """
 
+    if web_ui or udp_listen_port is not None:
+        # External motion-capable control planes are fail-closed unless both
+        # production tokens are provisioned or bench mode is explicitly opted
+        # into with CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL=1.
+        auth_policy = require_production_control_tokens()
+    else:
+        auth_policy = None
+
+    if calibration is None:
+        try:
+            from cat_follow.calibration import Calibration
+
+            calibration = Calibration()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("failed to load runtime calibration") from exc
+
     shared_state = SharedState()
     fsm = FSM()
-    decision_engine = DecisionEngine(fsm)
+    sequence_executor = MotionSequenceExecutor()
+    # Persisted calibration overrides must be applied before any control,
+    # range, or ROS thread starts. Invalid persisted safety values fail startup
+    # rather than silently falling back to less conservative defaults.
+    safety_config = resolve_safety_config(calibration)
+    ros_bridge_holder: dict = {}
+    decision_engine = DecisionEngine(
+        fsm,
+        sequence_executor=sequence_executor,
+        obstacle_too_close_cm=safety_config.obstacle_too_close_cm,
+    )
     if motor_backend is None:
         motor_backend = _make_default_backend(use_picarx=use_picarx)
 
@@ -229,8 +285,8 @@ def build_app(
         escalation.  Latching means only an operator ``clear_failsafe`` leaves
         FAILSAFE, so subsequent control ticks keep emitting a safe stop.
         """
-        # Emit CRITICAL telemetry first so the failsafe reason is durable even
-        # if the motor/FSM calls below raise (CRITICAL triggers a sync flush).
+        # Queue CRITICAL telemetry first and wake the async writer promptly.
+        # Motor/FSM safety does not wait for disk I/O.
         try:
             logger.log(
                 event_type=TelemetryEventType.FAILSAFE,
@@ -282,6 +338,12 @@ def build_app(
         ack_sink=ack_sink,
         logger=logger,
         on_emergency_stop=lambda: _enter_failsafe("comms_emergency_stop"),
+        on_start_chase=(
+            prototype_vision_shared_state.request_detector_warmup
+            if prototype_vision_shared_state is not None
+            and hasattr(prototype_vision_shared_state, "request_detector_warmup")
+            else None
+        ),
     )
 
     udp_receiver: Optional[UdpReceiver] = None
@@ -291,6 +353,7 @@ def build_app(
             bind_host=udp_listen_host or "0.0.0.0",
             bind_port=udp_listen_port,
             logger=logger,
+            command_token=auth_policy.comms_token if auth_policy is not None else None,
         )
 
     if (
@@ -312,7 +375,24 @@ def build_app(
             contract_shared_state=shared_state,
             read_distance=range_read_distance,
             logger=logger,
+            obstacle_detected_cm=safety_config.obstacle_detected_cm,
+            obstacle_critical_cm=safety_config.obstacle_too_close_cm,
+            health_error=(
+                (lambda: getattr(range_source, "runtime_error", None))
+                if range_source is not None
+                else None
+            ),
         )
+
+    def apply_runtime_safety(calib=None):
+        cfg = resolve_safety_config(calib)
+        apply_safety_config_to_runtime(
+            cfg,
+            decision_engine=decision_engine,
+            range_adapter=range_adapter,
+            ros_bridge=ros_bridge_holder.get("node"),
+        )
+        return cfg
 
     web_ui_thread: Optional[threading.Thread] = None
     if web_ui:
@@ -322,6 +402,9 @@ def build_app(
             memory_shared=web_ui_shared_state or prototype_vision_shared_state,
             picarx=web_ui_picarx,
             port=web_ui_port,
+            sequence_executor=sequence_executor,
+            apply_safety_config=apply_runtime_safety,
+            calibration=calibration,
         )
 
     return App(
@@ -338,11 +421,16 @@ def build_app(
         udp_sender=udp_sender,
         vision_adapter=vision_adapter,
         range_adapter=range_adapter,
+        range_source=range_source,
         prototype_perception_threads=prototype_perception_threads,
         prototype_perception_stop_event=prototype_perception_stop_event,
         prototype_detector_handshake=prototype_detector_handshake,
         ros_nav=ros_nav,
+        start_bicycle_odom=start_bicycle_odom,
+        ros_bridge_holder=ros_bridge_holder,
         web_ui_thread=web_ui_thread,
+        apply_safety_config=apply_runtime_safety,
+        safety_config=safety_config,
     )
 
 
@@ -353,6 +441,9 @@ def _build_web_ui_thread(
     memory_shared: Optional[object],
     picarx: Optional[Any],
     port: int,
+    sequence_executor: MotionSequenceExecutor,
+    apply_safety_config: Optional[Callable[..., Any]] = None,
+    calibration: Optional[Any] = None,
 ) -> Optional[threading.Thread]:
     """Build a daemon Flask thread for contract-runtime monitoring."""
     if memory_shared is None:
@@ -374,18 +465,12 @@ def _build_web_ui_thread(
             return None
 
     try:
-        from cat_follow.calibration import Calibration
         from cat_follow.web_ui.app import create_app
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(
             f"warning: --web-ui import failed ({exc!r}); skipping\n"
         )
         return None
-
-    try:
-        calibration = Calibration()
-    except Exception:  # noqa: BLE001
-        calibration = None
 
     flask_app = create_app(
         shared=memory_shared,
@@ -394,6 +479,8 @@ def _build_web_ui_thread(
         picarx=picarx,
         runtime_shared=runtime_shared,
         comms_manager=comms_manager,
+        sequence_executor=sequence_executor,
+        apply_safety_config=apply_safety_config,
     )
 
     def _run() -> None:
@@ -413,12 +500,15 @@ def _build_web_ui_thread(
     )
 
 
-def _try_make_picarx() -> Optional[Any]:
+def _try_make_picarx(*, enable_ultrasonic: bool = True) -> Optional[Any]:
     """Return a ``Picarx()`` instance if available, else ``None``.
 
     Used by both the motor backend and the prototype-perception bootstrap.
     A single instance is shared between them so we never construct two
     ``Picarx`` objects (which would fight over the I2C/PWM hardware).
+
+    When the libgpiod edge reader owns D2/D3, pass
+    ``enable_ultrasonic=False`` so Picarx does not claim those GPIO lines.
     """
 
     try:
@@ -429,7 +519,7 @@ def _try_make_picarx() -> Optional[Any]:
         )
         return None
     try:
-        return Picarx()
+        return Picarx(enable_ultrasonic=enable_ultrasonic)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(
             f"warning: Picarx() construction failed ({exc!r})\n"
@@ -482,18 +572,17 @@ class _PrototypePerception:
 
 def _build_prototype_perception(
     *,
-    picarx_instance: Optional[Any] = None,
+    range_read_distance: Optional[Callable[[], Optional[float]]] = None,
 ) -> Optional[_PrototypePerception]:
     """Allocate the prototype memory pool / SharedState / threads.
 
     Returns ``None`` (with a stderr warning) on platforms where the
-    prototype dependencies cannot be imported.  When ``picarx_instance``
-    is supplied, it is also injected into ``cat_follow.range_sensor`` so
-    ultrasonic reads work on real hardware.
+    prototype dependencies cannot be imported.  Hardware range acquisition is
+    supplied separately so this bundle never calls the PiCar-X polling
+    ultrasonic implementation.
     """
 
     try:
-        from cat_follow import range_sensor as proto_range_sensor
         from cat_follow.calibration import CALIBRATION_IMAGE_SIZE
         from cat_follow.memory.pool import allocate_pool
         from cat_follow.memory.shared_state import (
@@ -514,15 +603,7 @@ def _build_prototype_perception(
 
     pool = allocate_pool()
     proto_ss = PrototypeSharedState(pool)
-
-    if picarx_instance is not None:
-        try:
-            proto_range_sensor.set_car(picarx_instance)
-        except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(
-                f"warning: range_sensor.set_car failed ({exc!r}); "
-                "ultrasonic reads will return None\n"
-            )
+    perception_config = load_perception_config()
 
     stop_event = threading.Event()
     detector_handshake = DetectorHandshake()
@@ -544,6 +625,8 @@ def _build_prototype_perception(
             target=run_detector_loop,
             args=(proto_ss, stop_event),
             kwargs={
+                "config": perception_config,
+                "score_threshold": perception_config.score_threshold,
                 "handshake": detector_handshake,
                 "on_fatal": detector_fatal_hook,
             },
@@ -560,7 +643,7 @@ def _build_prototype_perception(
         stop_event=stop_event,
         image_width=image_width,
         image_height=image_height,
-        range_read_distance=proto_range_sensor.get_distance_cm,
+        range_read_distance=range_read_distance or (lambda: None),
         detector_handshake=detector_handshake,
         detector_fatal_hook=detector_fatal_hook,
     )
@@ -623,6 +706,17 @@ def main(argv: Optional[list] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--odom-source",
+        choices=("lidar", "bicycle"),
+        default=None,
+        help=(
+            "Local odometry source for --ros-nav. "
+            "'lidar' expects RF2O (or another external scan matcher) to publish "
+            "/odom and odom->base_link; 'bicycle' starts cat_follow's internal "
+            "OdomPublisher. Overrides CAT_FOLLOW_ODOM_SOURCE (default: lidar)."
+        ),
+    )
+    parser.add_argument(
         "--web-ui",
         action="store_true",
         help=(
@@ -663,6 +757,20 @@ def main(argv: Optional[list] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    use_bicycle_odom = False
+    if args.odom_source is not None and not args.ros_nav:
+        sys.stderr.write(
+            "warning: --odom-source is ignored without --ros-nav\n"
+        )
+    if args.ros_nav or args.odom_source is not None:
+        from cat_follow.navigation.odom_source import (
+            resolve_odom_source_or_default,
+            uses_bicycle_odom_source,
+        )
+
+        odom_source = resolve_odom_source_or_default(override=args.odom_source)
+        use_bicycle_odom = uses_bicycle_odom_source(odom_source)
+
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
 
@@ -670,7 +778,19 @@ def main(argv: Optional[list] = None) -> int:
     # perception (range sensor injection).  Constructed only when needed.
     picarx_instance: Optional[Any] = None
     if args.picarx or args.with_prototype_perception:
-        picarx_instance = _try_make_picarx()
+        picarx_instance = _try_make_picarx(
+            enable_ultrasonic=not args.with_prototype_perception,
+        )
+
+    range_source: Optional[Any] = None
+    range_read_callback: Optional[Callable[[], Optional[float]]] = None
+    if args.with_prototype_perception and picarx_instance is not None:
+        from cat_follow import range_sensor
+        from cat_follow.perception.edge_ultrasonic import EdgeTimedUltrasonic
+
+        range_source = EdgeTimedUltrasonic.from_env()
+        range_sensor.set_reader(range_source.latest_distance_cm)
+        range_read_callback = range_sensor.get_distance_cm
 
     motor_backend = _make_default_backend(
         use_picarx=args.picarx,
@@ -679,7 +799,9 @@ def main(argv: Optional[list] = None) -> int:
 
     proto = None
     if args.with_prototype_perception:
-        proto = _build_prototype_perception(picarx_instance=picarx_instance)
+        proto = _build_prototype_perception(
+            range_read_distance=range_read_callback
+        )
 
     app_kwargs: dict = {
         "log_path": args.log_path,
@@ -691,9 +813,11 @@ def main(argv: Optional[list] = None) -> int:
         "udp_target_host": args.udp_target_host,
         "udp_target_port": args.udp_target_port,
         "ros_nav": args.ros_nav,
+        "start_bicycle_odom": use_bicycle_odom,
         "web_ui": args.web_ui,
         "web_ui_port": args.web_ui_port,
         "web_ui_picarx": picarx_instance,
+        "range_source": range_source,
     }
     if proto is not None:
         app_kwargs.update(

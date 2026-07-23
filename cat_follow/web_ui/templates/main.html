@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cat Follow - Control</title>
+  <script defer src="/static/action_builder.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -123,6 +124,7 @@
   <h1>Cat Follow</h1>
   <nav>
     <a href="/" class="active">Control</a>
+    <a href="/movement">Movement</a>
     <a href="/calibration">Calibration</a>
   </nav>
 </header>
@@ -198,6 +200,27 @@
       · lores <strong x-text="(status.perception && status.perception.lores_active) ? 'on' : 'off'"></strong>
       · motion <strong x-text="(status.perception && status.perception.motion) ? 'yes' : 'no'"></strong>
     </div>
+    <div>
+      primary <strong x-text="targetText('PRIMARY_CAT')"></strong>
+      · secondary <strong x-text="targetText('SECONDARY_CAT')"></strong>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Action queue</h2>
+    <p class="notes" style="font-size:0.82rem;color:#8888aa;margin-bottom:8px;">
+      Motor motion runs only from the Movement tab. This queue is shared across Control, Movement, and Calibration.
+    </p>
+    <div>
+      Queue length: <strong x-text="queue.length"></strong>
+      · <a href="/movement" style="color:#e94560;">Open Movement to run</a>
+    </div>
+    <div class="controls" style="margin-top:10px;">
+      <button class="btn-send" @click="addActionsToQueue([{type:'stop', duration_s:0.5}])">Add STOP step</button>
+      <button class="btn-stop" @click="stopSequence()">Abort running sequence</button>
+    </div>
+    <div class="feedback" :class="{ show: builderFeedback, ok: builderFeedbackOk, err: !builderFeedbackOk }"
+         x-text="builderFeedback" x-show="builderFeedback"></div>
   </div>
 
   <div class="controls">
@@ -299,7 +322,7 @@
 
 <script>
 function catFollow() {
-  return {
+  return CatFollowActionBuilder.mixin({
     targetX: 1.0,
     targetY: 0.0,
     resolution: '640x480',
@@ -308,14 +331,13 @@ function catFollow() {
     caps: { mjpeg: true, h264: false },
     feedback: '',
     feedbackOk: true,
-    detectorModel: 'ssd_mobilenet_v2',
+    detectorModel: 'rknn',
     detectorOptions: {
-      ssd_mobilenet_v2: 'SSD MobileNet V2',
-      efficientdet_lite0: 'EfficientDet-Lite0',
+      rknn: 'RKNN NPU (configured model path)',
     },
     configText: '(not loaded)',
     mapData: null,
-    _h264Overlay: { state: '', bbox: null },
+    _h264Overlay: { state: '', bbox: null, targets: {} },
     _ws: null,
     _mapPollTimer: null,
     _mapImage: null,
@@ -325,6 +347,7 @@ function catFollow() {
       state: 'idle',
       odometry: { x: 0, y: 0, heading_deg: 0 },
       bbox_tracker: { x: 0, y: 0, w: 0, h: 0, valid: 0 },
+      tracked_targets: {},
       ultrasonic_cm: null,
       tracker_fps: 0,
       stream_fps: 0,
@@ -343,7 +366,27 @@ function catFollow() {
 
     _pollTimer: null,
 
+    controlHeaders(extra) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
+      const token = sessionStorage.getItem('cat_follow_control_token')
+        || localStorage.getItem('cat_follow_control_token')
+        || '';
+      if (token) headers['X-Control-Token'] = token;
+      return headers;
+    },
+
+    ensureControlToken() {
+      let token = sessionStorage.getItem('cat_follow_control_token')
+        || localStorage.getItem('cat_follow_control_token')
+        || '';
+      if (token) return token;
+      token = prompt('Enter control token (leave blank if unset on server):') || '';
+      if (token) sessionStorage.setItem('cat_follow_control_token', token);
+      return token;
+    },
+
     start() {
+      this.initActionBuilder();
       this.fetchStatus();
       this.fetchDetectorModel();
       this.fetchCapabilities();
@@ -369,6 +412,12 @@ function catFollow() {
       const n = this.status.navigation;
       if (!n || !n.heading_valid) return '—';
       return (n.heading * 180 / Math.PI).toFixed(1) + '°';
+    },
+
+    targetText(role) {
+      const target = (this.status.tracked_targets || {})[role];
+      if (!target || !target.valid) return '—';
+      return '#' + target.track_id + ' ' + Number(target.confidence).toFixed(2);
     },
 
     overlayText() {
@@ -573,9 +622,10 @@ function catFollow() {
 
     async sendTarget() {
       try {
+        this.ensureControlToken();
         const res = await fetch('/api/target', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this.controlHeaders(),
           body: JSON.stringify({ x: parseFloat(this.targetX), y: parseFloat(this.targetY) }),
         });
         const data = await res.json();
@@ -605,7 +655,11 @@ function catFollow() {
 
     async startChase() {
       try {
-        const res = await fetch('/api/command/start_chase', { method: 'POST' });
+        this.ensureControlToken();
+        const res = await fetch('/api/command/start_chase', {
+          method: 'POST',
+          headers: this.controlHeaders(),
+        });
         const data = await res.json();
         if (res.ok) {
           this.showFeedback('Start chase accepted', true);
@@ -632,9 +686,10 @@ function catFollow() {
 
     async changeResolution() {
       try {
+        this.ensureControlToken();
         const res = await fetch('/api/stream/resolution', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this.controlHeaders(),
           body: JSON.stringify({ resolution: this.resolution }),
         });
         if (res.ok) {
@@ -643,6 +698,9 @@ function catFollow() {
             setTimeout(() => { this.streamUrl = '/stream'; }, 100);
           }
           this.showFeedback('Resolution: ' + this.resolution, true);
+        } else {
+          const data = await res.json().catch(() => ({}));
+          this.showFeedback(data.error || 'Resolution change denied', false);
         }
       } catch (e) {
         this.showFeedback('Error changing resolution', false);
@@ -679,8 +737,22 @@ function catFollow() {
             const msg = JSON.parse(ev.data);
             if (msg.type === 'overlay') {
               this._h264Overlay = msg;
-              if (ctx && msg.bbox && msg.bbox[4]) {
-                // Lightweight client overlay outline (video frames are opaque).
+              if (ctx && msg.targets && Object.keys(msg.targets).length) {
+                const colors = {
+                  PRIMARY_CAT: '#2ecc71',
+                  SECONDARY_CAT: '#f39c12',
+                };
+                for (const [role, target] of Object.entries(msg.targets)) {
+                  if (!target.valid) continue;
+                  ctx.strokeStyle = colors[role] || '#ffffff';
+                  ctx.lineWidth = 2;
+                  ctx.strokeRect(target.x, target.y, target.w, target.h);
+                  ctx.fillStyle = colors[role] || '#ffffff';
+                  ctx.font = '13px sans-serif';
+                  ctx.fillText(role + ' #' + target.track_id, target.x, Math.max(14, target.y - 4));
+                }
+              } else if (ctx && msg.bbox && msg.bbox[4]) {
+                // Compatibility for a producer that only publishes bbox_tracker.
                 ctx.strokeStyle = '#2ecc71';
                 ctx.lineWidth = 2;
                 ctx.strokeRect(msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]);
@@ -750,7 +822,7 @@ function catFollow() {
       this.feedbackOk = ok;
       setTimeout(() => { this.feedback = ''; }, 3000);
     },
-  };
+  });
 }
 </script>
 

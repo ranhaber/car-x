@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cat Follow - Calibration</title>
+  <script defer src="/static/action_builder.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -76,6 +77,7 @@
   <h1>Cat Follow</h1>
   <nav>
     <a href="/">Control</a>
+    <a href="/movement">Movement</a>
     <a href="/calibration" class="active">Calibration</a>
   </nav>
 </header>
@@ -119,8 +121,8 @@
         <label>Duration (s)</label>
         <input type="number" step="0.5" min="0.5" x-model.number="runSpeedDuration" />
       </div>
-      <button type="button" class="btn-start" @click="runSpeedTest()">Start</button>
-      <button type="button" class="btn-stop" @click="runStop()">Stop</button>
+      <button type="button" class="btn-start" @click="queueSpeedTest()">Add to queue</button>
+      <button type="button" class="btn-stop" @click="stopSequence()">Abort sequence</button>
     </div>
   </div>
 
@@ -144,6 +146,15 @@
       <label>Target approach distance (cm)</label>
       <input type="number" step="1" min="5" max="50" x-model.number="targetDistanceCm" />
     </div>
+    <div class="form-row">
+      <label>Obstacle failsafe (cm)</label>
+      <input type="number" step="0.5" min="1" max="50" x-model.number="obstacleTooCloseCm" />
+    </div>
+    <div class="form-row">
+      <label>Obstacle detected (cm)</label>
+      <input type="number" step="1" min="5" max="200" x-model.number="obstacleDetectedCm" />
+    </div>
+    <p class="notes">Failsafe distance triggers immediate stop. Detected distance must be greater than failsafe. Env defaults come from <code>CAT_FOLLOW_SAFETY_*</code>; saving here applies at runtime.</p>
     <div class="run-row">
       <span class="notes" style="margin-right: 8px;">Run radius calibration (drive in circle):</span>
       <div class="control-group">
@@ -158,9 +169,17 @@
         <label>Duration (s)</label>
         <input type="number" step="0.5" min="0.5" x-model.number="runSteerDuration" />
       </div>
-      <button type="button" class="btn-start" @click="runSteerTest()">Start</button>
-      <button type="button" class="btn-stop" @click="runStop()">Stop</button>
+      <button type="button" class="btn-start" @click="queueSteerTest()">Add to queue</button>
+      <button type="button" class="btn-stop" @click="stopSequence()">Abort sequence</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Shared action queue</h2>
+    <p class="notes">Queue length: <strong x-text="queue.length"></strong>. Run from <a href="/movement" style="color:#e94560;">Movement</a>.</p>
+    <template x-for="(item, index) in queue.slice(0, 5)" :key="index">
+      <div class="notes" x-text="(index + 1) + '. ' + queueSummary(item)"></div>
+    </template>
   </div>
 
   <div class="form-row">
@@ -174,12 +193,14 @@
 
 <script>
 function calibrationApp() {
-  return {
+  return CatFollowActionBuilder.mixin({
     speedRows: [{ speed: 30, cm_per_sec: 12 }, { speed: 50, cm_per_sec: 22 }, { speed: 70, cm_per_sec: 32 }],
     maxSteer: 30,
     radiusLeft: 40,
     radiusRight: 40,
     targetDistanceCm: 15,
+    obstacleTooCloseCm: 10,
+    obstacleDetectedCm: 50,
     feedback: '',
     feedbackOk: true,
     runSpeedVal: 30,
@@ -189,6 +210,7 @@ function calibrationApp() {
     runSteerDuration: 4.0,
 
     load() {
+      this.initActionBuilder();
       fetch('/api/calibration')
         .then(res => res.ok ? res.json() : Promise.reject(res))
         .then(data => {
@@ -204,6 +226,16 @@ function calibrationApp() {
             this.radiusLeft = this.radiusRight = parseFloat(radii);
           }
           this.targetDistanceCm = parseFloat(data.steering?.target_distance_cm ?? 15);
+          this.obstacleTooCloseCm = parseFloat(
+            data.steering?.obstacle_too_close_cm ?? data.safety_effective?.obstacle_too_close_cm ?? 10
+          );
+          this.obstacleDetectedCm = parseFloat(
+            data.steering?.obstacle_detected_cm ?? data.safety_effective?.obstacle_detected_cm ?? 50
+          );
+          if (data.safety_effective?.safety_degraded) {
+            this.feedback = 'Safety config degraded: ' + (data.safety_effective.safety_error || 'invalid thresholds');
+            this.feedbackOk = false;
+          }
         })
         .catch(() => { this.feedback = 'Could not load calibration'; this.feedbackOk = false; });
     },
@@ -229,12 +261,15 @@ function calibrationApp() {
           max_steer_angle_deg: Number(this.maxSteer),
           min_turn_radius_cm: { left: Number(this.radiusLeft), right: Number(this.radiusRight) },
           target_distance_cm: Number(this.targetDistanceCm),
+          obstacle_too_close_cm: Number(this.obstacleTooCloseCm),
+          obstacle_detected_cm: Number(this.obstacleDetectedCm),
           notes: 'Do not exceed max_steer to avoid servo strain.'
         }
       };
+      CatFollowActionBuilder.ensureToken();
       fetch('/api/calibration', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: CatFollowActionBuilder.authHeaders(),
         body: JSON.stringify(payload)
       })
         .then(res => res.json().then(data => ({ res, data })))
@@ -242,6 +277,10 @@ function calibrationApp() {
           if (res.ok) {
             this.feedback = 'Calibration saved.';
             this.feedbackOk = true;
+            if (data.safety_effective) {
+              this.obstacleTooCloseCm = data.safety_effective.obstacle_too_close_cm;
+              this.obstacleDetectedCm = data.safety_effective.obstacle_detected_cm;
+            }
           } else {
             this.feedback = data.error || 'Save failed';
             this.feedbackOk = false;
@@ -250,19 +289,21 @@ function calibrationApp() {
         .catch(() => { this.feedback = 'Network error'; this.feedbackOk = false; });
     },
 
-    async runSpeedTest() {
+    async queueSpeedTest() {
       try {
+        CatFollowActionBuilder.ensureToken();
         const res = await fetch('/api/calibrate/run_speed', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: CatFollowActionBuilder.authHeaders(),
           body: JSON.stringify({ speed: this.runSpeedVal, duration: this.runSpeedDuration })
         });
         const data = await res.json();
         if (res.ok) {
-          this.feedback = data.message || 'Speed test started.';
+          this.addActionsToQueue(data.actions || []);
+          this.feedback = data.message || 'Speed test added to queue.';
           this.feedbackOk = true;
         } else {
-          this.feedback = data.error || 'Failed to start speed test';
+          this.feedback = (data.errors && data.errors.join('; ')) || data.error || 'Failed to build speed test';
           this.feedbackOk = false;
         }
       } catch (e) {
@@ -271,11 +312,12 @@ function calibrationApp() {
       }
     },
 
-    async runSteerTest() {
+    async queueSteerTest() {
       try {
+        CatFollowActionBuilder.ensureToken();
         const res = await fetch('/api/calibrate/run_steer', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: CatFollowActionBuilder.authHeaders(),
           body: JSON.stringify({
             angle: this.runSteerAngle,
             speed: this.runSteerSpeed,
@@ -284,10 +326,11 @@ function calibrationApp() {
         });
         const data = await res.json();
         if (res.ok) {
-          this.feedback = data.message || 'Steer test started.';
+          this.addActionsToQueue(data.actions || []);
+          this.feedback = data.message || 'Steer test added to queue.';
           this.feedbackOk = true;
         } else {
-          this.feedback = data.error || 'Failed to start steer test';
+          this.feedback = (data.errors && data.errors.join('; ')) || data.error || 'Failed to build steer test';
           this.feedbackOk = false;
         }
       } catch (e) {
@@ -295,24 +338,7 @@ function calibrationApp() {
         this.feedbackOk = false;
       }
     },
-
-    async runStop() {
-      try {
-        const res = await fetch('/api/stop', { method: 'POST' });
-        const data = await res.json();
-        if (res.ok) {
-          this.feedback = 'Stop sent. Car should stop.';
-          this.feedbackOk = true;
-        } else {
-          this.feedback = data.error || 'Stop failed';
-          this.feedbackOk = false;
-        }
-      } catch (e) {
-        this.feedback = 'Network error';
-        this.feedbackOk = false;
-      }
-    }
-  };
+  });
 }
 </script>
 

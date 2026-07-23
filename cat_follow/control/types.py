@@ -104,6 +104,7 @@ class ReasonCode(str, Enum):
     FAILSAFE_TRIGGERED = "failsafe_triggered"
     CLEAR_FAILSAFE_ACCEPTED = "clear_failsafe_accepted"
     TRANSITION_REJECTED = "transition_rejected"
+    MANUAL_SEQUENCE = "manual_sequence"
     INIT = "init"
 
 
@@ -231,7 +232,6 @@ class NavigationState:
     authority: str = "Navigation"
     heading: float = 0.0
     heading_valid: bool = False
-    steering_constraint: float = 0.0
     speed_limit: float = 0.0
     path_correction: float = 0.0
     no_progress: bool = False

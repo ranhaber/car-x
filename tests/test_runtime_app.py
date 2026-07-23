@@ -40,6 +40,27 @@ def test_build_app_wires_all_components(tmp_path):
     assert app.motor_backend is not None
 
 
+def test_build_app_applies_persisted_calibration_safety(tmp_path):
+    from cat_follow.calibration import Calibration
+
+    calib_dir = tmp_path / "calib"
+    calib_dir.mkdir()
+    (calib_dir / "speed_time_distance.json").write_text("{}", encoding="utf-8")
+    (calib_dir / "steering_limits.json").write_text(
+        '{"obstacle_too_close_cm": 22, "obstacle_detected_cm": 58}',
+        encoding="utf-8",
+    )
+    calib = Calibration(calib_dir=str(calib_dir))
+
+    app = build_app(
+        log_path=tmp_path / "telemetry.jsonl",
+        stop_event=threading.Event(),
+        target_rate_hz=200.0,
+        calibration=calib,
+    )
+    assert app.decision_engine.obstacle_too_close_cm == 22.0
+
+
 def test_app_starts_runs_and_stops_cleanly(tmp_path):
     log_path = tmp_path / "telemetry.jsonl"
     app = build_app(

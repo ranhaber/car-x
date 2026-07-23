@@ -56,6 +56,22 @@ def _vision_dict(vision) -> dict:
     }
 
 
+def _tracked_targets_dict(targets) -> dict:
+    result = {}
+    for role, target in targets.items():
+        result[role] = {
+            "track_id": target[0],
+            "x": target[1],
+            "y": target[2],
+            "w": target[3],
+            "h": target[4],
+            "confidence": target[5],
+            "frames_since_update": target[6],
+            "valid": target[7],
+        }
+    return result
+
+
 def _decision_dict(decision) -> dict:
     return {
         "speed": float(decision.speed),
@@ -87,6 +103,9 @@ def init_status_routes(ctx):
 def api_status():
     odom = _ctx.shared.get_odometry() if _ctx and _ctx.shared else (0, 0, 0)
     bbox = _ctx.shared.get_bbox_tracker() if _ctx and _ctx.shared else (0, 0, 0, 0, 0)
+    tracked_targets = (
+        _ctx.shared.get_tracked_targets() if _ctx and _ctx.shared else {}
+    )
     legacy_state = "unknown"
     if _ctx is not None and _ctx.state_machine is not None:
         legacy_state = _ctx.state_machine.state.value
@@ -99,6 +118,21 @@ def api_status():
         else 0
     )
 
+    from cat_follow.safety_config import safe_resolve_safety_config
+
+    calib = getattr(_ctx, "calibration", None) if _ctx is not None else None
+    safety_cfg, safety_err = safe_resolve_safety_config(calib)
+    safety_status = {
+        "safety_degraded": safety_cfg is None,
+        "safety_error": safety_err,
+        "obstacle_too_close_cm": (
+            None if safety_cfg is None else safety_cfg.obstacle_too_close_cm
+        ),
+        "obstacle_detected_cm": (
+            None if safety_cfg is None else safety_cfg.obstacle_detected_cm
+        ),
+    }
+
     legacy = {
         "state": legacy_state,
         "odometry": {"x": odom[0], "y": odom[1], "heading_deg": odom[2]},
@@ -109,6 +143,9 @@ def api_status():
             "h": bbox[3],
             "valid": bbox[4],
         },
+        "tracked_targets": _tracked_targets_dict(tracked_targets),
+        # Alias for role-aware clients; same payload as tracked_targets.
+        "cats": _tracked_targets_dict(tracked_targets),
         "ultrasonic_cm": (
             round(ultrasonic_cm, 1) if ultrasonic_cm is not None else None
         ),
@@ -119,6 +156,7 @@ def api_status():
         "ram_percent": round(_ctx.get_ram_percent(), 1) if _ctx else -1.0,
         "cpu_temp": round(_ctx.get_cpu_temp(), 1) if _ctx else -1.0,
         "battery_v": _ctx.get_battery_voltage() if _ctx else -1.0,
+        **safety_status,
     }
 
     payload = {

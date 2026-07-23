@@ -29,6 +29,7 @@ def init_config_routes(ctx):
 def api_config():
     from cat_follow.camera_config import load_camera_config
     from cat_follow.perception_config import load_perception_config
+    from cat_follow.safety_config import load_safety_config_from_env
 
     try:
         camera = asdict(load_camera_config())
@@ -38,12 +39,45 @@ def api_config():
         perception = asdict(load_perception_config())
     except Exception as exc:  # noqa: BLE001
         perception = {"error": str(exc)}
+    try:
+        env_safety = asdict(load_safety_config_from_env())
+        env_safety["safety_degraded"] = False
+        env_safety["safety_error"] = None
+    except Exception as exc:  # noqa: BLE001
+        env_safety = {
+            "error": str(exc),
+            "safety_degraded": True,
+            "safety_error": str(exc),
+            "obstacle_too_close_cm": None,
+            "obstacle_detected_cm": None,
+        }
+    effective = env_safety
+    calib = getattr(_ctx, "calibration", None) if _ctx is not None else None
+    if calib is not None:
+        from cat_follow.safety_config import safe_resolve_safety_config
+
+        cfg, err = safe_resolve_safety_config(calib)
+        if cfg is None:
+            effective = {
+                "error": err,
+                "safety_degraded": True,
+                "safety_error": err,
+                "obstacle_too_close_cm": None,
+                "obstacle_detected_cm": None,
+            }
+        else:
+            effective = asdict(cfg)
+            effective["safety_degraded"] = False
+            effective["safety_error"] = None
 
     return jsonify({
         "camera": camera,
         "perception": perception,
+        "safety_env": env_safety,
+        "safety_effective": effective,
         "note": (
             "Read-only snapshot of env-driven settings. "
-            "Edit /etc/car-x/car-x.env and restart to change."
+            "Safety failsafe thresholds can also be overridden from Calibration "
+            "(steering_limits.json). Restart is not required for calibration overrides."
         ),
     })

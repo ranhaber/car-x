@@ -3,6 +3,7 @@ Page routes: main (Control) and Calibration tabs.
 
 Routes:
     GET /            — Control tab (main.html)
+    GET /movement    — Movement tab (movement.html)
     GET /calibration — Calibration tab (calibration.html)
 """
 
@@ -16,6 +17,11 @@ pages_bp = Blueprint("pages", __name__)
 @pages_bp.route("/")
 def index():
     return render_template("main.html", version=__version__)
+
+
+@pages_bp.route("/movement")
+def movement_page():
+    return render_template("movement.html", version=__version__)
 
 
 @pages_bp.route("/calibration")

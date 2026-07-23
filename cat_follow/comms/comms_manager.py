@@ -69,6 +69,7 @@ class CommsManager:
         command_id_cache_size: int = DEFAULT_COMMAND_ID_CACHE_SIZE,
         source: str = "CommsManager",
         on_emergency_stop: Optional[Callable[[], None]] = None,
+        on_start_chase: Optional[Callable[[], None]] = None,
     ) -> None:
         self._ss = shared_state
         self._ack_sink = ack_sink
@@ -79,7 +80,14 @@ class CommsManager:
         # emergency_stop command is accepted, so motors stop immediately
         # instead of waiting for the next ControlLoop tick (which may be hung).
         self._on_emergency_stop = on_emergency_stop
+        # Lightweight edge-trigger hook used to ask the detector thread to
+        # load/warm its lazily-unloaded RKNN model after START_CHASE is accepted.
+        self._on_start_chase = on_start_chase
         self._lock = threading.Lock()
+        # Serialize command semantics separately from the short-lived cache /
+        # tracking lock. Hardware and ACK I/O never run while ``_lock`` is held,
+        # so an emergency stop cannot block incoming tracking updates.
+        self._command_lock = threading.Lock()
         self._command_results: "OrderedDict[str, _CommandResult]" = OrderedDict()
         self._last_tracking_sequence: int = -1
         self._next_outbound_sequence: int = 1
@@ -133,19 +141,49 @@ class CommsManager:
         accept/reject result without re-executing side effects.
         """
 
-        with self._lock:
-            cached = self._command_results.get(msg.command_id)
-            if cached is not None:
-                self._command_results.move_to_end(msg.command_id)
-                ack = self._build_ack(msg, cached)
+        with self._command_lock:
+            with self._lock:
+                cached = self._command_results.get(msg.command_id)
+                if cached is not None:
+                    self._command_results.move_to_end(msg.command_id)
+                    ack = self._build_ack(msg, cached)
+                else:
+                    ack = None
+            if ack is not None:
                 self._dispatch_ack(ack, duplicate=True)
                 return ack
 
             self._log_command_received(msg)
             result = self._validate_and_apply(msg)
-            self._command_results[msg.command_id] = result
-            while len(self._command_results) > self._cache_size:
-                self._command_results.popitem(last=False)
+
+            # Safety/hardware callbacks are deliberately outside ``_lock``.
+            # Command submissions remain serialized by ``_command_lock`` so an
+            # accepted e-stop completes before a later command is evaluated.
+            if (
+                msg.command == CommandName.EMERGENCY_STOP
+                and result.status == AckStatus.ACCEPTED
+                and self._on_emergency_stop is not None
+            ):
+                try:
+                    self._on_emergency_stop()
+                except Exception:
+                    pass
+            if (
+                msg.command == CommandName.START_CHASE
+                and result.status == AckStatus.ACCEPTED
+                and self._on_start_chase is not None
+            ):
+                try:
+                    self._on_start_chase()
+                except Exception:
+                    # Warmup is an optimization; command semantics and safety
+                    # must not depend on this callback succeeding.
+                    pass
+
+            with self._lock:
+                self._command_results[msg.command_id] = result
+                while len(self._command_results) > self._cache_size:
+                    self._command_results.popitem(last=False)
             ack = self._build_ack(msg, result)
             self._update_command_state(msg, result)
             self._dispatch_ack(ack, duplicate=False)
@@ -328,14 +366,8 @@ class CommsManager:
     # emergency_stop ────────────────────────────────────────────────
 
     def _handle_emergency_stop(self, msg: CommandMessage, state: FsmState) -> _CommandResult:
-        # Actuate the stop synchronously (motor e-stop + FAILSAFE latch) before
-        # ACKing.  The DecisionEngine still consumes the accepted command to keep
-        # FSM state consistent, but safety must not wait for the control tick.
-        if self._on_emergency_stop is not None:
-            try:
-                self._on_emergency_stop()
-            except Exception:
-                pass
+        # The synchronous actuation hook is invoked by ``submit_command`` after
+        # validation and outside the short-lived cache/tracking lock.
         return _CommandResult(
             ack_type=AckType.COMMAND,
             status=AckStatus.ACCEPTED,
