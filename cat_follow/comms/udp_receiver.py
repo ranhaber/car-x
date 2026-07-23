@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import os
 import socket
 import threading
 from typing import Optional, Tuple
@@ -27,6 +26,11 @@ from cat_follow.control.types import (
     TelemetrySeverity,
 )
 from cat_follow.telemetry.async_logger import AsyncLogger
+from cat_follow.web_ui.control_policy import (
+    ALLOW_UNAUTHENTICATED_ENV,
+    COMMS_TOKEN_ENV,
+    load_control_auth_policy,
+)
 
 
 # Conservative buffer size for incoming JSON datagrams.  Tracking packets
@@ -44,7 +48,7 @@ DEFAULT_RECV_TIMEOUT_S = 0.1
 # (backwards-compatible), and a warning is emitted at startup.  UDP is an
 # unauthenticated, spoofable transport and commands can move the car, so
 # operators binding beyond localhost should always configure this.
-COMMAND_TOKEN_ENV = "CAT_FOLLOW_COMMS_TOKEN"
+COMMAND_TOKEN_ENV = COMMS_TOKEN_ENV
 
 
 class UdpReceiver:
@@ -70,12 +74,18 @@ class UdpReceiver:
         self._recv_timeout_s = recv_timeout_s
         self._thread_name = thread_name
         self._source = source
-        # Explicit argument overrides the environment; an empty string means
-        # "no token" (auth disabled).
+        # Explicit argument overrides the environment. Missing command auth is
+        # allowed only when the operator explicitly enables bench mode.
+        policy = load_control_auth_policy()
         if command_token is None:
-            command_token = os.environ.get(COMMAND_TOKEN_ENV, "")
+            command_token = policy.comms_token or ""
         command_token = command_token.strip()
         self._command_token: Optional[str] = command_token or None
+        if self._command_token is None and not policy.allow_unauthenticated:
+            raise RuntimeError(
+                f"{COMMAND_TOKEN_ENV} is required for UDP commands; set it or "
+                f"set {ALLOW_UNAUTHENTICATED_ENV}=1 for explicit bench mode"
+            )
 
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None

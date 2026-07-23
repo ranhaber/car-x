@@ -22,7 +22,6 @@ control_bp = Blueprint("control", __name__)
 _log = get_logger("web_ui.control")
 
 _ctx = None
-_web_cmd_seq = 0
 
 
 def _next_command_id(prefix: str) -> str:
@@ -34,17 +33,17 @@ def _submit_contract_command(command, params=None):
 
     Returns (ack_dict_or_none, used_contract: bool).
     """
-    global _web_cmd_seq
     comms = getattr(_ctx, "comms_manager", None) if _ctx is not None else None
     if comms is None:
         return None, False
 
     from cat_follow.comms.messages import CommandMessage
     from cat_follow.runtime.shared_state import now_monotonic_ms
+    from cat_follow.web_ui.command_seq import next_web_command_seq
 
-    _web_cmd_seq += 1
+    seq = next_web_command_seq(_ctx)
     msg = CommandMessage(
-        sequence=_web_cmd_seq,
+        sequence=seq,
         timestamp_ms=now_monotonic_ms(),
         command_id=_next_command_id(command.value),
         command=command,
@@ -98,6 +97,9 @@ def api_target():
 @control_bp.route("/api/stop", methods=["POST"])
 def api_stop():
     from cat_follow.control.types import CommandName
+    from cat_follow.web_ui.routes_movement import abort_sequence_on_operator_stop
+
+    abort_sequence_on_operator_stop("operator_stop")
 
     ack, used = _submit_contract_command(CommandName.STOP_CHASE)
     set_stop_command()
@@ -122,6 +124,9 @@ def api_start_chase():
 @control_bp.route("/api/command/emergency_stop", methods=["POST"])
 def api_emergency_stop():
     from cat_follow.control.types import CommandName
+    from cat_follow.web_ui.routes_movement import abort_sequence_on_operator_stop
+
+    abort_sequence_on_operator_stop("emergency_stop")
 
     ack, used = _submit_contract_command(CommandName.EMERGENCY_STOP)
     set_stop_command()

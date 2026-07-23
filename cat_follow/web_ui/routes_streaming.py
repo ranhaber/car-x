@@ -85,6 +85,7 @@ def _generate_mjpeg():
 
             _ctx.shared.get_frame_latest(frame_buf)
             bbox = _ctx.shared.get_bbox_tracker()
+            tracked_targets = _ctx.shared.get_tracked_targets()
             state_name = "unknown"
             if _ctx.state_machine is not None:
                 state_name = _ctx.state_machine.state.value
@@ -94,10 +95,35 @@ def _generate_mjpeg():
 
             if _has_cv2:
                 np.copyto(display, frame_buf)
-                if bbox[4] > 0:
+                if tracked_targets:
+                    colors = {
+                        "PRIMARY_CAT": (0, 255, 0),
+                        "SECONDARY_CAT": (0, 165, 255),
+                    }
+                    for role, target in tracked_targets.items():
+                        if target[7] <= 0:
+                            continue
+                        _track_id, x, y, w, h, confidence, _misses, _valid = target
+                        x, y, w, h = int(x), int(y), int(w), int(h)
+                        color = colors.get(role, (255, 255, 255))
+                        cv2.rectangle(
+                            display, (x, y), (x + w, y + h), color, 2
+                        )
+                        label = f"{role} #{_track_id} {confidence:.2f}"
+                        cv2.putText(
+                            display,
+                            label,
+                            (x, max(y - 8, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            1,
+                        )
+                elif bbox[4] > 0:
+                    # Compatibility for producers that only publish bbox_tracker.
                     x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
                     cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    label = f"cat ({w}x{h})"
+                    label = f"PRIMARY_CAT ({w}x{h})"
                     cv2.putText(display, label, (x, max(y - 8, 15)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(display, f"State: {state_name}", (10, 25),

@@ -9,6 +9,7 @@ Routes:
 from flask import Blueprint, request, jsonify
 
 from cat_follow.logger import get_logger
+from cat_follow.web_ui.auth import require_control_token
 
 stream_config_bp = Blueprint("stream_config", __name__)
 _log = get_logger("web_ui.stream_config")
@@ -23,6 +24,7 @@ def init_stream_config_routes(ctx):
 
 
 @stream_config_bp.route("/api/stream/resolution", methods=["POST"])
+@require_control_token
 def api_stream_resolution():
     data = request.get_json(silent=True) or {}
     res = data.get("resolution", "")

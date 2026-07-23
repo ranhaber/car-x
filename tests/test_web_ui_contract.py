@@ -38,6 +38,8 @@ def test_perception_diagnostics_roundtrip():
 
 def test_motion_endpoint_open_when_no_token(monkeypatch):
     monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_COMMS_TOKEN", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", "1")
     proto = PrototypeSharedState(allocate_pool())
     app = create_app(shared=proto)
     client = app.test_client()
@@ -46,7 +48,9 @@ def test_motion_endpoint_open_when_no_token(monkeypatch):
 
 
 def test_motion_endpoint_requires_token_when_set(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
     monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    monkeypatch.setenv("CAT_FOLLOW_COMMS_TOKEN", "comms-s3cret")
     proto = PrototypeSharedState(allocate_pool())
     app = create_app(shared=proto)
     client = app.test_client()
@@ -69,7 +73,9 @@ def test_motion_endpoint_requires_token_when_set(monkeypatch):
 
 
 def test_stop_endpoint_never_requires_token(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
     monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    monkeypatch.setenv("CAT_FOLLOW_COMMS_TOKEN", "comms-s3cret")
     proto = PrototypeSharedState(allocate_pool())
     app = create_app(shared=proto)
     client = app.test_client()
@@ -84,6 +90,12 @@ def test_status_prototype_mode(monkeypatch):
         lambda: 42.5,
     )
     proto = PrototypeSharedState(allocate_pool())
+    proto.set_tracked_targets(
+        {
+            "PRIMARY_CAT": (1, 10.0, 20.0, 30.0, 40.0, 0.95, 0, 1.0),
+            "SECONDARY_CAT": (2, 50.0, 60.0, 20.0, 25.0, 0.80, 1, 1.0),
+        }
+    )
     app = create_app(shared=proto)
     client = app.test_client()
     res = client.get("/api/status")
@@ -94,6 +106,9 @@ def test_status_prototype_mode(monkeypatch):
     assert "legacy" in data
     assert "stream_clients" in data
     assert "perception" in data
+    assert data["tracked_targets"]["PRIMARY_CAT"]["track_id"] == 1
+    assert data["tracked_targets"]["SECONDARY_CAT"]["confidence"] == 0.8
+    assert data["cats"]["PRIMARY_CAT"]["track_id"] == 1
 
 
 def test_status_contract_mode(monkeypatch):

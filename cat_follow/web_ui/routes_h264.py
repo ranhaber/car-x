@@ -69,14 +69,6 @@ def _get_encoder():
         return _encoder
 
 
-def _release_encoder():
-    global _encoder
-    with _encoder_lock:
-        if _encoder is not None:
-            _encoder.stop()
-            _encoder = None
-
-
 def _serve_h264(ws) -> None:  # noqa: ANN001
     global _clients
     frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
@@ -104,12 +96,14 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
                 continue
 
             _ctx.shared.get_frame_latest(frame_buf)
+            # Encode without holding _encoder_lock — MPP encode can be slow.
             chunk = encoder.encode(frame_buf)
             if chunk:
                 ws.send(chunk)
 
             # Overlay metadata as a JSON text frame (drawn client-side).
             bbox = _ctx.shared.get_bbox_tracker()
+            tracked_targets = _ctx.shared.get_tracked_targets()
             state_name = "unknown"
             if _ctx.state_machine is not None:
                 state_name = _ctx.state_machine.state.value
@@ -119,6 +113,19 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
                         "type": "overlay",
                         "state": state_name,
                         "bbox": [bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]],
+                        "targets": {
+                            role: {
+                                "track_id": target[0],
+                                "x": target[1],
+                                "y": target[2],
+                                "w": target[3],
+                                "h": target[4],
+                                "confidence": target[5],
+                                "frames_since_update": target[6],
+                                "valid": target[7],
+                            }
+                            for role, target in tracked_targets.items()
+                        },
                     }
                 )
             )
@@ -128,10 +135,20 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
     except Exception:  # noqa: BLE001 - client disconnected
         pass
     finally:
+        # Atomically drop the client count and detach the encoder reference so a
+        # concurrent new client never receives an encoder that is about to stop.
+        # Stop the old encoder outside the lock (stop can block).
+        global _encoder
+        enc_to_stop = None
         with _encoder_lock:
             _clients = max(0, _clients - 1)
-            last = _clients == 0
+            if _clients == 0 and _encoder is not None:
+                enc_to_stop = _encoder
+                _encoder = None
+        if enc_to_stop is not None:
+            try:
+                enc_to_stop.stop()
+            except Exception:  # noqa: BLE001
+                log.warning("H.264 encoder stop failed during last-client teardown")
         if _ctx is not None and getattr(_ctx, "dec_stream_clients", None):
             _ctx.dec_stream_clients()
-        if last:
-            _release_encoder()
