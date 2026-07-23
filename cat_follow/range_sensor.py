@@ -13,10 +13,11 @@ Thread-safe: main loop writes, status API reads; all access to cache is under _l
 
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 # Same car instance as motion.driver when on hardware
 _car = None
+_reader: Optional[Callable[[], Optional[float]]] = None
 _lock = threading.Lock()
 _last_distance_cm: Optional[float] = None
 _last_read_time: float = 0.0
@@ -31,8 +32,20 @@ MAX_CM = 500.0
 
 def set_car(car) -> None:
     """Inject Picarx (or any object with get_distance() returning cm). Call once at startup."""
-    global _car
+    global _car, _reader
     _car = car
+    _reader = None
+
+
+def set_reader(reader: Callable[[], Optional[float]]) -> None:
+    """Inject a nonblocking distance provider such as EdgeTimedUltrasonic."""
+
+    global _car, _reader
+    if not callable(reader):
+        raise TypeError("reader must be callable")
+    with _lock:
+        _car = None
+        _reader = reader
 
 
 def get_distance_cm() -> Optional[float]:
@@ -43,13 +56,19 @@ def get_distance_cm() -> Optional[float]:
     global _last_distance_cm, _last_read_time
     now = time.monotonic()
     with _lock:
-        if _car is not None and (now - _last_read_time) < MIN_READ_INTERVAL_SEC and _last_distance_cm is not None:
+        reader = _reader
+        car = _car
+        if (
+            (reader is not None or car is not None)
+            and (now - _last_read_time) < MIN_READ_INTERVAL_SEC
+            and _last_distance_cm is not None
+        ):
             return _last_distance_cm
-        if _car is None:
+        if reader is None and car is None:
             _last_distance_cm = None
             return None
     try:
-        d = _car.get_distance()
+        d = reader() if reader is not None else car.get_distance()
     except Exception:
         with _lock:
             _last_distance_cm = None

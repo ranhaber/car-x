@@ -13,7 +13,7 @@ Resource-optimization design (scaled for the ROCK 4D):
 - **Zero per-frame allocation**: reuses the pre-allocated detector snapshot
   buffer and the motion detector's internal buffers.
 
-There is no CPU/TFLite fallback.  When the RKNN runtime is present but the
+There is no software inference fallback. When the RKNN runtime is present but the
 model is missing / fails to load, the loop hard-fails with a ``RuntimeError``.
 The deterministic no-NPU stub (periodically publishing a center bbox, for unit
 tests) is only used when the RKNN runtime is entirely absent *and*
@@ -182,7 +182,7 @@ def build_validated_backend(
         raise RuntimeError(
             f"RKNN model file not found: {path!r}. Set "
             "CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH to a valid .rknn file "
-            "(build one with scripts/convert_to_rknn.py)."
+            "(build one with scripts/convert_yolo_to_rknn.py)."
         )
     try:
         b.self_test()
@@ -190,8 +190,8 @@ def build_validated_backend(
         raise RuntimeError(
             f"RKNN model failed strict validation: {path!r} ({exc}). It may be "
             "corrupt, built for a different target, or have an input/output "
-            "contract that does not match a finalized SSD-MobileNet. Rebuild it "
-            "with scripts/convert_to_rknn.py."
+            "contract that does not match the YOLOv8n 9-tensor model-zoo head. "
+            "Rebuild it with scripts/convert_yolo_to_rknn.py."
         ) from exc
     if not config.warmup_on_start:
         # Release NPU worker threads until the first real inference.
@@ -227,7 +227,7 @@ def run_detector_loop(
     stop_event: threading.Event,
     *,
     model_path: Optional[str] = None,
-    score_threshold: float = 0.5,
+    score_threshold: Optional[float] = None,
     target_fps: Optional[float] = None,
     config: Optional[PerceptionConfig] = None,
     handshake: Optional[DetectorHandshake] = None,
@@ -245,6 +245,10 @@ def run_detector_loop(
     perception ``stop_event`` alone does not stop the control loop.
     """
     config = config or load_perception_config()
+    if score_threshold is None:
+        score_threshold = config.score_threshold
+    if not np.isfinite(score_threshold) or not 0.0 <= score_threshold <= 1.0:
+        raise ValueError("score_threshold must be finite and within [0, 1]")
     if target_fps is None:
         target_fps = config.detect_fps
     tick = 1.0 / target_fps
@@ -273,7 +277,7 @@ def run_detector_loop(
     # it fails, the supervisor waiting on the handshake aborts startup.
     try:
         backend = build_validated_backend(config, model_path)
-    except BaseException as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.error("Detector backend validation failed: %s", exc)
         update_perception_diagnostics(
             backend="rknn", model_loaded=False, error=str(exc)
@@ -314,6 +318,7 @@ def run_detector_loop(
 
     frame_index = 0
     stub_cycle = 0
+    lores_gray = None
     while not stop_event.is_set():
         t0 = time.monotonic()
         frame_index += 1
@@ -325,12 +330,30 @@ def run_detector_loop(
         # matches on this to init on the same pixels).
         frame_gen = shared.snapshot_detector_frame(tmp)
 
+        # START_CHASE asks this owner thread to load and warm the model. Keeping
+        # RKNN ownership here avoids cross-thread runtime calls while ensuring
+        # the first chase detection does not pay load/initialization latency.
+        if (
+            backend is not None
+            and shared.consume_detector_warmup_request()
+        ):
+            warmup_start = time.perf_counter()
+            try:
+                backend.self_test()
+                last_detect_s = t0
+                log.info(
+                    "[RKNN-WARMUP] chase request ready in %.2f ms",
+                    (time.perf_counter() - warmup_start) * 1000.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _escalate(f"RKNN chase-start warmup failed: {exc}")
+                break
+
         # Cheap motion gate. Prefer the hardware-scaled lores gray frame when
         # the camera publishes one (zero software downscale); otherwise fall
         # back to the full detector snapshot.
-        lores_active = shared.has_lores_gray()
         if config.motion_gating:
-            lores_gray = shared.get_lores_gray()
+            lores_gray = shared.get_lores_gray(lores_gray)
             if lores_gray is not None:
                 motion_result = motion.detect(lores_gray, gray_input=True)
             else:
@@ -338,6 +361,7 @@ def run_detector_loop(
             has_motion = motion_result.motion
         else:
             has_motion = True
+        lores_active = lores_gray is not None
 
         # Decide whether to run the model this tick (phase + cadence).
         detected_last = False
@@ -354,7 +378,34 @@ def run_detector_loop(
                     f"{config.rknn_model_path}"
                 )
                 break
-            det = backend.infer(tmp, score_threshold)
+            if hasattr(backend, "infer_all"):
+                detections = backend.infer_all(tmp, score_threshold)
+                if detections:
+                    best = max(detections, key=lambda item: item[4])
+                    det = (
+                        float(best[0]),
+                        float(best[1]),
+                        float(best[2] - best[0]),
+                        float(best[3] - best[1]),
+                        float(best[4]),
+                    )
+                else:
+                    det = (0.0, 0.0, 0.0, 0.0, 0.0)
+            else:
+                # Compatibility for simple test doubles and external backends.
+                det = backend.infer(tmp, score_threshold)
+                detections = (
+                    [(
+                        det[0],
+                        det[1],
+                        det[0] + det[2],
+                        det[1] + det[3],
+                        float(det[4]),
+                        17,
+                    )]
+                    if det[4] > 0
+                    else []
+                )
             failures = getattr(backend, "consecutive_failures", 0)
             if failures >= config.max_infer_failures:
                 _escalate(
@@ -365,6 +416,7 @@ def run_detector_loop(
             detected_last = det[4] > 0
             if detected_last:
                 last_detect_s = t0
+            shared.set_detector_detections(detections, frame_gen)
             shared.set_bbox_detector(
                 det[0], det[1], det[2], det[3], det[4], frame_gen=frame_gen
             )
@@ -382,9 +434,13 @@ def run_detector_loop(
                 shared.set_bbox_detector(
                     float(x), float(y), float(w), float(h), 1.0, frame_gen=frame_gen
                 )
+                shared.set_detector_detections(
+                    [(x, y, x + w, y + h, 1.0, 17)], frame_gen
+                )
                 detected_last = True
             else:
                 shared.set_bbox_detector(0.0, 0.0, 0.0, 0.0, 0.0, frame_gen=frame_gen)
+                shared.set_detector_detections([], frame_gen)
             stub_cycle += 1
 
         # Advance the perception phase machine.
@@ -396,6 +452,7 @@ def run_detector_loop(
         # tracker/adapters/control).  In IDLE there is nothing to track.
         if phase.phase is Phase.IDLE and not detected_last:
             shared.set_bbox_detector(0.0, 0.0, 0.0, 0.0, 0.0, frame_gen=frame_gen)
+            shared.set_detector_detections([], frame_gen)
 
         # Idle unload: release the interpreter after a quiet period.
         if (

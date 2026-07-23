@@ -38,7 +38,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from cat_follow.control.decision_engine import OBSTACLE_TOO_CLOSE_CM
+from cat_follow.safety_config import DEFAULT_OBSTACLE_TOO_CLOSE_CM
 from cat_follow.control.types import (
     RangeBackend,
     RangeState,
@@ -69,11 +69,12 @@ class RangeAdapter:
         *,
         backend: RangeBackend = RangeBackend.ULTRASONIC,
         obstacle_detected_cm: float = DEFAULT_OBSTACLE_DETECTED_CM,
-        obstacle_critical_cm: float = OBSTACLE_TOO_CLOSE_CM,
+        obstacle_critical_cm: float = DEFAULT_OBSTACLE_TOO_CLOSE_CM,
         poll_rate_hz: float = DEFAULT_POLL_RATE_HZ,
         logger: Optional[AsyncLogger] = None,
         thread_name: str = "CatFollow-RangeAdapter",
         source: str = "RangeAdapter",
+        health_error: Optional[Callable[[], Optional[BaseException]]] = None,
     ) -> None:
         if obstacle_detected_cm <= obstacle_critical_cm:
             raise ValueError(
@@ -93,9 +94,21 @@ class RangeAdapter:
         self._logger = logger
         self._thread_name = thread_name
         self._source = source
+        self._health_error = health_error
+        self._health_error_reported = False
+        self._threshold_lock = threading.Lock()
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def set_safety_thresholds(self, config) -> None:
+        """Apply runtime safety threshold updates."""
+
+        if config.obstacle_detected_cm <= config.obstacle_too_close_cm:
+            raise ValueError("obstacle_detected_cm must exceed obstacle_too_close_cm")
+        with self._threshold_lock:
+            self._obstacle_detected_cm = float(config.obstacle_detected_cm)
+            self._obstacle_critical_cm = float(config.obstacle_too_close_cm)
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -131,7 +144,7 @@ class RangeAdapter:
             new_state = RangeState(
                 timestamp_ms=int(time.time() * 1000),
                 received_ms=now,
-                fresh=True,
+                fresh=False,
                 authority=self._source,
                 backend=self._backend,
                 distance_cm=None,
@@ -143,9 +156,16 @@ class RangeAdapter:
             )
         else:
             distance_cm = float(distance)
-            obstacle_detected = distance_cm < self._obstacle_detected_cm
-            obstacle_critical = distance_cm < self._obstacle_critical_cm
-            severity = self._compute_severity(distance_cm)
+            with self._threshold_lock:
+                detected_cm = self._obstacle_detected_cm
+                critical_cm = self._obstacle_critical_cm
+            obstacle_detected = distance_cm < detected_cm
+            obstacle_critical = distance_cm < critical_cm
+            severity = self._compute_severity(
+                distance_cm,
+                obstacle_detected_cm=detected_cm,
+                obstacle_critical_cm=critical_cm,
+            )
             new_state = RangeState(
                 timestamp_ms=int(time.time() * 1000),
                 received_ms=now,
@@ -173,17 +193,43 @@ class RangeAdapter:
                 self.update()
             except Exception:
                 self._log_thread_exception()
+            self._check_source_health()
             self._stop.wait(period_s)
 
-    def _compute_severity(self, distance_cm: float) -> float:
-        if distance_cm >= self._obstacle_detected_cm:
+    @staticmethod
+    def _compute_severity(
+        distance_cm: float,
+        *,
+        obstacle_detected_cm: float,
+        obstacle_critical_cm: float,
+    ) -> float:
+        if distance_cm >= obstacle_detected_cm:
             return 0.0
-        if distance_cm <= self._obstacle_critical_cm:
+        if distance_cm <= obstacle_critical_cm:
             return 1.0
-        span = self._obstacle_detected_cm - self._obstacle_critical_cm
+        span = obstacle_detected_cm - obstacle_critical_cm
         if span <= 0:
             return 1.0
-        return (self._obstacle_detected_cm - distance_cm) / span
+        return (obstacle_detected_cm - distance_cm) / span
+
+    def _check_source_health(self) -> None:
+        if self._health_error is None or self._health_error_reported:
+            return
+        error = self._health_error()
+        if error is None:
+            return
+        self._health_error_reported = True
+        if self._logger is not None:
+            self._logger.log(
+                event_type=TelemetryEventType.THREAD_HEALTH,
+                severity=TelemetrySeverity.CRITICAL,
+                source=self._source,
+                state=None,
+                data={
+                    "event": "range_source_stopped",
+                    "error": repr(error),
+                },
+            )
 
     def _log_update(self, state: RangeState) -> None:
         if self._logger is None:

@@ -2,7 +2,7 @@
 
 The project runs a single detection backend: the RK3576 NPU via
 :class:`cat_follow.vision.rknn_backend.RknnBackend`.  There is intentionally
-no CPU/TFLite fallback -- the detector thread hard-fails when the RKNN runtime
+no software inference fallback -- the detector thread hard-fails when the RKNN runtime
 is present but the model is missing, and only runs a deterministic stub on
 machines that lack the runtime entirely (dev/CI).
 
@@ -30,6 +30,7 @@ import numpy as np
 from cat_follow.vision.rknn_backend import RknnBackend
 
 Detection = Tuple[float, float, float, float, float]
+MultiDetection = Tuple[int, int, int, int, float, int]
 
 
 class DetectionBackend(Protocol):
@@ -48,6 +49,10 @@ class DetectionBackend(Protocol):
 
     def self_test(self) -> None: ...
 
+    def infer_all(
+        self, frame_bgr: np.ndarray, score_threshold: float
+    ) -> list[MultiDetection]: ...
+
     def infer(self, frame_bgr: np.ndarray, score_threshold: float) -> Detection: ...
 
 
@@ -58,4 +63,10 @@ def create_backend(
     return RknnBackend(model_path, input_size=input_size)
 
 
-__all__ = ["DetectionBackend", "RknnBackend", "create_backend", "Detection"]
+__all__ = [
+    "DetectionBackend",
+    "RknnBackend",
+    "create_backend",
+    "Detection",
+    "MultiDetection",
+]

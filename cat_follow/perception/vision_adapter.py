@@ -23,8 +23,8 @@ matches Interface spec section 10.4 (``cat_visible_stable >= 3 frames``).
 
 Confidence
 ----------
-Per Interface spec section 5.4, V1 confidence is binary.  We emit ``1.0``
-when the prototype bbox is valid and ``0.0`` otherwise.
+The legacy tracker slot's fifth value is treated as confidence as well as
+validity (positive means visible), preserving the detector's real score.
 
 Freshness / generation
 ----------------------
@@ -183,7 +183,7 @@ class VisionAdapter:
             cat_visible=cat_visible,
             cat_visible_stable=cat_visible_stable,
             x_offset_norm=x_offset_norm,
-            confidence=1.0 if cat_visible else 0.0,
+            confidence=max(0.0, min(1.0, valid)) if cat_visible else 0.0,
             last_seen_ms=self._last_seen_ms,
         )
         self._contract_ss.update_vision(new_state)

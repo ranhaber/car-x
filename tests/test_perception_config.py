@@ -13,6 +13,7 @@ _ENV_NAMES = (
     "MOTION_MIN_AREA",
     "DETECT_FPS",
     "DETECT_INTERVAL_TRACKING",
+    "SCORE_THRESHOLD",
     "IDLE_UNLOAD_SEC",
     "WARMUP_ON_START",
     "OPENCV_THREADS_IDLE",
@@ -33,9 +34,10 @@ def _clear_env(monkeypatch):
 
 def test_defaults_are_rknn_only():
     config = load_perception_config()
-    assert config.rknn_model_path == "models/ssd_mobilenet_v2.rknn"
+    assert config.rknn_model_path == "models/yolov8n_coco_320_rk3576.rknn"
     assert config.rknn_input_size == (320, 320)
     assert config.motion_gating is True
+    assert config.score_threshold == 0.5
     assert config.opencv_threads_idle == 1
     assert config.opencv_threads_active == 4
     assert config.affinity_enabled is False
@@ -52,6 +54,7 @@ def test_env_driven_config(monkeypatch):
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_CAMERA_CORES", "4,5")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_DETECTOR_CORES", "6, 7")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_DETECT_INTERVAL_TRACKING", "3")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_SCORE_THRESHOLD", "0.65")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH", "models/cat.rknn")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_INPUT", "320,240")
 
@@ -61,6 +64,7 @@ def test_env_driven_config(monkeypatch):
     assert config.camera_cores == (4, 5)
     assert config.detector_cores == (6, 7)
     assert config.detect_interval_tracking == 3
+    assert config.score_threshold == 0.65
     assert config.rknn_model_path == "models/cat.rknn"
     assert config.rknn_input_size == (320, 240)
 
@@ -83,6 +87,12 @@ def test_below_minimum_rejected(monkeypatch, name, value):
     monkeypatch.setenv(f"CAT_FOLLOW_PERCEPTION_{name}", value)
     with pytest.raises(ValueError):
         load_perception_config()
+
+
+@pytest.mark.parametrize("value", (-0.01, 1.01, float("nan"), float("inf")))
+def test_score_threshold_must_be_finite_probability(value):
+    with pytest.raises(ValueError):
+        PerceptionConfig(score_threshold=value)
 
 
 def test_phase_idle_to_acquisition_on_motion():

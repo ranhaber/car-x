@@ -83,6 +83,48 @@ def test_bbox_detector_default_zero():
     assert result == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def test_tracked_targets_are_role_keyed_and_detached():
+    shared = _make_shared()
+    source = {
+        "PRIMARY_CAT": (7, 10.0, 20.0, 30.0, 40.0, 0.9, 0, 1.0),
+        "SECONDARY_CAT": (8, 50.0, 60.0, 20.0, 25.0, 0.8, 1, 1.0),
+    }
+    shared.set_tracked_targets(source)
+    result = shared.get_tracked_targets()
+    assert result == source
+    result.clear()
+    assert set(shared.get_tracked_targets()) == {"PRIMARY_CAT", "SECONDARY_CAT"}
+
+
+def test_tracking_snapshot_coasting_does_not_refresh_generation():
+    shared = _make_shared()
+    detected = {"PRIMARY_CAT": (7, 10, 20, 30, 40, 0.8, 0, 1, 1)}
+    shared.publish_tracking_snapshot(
+        detected, (10, 20, 30, 40, 0.8), detector_backed=True
+    )
+    _, first_bbox = shared.get_tracking_snapshot()
+
+    coasted = {"PRIMARY_CAT": (7, 12, 20, 30, 40, 0.8, 0, 1, 0)}
+    shared.publish_tracking_snapshot(
+        coasted, (12, 20, 30, 40, 0.8), detector_backed=False
+    )
+    targets, second_bbox = shared.get_tracking_snapshot()
+
+    assert targets == coasted
+    assert second_bbox[:4] == (12.0, 20.0, 30.0, 40.0)
+    assert abs(second_bbox[4] - 0.8) < 1e-6
+    assert second_bbox[5] == first_bbox[5]
+
+
+def test_lores_gray_reuses_caller_buffer():
+    shared = _make_shared()
+    shared.set_lores_gray(np.full((24, 32), 7, dtype=np.uint8))
+    first = shared.get_lores_gray()
+    second = shared.get_lores_gray(first)
+    assert second is first
+    assert np.all(second == 7)
+
+
 def test_odometry_set_get():
     shared = _make_shared()
     shared.set_odometry(1.5, 2.5, 90.0)

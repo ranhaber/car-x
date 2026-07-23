@@ -1,4 +1,4 @@
-"""Tests for the RKNN-only detection backend and camera lores config."""
+"""Tests for the YOLO RKNN backend and camera lores config."""
 
 import numpy as np
 import pytest
@@ -6,11 +6,15 @@ import pytest
 import cat_follow.vision.rknn_backend as rknn_module
 from cat_follow.camera_config import CameraConfig, load_camera_config
 from cat_follow.vision.backends import RknnBackend, create_backend
-from cat_follow.vision.ssd_postprocess import validate_ssd_output_contract
+from cat_follow.vision.yolo_postprocess import (
+    _decode_cells_dfl,
+    decode_yolov8_outputs,
+    validate_yolo_output_contract,
+)
 
 
 def test_create_backend_returns_rknn():
-    backend = create_backend("models/ssd_mobilenet_v2.rknn")
+    backend = create_backend("models/yolov8n_coco_320_rk3576.rknn")
     assert isinstance(backend, RknnBackend)
 
 
@@ -33,43 +37,67 @@ def test_rknn_backend_unavailable_without_runtime(tmp_path, monkeypatch):
     assert backend.infer(frame, 0.5) == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-def test_ssd_output_contract_accepts_four_output_ssd():
-    # boxes[1,N,4], classes[1,N], scores[1,N], count[1]
-    boxes = np.zeros((1, 10, 4), dtype=np.float32)
-    classes = np.zeros((1, 10), dtype=np.float32)
-    scores = np.zeros((1, 10), dtype=np.float32)
-    count = np.array([10.0], dtype=np.float32)
-    validate_ssd_output_contract([boxes, classes, scores, count])  # no raise
+def _empty_yolo_outputs():
+    outputs = []
+    for grid in (40, 20, 10):
+        outputs.extend(
+            [
+                np.zeros((1, 64, grid, grid), dtype=np.float32),
+                np.zeros((1, 80, grid, grid), dtype=np.float32),
+                np.zeros((1, 1, grid, grid), dtype=np.float32),
+            ]
+        )
+    return outputs
 
 
-def test_ssd_output_contract_rejects_undecoded_heads():
-    # Raw SSD heads (undecoded, wrong shape) must be rejected loudly.
-    raw = np.zeros((1, 1917, 91), dtype=np.float32)
+def test_yolo_output_contract_accepts_nine_tensor_head():
+    validate_yolo_output_contract(_empty_yolo_outputs())
+
+
+def test_yolo_output_contract_rejects_wrong_count_and_shapes():
     with pytest.raises(ValueError):
-        validate_ssd_output_contract([raw])
+        validate_yolo_output_contract([])
+    outputs = _empty_yolo_outputs()
+    outputs[0] = np.zeros((1, 4, 40, 40), dtype=np.float32)
     with pytest.raises(ValueError):
-        validate_ssd_output_contract([])
+        validate_yolo_output_contract(outputs)
 
 
-def test_ssd_output_contract_rejects_misaligned_scores():
-    # scores N must match boxes N (tensor alignment / ordering check).
-    boxes = np.zeros((1, 10, 4), dtype=np.float32)
-    classes = np.zeros((1, 10), dtype=np.float32)
-    scores = np.zeros((1, 7), dtype=np.float32)  # wrong N
-    count = np.array([10.0], dtype=np.float32)
-    with pytest.raises(ValueError):
-        validate_ssd_output_contract([boxes, classes, scores, count])
+def test_yolo_decoder_filters_to_cat_and_unletterboxes():
+    outputs = _empty_yolo_outputs()
+    # Flat DFL logits decode to a large box around this cell; only the class and
+    # contract matter here. YOLO class index 15 maps to official COCO cat 17.
+    outputs[1][0, 15, 20, 20] = 0.9
+    outputs[2][0, 0, 20, 20] = 0.9
+    detections = decode_yolov8_outputs(
+        outputs,
+        input_w=320,
+        input_h=320,
+        frame_w=640,
+        frame_h=480,
+        scale=0.5,
+        pad_x=0,
+        pad_y=40,
+        score_threshold=0.3,
+    )
+    assert len(detections) == 1
+    assert detections[0][4] == pytest.approx(0.9)
+    assert detections[0][5] == 17
 
 
-def test_ssd_output_contract_rejects_out_of_range_scores():
-    # Undecoded logits (scores outside [0, 1.5]) must be rejected: this catches
-    # a model whose output ordering / decoding does not match the contract.
-    boxes = np.zeros((1, 10, 4), dtype=np.float32)
-    classes = np.zeros((1, 10), dtype=np.float32)
-    scores = np.full((1, 10), 42.0, dtype=np.float32)
-    count = np.array([10.0], dtype=np.float32)
-    with pytest.raises(ValueError):
-        validate_ssd_output_contract([boxes, classes, scores, count])
+def test_yolo_decoder_uses_independent_non_square_strides():
+    # One DFL bin decodes every side distance to zero. Cell (row=1, col=2)
+    # on a 4x2 grid in a 320x240 input is centered at x=200, y=180.
+    branch = np.zeros((1, 4, 2, 4), dtype=np.float32)
+    decoded = _decode_cells_dfl(
+        branch,
+        np.asarray([6]),
+        grid_h=2,
+        grid_w=4,
+        input_w=320,
+        input_h=240,
+    )
+    assert decoded[0] == pytest.approx((200.0, 180.0, 200.0, 180.0))
 
 
 def test_camera_lores_config_defaults(monkeypatch):

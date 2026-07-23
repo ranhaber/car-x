@@ -2,11 +2,12 @@
 
 Measures average inference time for N runs on either a captured camera frame
 or a synthetic image, using the same :class:`RknnBackend` the runtime uses.
-Requires ``rknnlite`` (present on Rockchip vendor images) and a converted
-``.rknn`` model (see ``scripts/convert_to_rknn.py``).
+Requires ``rknnlite`` and the rk3576 YOLO model built with
+``scripts/convert_yolo_to_rknn.py``.
 
 Usage:
-  python scripts/benchmark_detector.py --model models/ssd_mobilenet_v2.rknn --runs 50
+  python scripts/benchmark_detector.py \
+    --model models/yolov8n_coco_320_rk3576.rknn --runs 50
 """
 
 import argparse
@@ -20,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cat_follow.vision.rknn_backend import RknnBackend
-from cat_follow.vision.ssd_postprocess import validate_ssd_output_contract
+from cat_follow.vision.yolo_postprocess import validate_yolo_output_contract
 
 
 def run_bench(
@@ -60,9 +61,9 @@ def run_bench(
     # Warmup, and in strict mode confirm the real frame also yields a valid
     # output contract (not just the dummy self-test frame).
     for _ in range(3):
-        outputs = backend._raw_infer(frame)
+        outputs, _meta = backend._raw_infer(frame)
         if strict:
-            validate_ssd_output_contract(outputs)
+            validate_yolo_output_contract(outputs)
 
     times = []
     for _ in range(runs):

@@ -1,229 +1,170 @@
-"""Tracker thread.
+"""Predictive multi-target tracker thread.
 
-Improved tracker with robust re-init logic:
-- uses OpenCV single-object tracker (KCF/CSRT/MOSSE) when available
-- maintains a short detector-history buffer for temporal confirmation
-- computes IoU between tracker and detector to decide merge vs re-init
-- enforces cooldown and smoothing to avoid thrash
-
-All frame I/O uses the pre-allocated buffers from SharedState so no
-per-frame allocations occur.
+Association runs when the detector publishes a new generation. Between detector
+ticks the thread extrapolates the current ``PRIMARY_CAT`` with constant velocity
+and republishes at the tracker poll rate so chase/control sees smooth motion.
+Only the primary role is written to the legacy ``bbox_tracker`` contract.
 """
+
+from __future__ import annotations
 
 import threading
 import time
-import math
-from typing import Optional, Tuple, List
-
-import numpy as np
+from typing import Callable, Optional
 
 from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
-from cat_follow.memory.pool import FRAME_SHAPE
+from cat_follow.multitarget import MultiTargetCoordinator
+from cat_follow.multitarget.roles import PRIMARY_CAT, SECONDARY_CAT
 
 log = get_logger("thread.tracker")
 
 
-def _create_tracker():
-    try:
-        import cv2
-    except Exception:
+def _xywh_for_state(state, *, extrapolate_fraction: float = 0.0):
+    """Translate the last box to the track centroid, optionally coasting forward."""
+    if state is None or state.bbox is None:
         return None
-
-    # Try common creators (new API or legacy)
-    creators = ["TrackerKCF_create", "TrackerCSRT_create", "TrackerMOSSE_create"]
-    for name in creators:
-        try:
-            creator = getattr(cv2, name)
-            return creator()
-        except Exception:
-            pass
-    try:
-        legacy = getattr(cv2, "legacy")
-        for name in creators:
-            try:
-                creator = getattr(legacy, name)
-                return creator()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
+    x1, y1, x2, y2 = state.bbox
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    center_x = state.centroid[0] + state.velocity[0] * extrapolate_fraction
+    center_y = state.centroid[1] + state.velocity[1] * extrapolate_fraction
+    return (
+        center_x - width / 2.0,
+        center_y - height / 2.0,
+        width,
+        height,
+    )
 
 
-def _bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    ax2 = ax + aw
-    ay2 = ay + ah
-    bx2 = bx + bw
-    by2 = by + bh
-    ix1 = max(ax, bx)
-    iy1 = max(ay, by)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    area_a = aw * ah
-    area_b = bw * bh
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
-
-
-def run_tracker_loop(shared: SharedState, stop_event: threading.Event, *, target_fps: float = 30.0) -> None:
-    tick = 1.0 / target_fps
-    frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
-    # Separate buffer holding the exact frame the detector inferred on, used to
-    # (re)initialize the tracker on the same pixels that produced the bbox.
-    det_frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
-
-    def _init_on_detector_frame(bbox_int, det_gen):
-        """Create + init a tracker on the detector's frame iff that frame's
-        generation still matches the bbox generation.
-
-        Returns the initialized tracker, or ``None`` if creation/init failed or
-        the frame/bbox generations disagree (avoids wrong-pixel init).
-        """
-        frame_gen = shared.get_detector_frame_and_gen(det_frame_buf)
-        if det_gen < 0 or det_gen != frame_gen:
-            # The published detector frame no longer matches this bbox; skip
-            # this cycle rather than initializing on mismatched pixels.
-            return None
-        try:
-            trk = _create_tracker()
-            if trk.init(det_frame_buf, bbox_int):
-                return trk
-        except Exception as e:  # noqa: BLE001
-            log.warning("Tracker init failed: %s", e)
+def _target_snapshot(state, bbox, *, detector_backed: bool):
+    if state is None or bbox is None:
         return None
+    return (
+        state.track_id,
+        bbox[0],
+        bbox[1],
+        bbox[2],
+        bbox[3],
+        state.confidence,
+        (
+            state.frames_since_update
+            if detector_backed
+            else max(1, state.frames_since_update)
+        ),
+        1.0,
+        1.0 if detector_backed else 0.0,
+    )
 
-    # Tracker instance
-    tracker = None
 
-    # Re-init / confirmation parameters
-    last_reinit = 0.0
-    REINIT_COOLDOWN = 0.5
-    DET_HISTORY_WINDOW = 1.0
-    DET_CONFIRM_N = 2
-    DET_CONFIRM_IOU = 0.5
-    IOU_REINIT_HIGH = 0.6
-    IOU_REINIT_LOW = 0.2
-
-    det_history: List[Tuple[Tuple[float, float, float, float], float]] = []
-
-    tracker_creator = _create_tracker()
-    if tracker_creator is None:
-        log.info("OpenCV trackers unavailable; tracker will publish detector bboxes only.")
-
-    log.info("Tracker loop started (target %.0f FPS).", target_fps)
+def run_tracker_loop(
+    shared: SharedState,
+    stop_event: threading.Event,
+    *,
+    target_fps: float = 30.0,
+    on_fps: Optional[Callable[[float], None]] = None,
+) -> None:
+    """Associate detector results and publish the current primary cat."""
+    coordinator = MultiTargetCoordinator()
+    tick = 1.0 / max(1.0, target_fps)
+    last_generation = None
+    last_observation_at = None
+    observation_interval = None
+    fps_counter = 0
+    fps_timer = time.monotonic()
+    log.info("PredictiveTracker loop started (poll target %.0f FPS).", target_fps)
 
     while not stop_event.is_set():
-        t0 = time.monotonic()
+        started = time.monotonic()
+        fps_counter += 1
+        detections, generation = shared.get_detector_detections_with_gen()
 
-        # Read latest frame
-        shared.get_frame_latest(frame_buf)
+        if generation >= 0:
+            observation_key = ("multi", generation)
+            observation = detections
+        else:
+            # Backward-compatible path for tests or producers that publish only
+            # the old single detector bbox.
+            legacy = shared.get_bbox_detector_with_gen()
+            observation_key = ("legacy", legacy)
+            observation = (
+                (
+                    legacy[0],
+                    legacy[1],
+                    legacy[0] + legacy[2],
+                    legacy[1] + legacy[3],
+                    1.0,
+                    17,
+                ),
+            ) if legacy[4] > 0 else ()
+
+        detector_backed_update = observation_key != last_generation
+        if detector_backed_update:
+            last_generation = observation_key
+            coordinator.update(observation)
+            if last_observation_at is not None:
+                observation_interval = max(tick, started - last_observation_at)
+            last_observation_at = started
+
+        # Tracker velocity is measured in pixels per detector observation, not
+        # pixels per 30 Hz poll. Scale elapsed wall time by the measured detector
+        # interval and cap prediction to one observation ahead.
+        extrapolate_fraction = 0.0
+        if last_observation_at is not None and observation_interval is not None:
+            extrapolate_fraction = min(
+                1.0,
+                max(0.0, (started - last_observation_at) / observation_interval),
+            )
+
+        role_targets = {}
+        role_bboxes = {}
+        for role in (PRIMARY_CAT, SECONDARY_CAT):
+            state = coordinator.state_for_role(role)
+            bbox = _xywh_for_state(
+                state,
+                extrapolate_fraction=extrapolate_fraction,
+            )
+            target = _target_snapshot(
+                state,
+                bbox,
+                detector_backed=(
+                    detector_backed_update
+                    and state is not None
+                    and state.frames_since_update == 0
+                ),
+            )
+            if target is not None:
+                role_targets[role] = target
+                role_bboxes[role] = bbox
+        primary = role_bboxes.get(PRIMARY_CAT)
+        if primary is None:
+            primary_bbox = (0.0, 0.0, 0.0, 0.0, 0.0)
+            primary_detector_backed = detector_backed_update
+        else:
+            primary_state = coordinator.state_for_role(PRIMARY_CAT)
+            confidence = max(0.0, min(1.0, float(primary_state.confidence)))
+            primary_bbox = (*primary, confidence)
+            primary_detector_backed = (
+                detector_backed_update
+                and primary_state.frames_since_update == 0
+            )
+        shared.publish_tracking_snapshot(
+            role_targets,
+            primary_bbox,
+            detector_backed=primary_detector_backed,
+        )
+
         now = time.monotonic()
+        if now - fps_timer >= 1.0:
+            if on_fps is not None:
+                try:
+                    on_fps(fps_counter / (now - fps_timer))
+                except Exception:  # noqa: BLE001
+                    log.exception("Tracker FPS callback failed.")
+            fps_counter = 0
+            fps_timer = now
 
-        # Read detector bbox (with its frame generation) and maintain short
-        # history for confirmation.
-        det_wg = shared.get_bbox_detector_with_gen()
-        det = det_wg[:5]
-        det_gen = det_wg[5]
-        if det[4] > 0:
-            det_bbox = (float(det[0]), float(det[1]), float(det[2]), float(det[3]))
-            det_history.append((det_bbox, now))
-        # prune history
-        det_history = [(b, ts) for (b, ts) in det_history if now - ts <= DET_HISTORY_WINDOW]
+        elapsed = now - started
+        stop_event.wait(max(0.0, tick - elapsed))
 
-        # Current tracker snapshot
-        tr = shared.get_bbox_tracker()
-        tr_valid = tr[4] > 0
-        tr_bbox = (float(tr[0]), float(tr[1]), float(tr[2]), float(tr[3])) if tr_valid else None
-
-        # If we have no active tracker, attempt confirmed re-init from detector
-        if tracker is None:
-            confirmed = False
-            if len(det_history) >= DET_CONFIRM_N:
-                matches = 0
-                for i in range(len(det_history) - 1):
-                    if _bbox_iou(det_history[i][0], det_history[i + 1][0]) >= DET_CONFIRM_IOU:
-                        matches += 1
-                if matches >= (DET_CONFIRM_N - 1):
-                    confirmed = True
-            if det[4] > 0 and confirmed and (now - last_reinit) >= REINIT_COOLDOWN:
-                x, y, w, h = det_history[-1][0]
-                bbox = (int(x), int(y), int(w), int(h))
-                if tracker_creator is not None:
-                    tracker = _init_on_detector_frame(bbox, det_gen)
-                    if tracker is not None:
-                        shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
-                        last_reinit = now
-                        log.info("Tracker initialized from confirmed detector bbox: %s", str(bbox))
-                else:
-                    # no OpenCV available; publish detector bbox directly
-                    shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
-                    last_reinit = now
-
-        # If we have a tracker, try updating it
-        if tracker is not None:
-            try:
-                ok, newbox = tracker.update(frame_buf)
-            except Exception:
-                ok = False
-                newbox = None
-
-            if ok and newbox is not None:
-                nx, ny, nw, nh = newbox
-                shared.set_bbox_tracker(float(nx), float(ny), float(nw), float(nh), 1.0)
-                # Refresh the local tracker bbox so the IoU/fuse step below uses
-                # the *updated* box, not the pre-update snapshot (which would
-                # pull the published box backward).
-                tr_bbox = (float(nx), float(ny), float(nw), float(nh))
-                tr_valid = True
-            else:
-                # tracking failed -> mark invalid and drop tracker to allow re-init
-                shared.set_bbox_tracker(0.0, 0.0, 0.0, 0.0, 0.0)
-                tracker = None
-                tr_bbox = None
-                tr_valid = False
-
-        # If tracker exists and detector is present, decide whether to fuse or re-init
-        if tracker is not None and det[4] > 0 and tr_bbox is not None:
-            det_bbox = det_history[-1][0] if det_history else (float(det[0]), float(det[1]), float(det[2]), float(det[3]))
-            iou = _bbox_iou(tr_bbox, det_bbox)
-            if iou >= IOU_REINIT_HIGH:
-                # strong agreement -> smooth towards detector bbox
-                alpha = 0.4
-                fused = (
-                    tr_bbox[0] * (1 - alpha) + det_bbox[0] * alpha,
-                    tr_bbox[1] * (1 - alpha) + det_bbox[1] * alpha,
-                    tr_bbox[2] * (1 - alpha) + det_bbox[2] * alpha,
-                    tr_bbox[3] * (1 - alpha) + det_bbox[3] * alpha,
-                )
-                shared.set_bbox_tracker(float(fused[0]), float(fused[1]), float(fused[2]), float(fused[3]), 1.0)
-            elif iou < IOU_REINIT_LOW and (now - last_reinit) >= REINIT_COOLDOWN:
-                # strong disagreement -> re-init only if detector is confirmed
-                confirmed = False
-                if len(det_history) >= DET_CONFIRM_N:
-                    matches = 0
-                    for i in range(len(det_history) - 1):
-                        if _bbox_iou(det_history[i][0], det_history[i + 1][0]) >= DET_CONFIRM_IOU:
-                            matches += 1
-                    if matches >= (DET_CONFIRM_N - 1):
-                        confirmed = True
-                if confirmed:
-                    x, y, w, h = det_history[-1][0]
-                    bbox = (int(x), int(y), int(w), int(h))
-                    tracker = _init_on_detector_frame(bbox, det_gen)
-                    if tracker is not None:
-                        shared.set_bbox_tracker(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), 1.0)
-                        last_reinit = now
-                        log.info("Tracker re-initialized after disagreement: %s", str(bbox))
-
-        # If no tracker and no detector, ensure bbox invalid
-        if tracker is None and det[4] == 0:
-            shared.set_bbox_tracker(0.0, 0.0, 0.0, 0.0, 0.0)
-
-        elapsed = time.monotonic() - t0
-        time.sleep(max(0.0, tick - elapsed))
+    log.info("PredictiveTracker loop stopped.")

@@ -1,6 +1,6 @@
 """Memory reclamation helpers for the perception pipeline.
 
-When a heavy interpreter (TFLite/XNNPACK or RKNN) is unloaded during idle
+When the RKNN runtime is unloaded during idle
 periods, Python's garbage collector reclaims the objects but glibc may keep
 the freed arena mapped.  Calling ``malloc_trim(0)`` returns that arena to the
 OS, which matters on a memory-constrained SBC running alongside ROS2/Nav2.

@@ -30,8 +30,11 @@ class SharedState:
 
         # One lock per logical resource
         self._lock_frame = threading.Lock()
-        self._lock_bbox_tracker = threading.Lock()
+        self._lock_tracking = threading.Lock()
+        self._lock_bbox_tracker = self._lock_tracking
         self._lock_bbox_detector = threading.Lock()
+        self._lock_detector_detections = threading.Lock()
+        self._lock_tracked_targets = self._lock_tracking
         self._lock_odometry = threading.Lock()
 
         # Legacy detector-model selection slot. Detection is now RKNN-only and
@@ -58,6 +61,15 @@ class SharedState:
         # saw rather than a later ``frame_latest`` (avoids wrong-pixel init).
         self._detector_frame_gen = 0
         self._bbox_detector_gen = -1
+        # Full post-NMS detection set consumed by PredictiveTracker. Tuples are
+        # immutable snapshots, so readers never share mutable detector data.
+        self._detector_detections = ()
+        self._detector_detections_gen = -1
+        # Role -> immutable target snapshot:
+        # (track_id, x, y, w, h, confidence, frames_since_update, valid,
+        #  detector_backed). The final field is optional for compatibility.
+        # PRIMARY_CAT remains mirrored to bbox_tracker for behavior consumers.
+        self._tracked_targets = {}
         # Monotonic generation for the tracker bbox, bumped on every publish.
         # The vision adapter keys stability/freshness off *changes* in this
         # generation so a frozen tracker (dead thread) ages out instead of the
@@ -69,7 +81,23 @@ class SharedState:
         self._lock_lores = threading.Lock()
         self._lores_gray = None
 
+        # Edge-triggered request from an accepted START_CHASE command. The
+        # detector consumes it and loads/warmups the lazily-unloaded RKNN model
+        # before the next detection.
+        self._detector_warmup_requested = threading.Event()
+
     # ── frame_latest ─────────────────────────────────────────────────
+
+    def request_detector_warmup(self) -> None:
+        """Request asynchronous RKNN load/warmup on the detector thread."""
+        self._detector_warmup_requested.set()
+
+    def consume_detector_warmup_request(self) -> bool:
+        """Return and clear a pending detector warmup request."""
+        if not self._detector_warmup_requested.is_set():
+            return False
+        self._detector_warmup_requested.clear()
+        return True
 
     def set_frame_latest(self, src: np.ndarray) -> None:
         """Copy *src* into the next write slot and publish it as latest.
@@ -127,13 +155,12 @@ class SharedState:
             np.copyto(dst, self._pool.frame_for_detector)
 
     def snapshot_detector_frame(self, dst: np.ndarray) -> int:
-        """Atomically publish ``frame_latest`` → ``frame_for_detector``, copy it
-        into *dst*, and return the new detector-frame generation.
+        """Atomically copy ``frame_latest`` directly into *dst* and return the
+        new detector-frame generation.
 
-        Doing the publish + read under a single ``_lock_frame`` acquisition (and
-        bumping the generation) guarantees the returned generation identifies
-        exactly the frame now in *dst*, so a bbox the detector produces from
-        *dst* can be tagged with a generation the tracker can match.
+        This is one full-frame copy, rather than staging through
+        ``frame_for_detector``. The legacy staging APIs remain available to
+        callers that explicitly use them.
         """
         if dst.shape != FRAME_SHAPE:
             raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
@@ -142,15 +169,11 @@ class SharedState:
 
         with self._lock_frame:
             if self._latest_idx < 0:
-                self._pool.frame_for_detector.fill(0)
+                dst.fill(0)
             else:
-                np.copyto(
-                    self._pool.frame_for_detector,
-                    self._pool.frame_ring[self._latest_idx],
-                )
+                np.copyto(dst, self._pool.frame_ring[self._latest_idx])
             self._detector_frame_gen += 1
             gen = self._detector_frame_gen
-            np.copyto(dst, self._pool.frame_for_detector)
         return gen
 
     def get_detector_frame_and_gen(self, dst: np.ndarray) -> int:
@@ -198,16 +221,35 @@ class SharedState:
     # ── bbox_tracker ─────────────────────────────────────────────────
 
     def set_bbox_tracker(
-        self, x: float, y: float, w: float, h: float, valid: float
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        valid: float,
+        *,
+        refresh_generation: bool = True,
     ) -> None:
-        """Write tracker bbox into the pre-allocated array under lock."""
+        """Write tracker bbox, optionally marking it as a fresh observation."""
         with self._lock_bbox_tracker:
-            buf = self._pool.bbox_tracker
-            buf[0] = x
-            buf[1] = y
-            buf[2] = w
-            buf[3] = h
-            buf[4] = valid
+            self._write_bbox_tracker(x, y, w, h, valid, refresh_generation)
+
+    def _write_bbox_tracker(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        valid: float,
+        refresh_generation: bool,
+    ) -> None:
+        buf = self._pool.bbox_tracker
+        buf[0] = x
+        buf[1] = y
+        buf[2] = w
+        buf[3] = h
+        buf[4] = valid
+        if refresh_generation:
             self._bbox_tracker_gen += 1
 
     def get_bbox_tracker(self) -> Tuple[float, float, float, float, float]:
@@ -276,6 +318,89 @@ class SharedState:
             return (float(buf[0]), float(buf[1]), float(buf[2]),
                     float(buf[3]), float(buf[4]), int(self._bbox_detector_gen))
 
+    def set_detector_detections(self, detections, frame_gen: int) -> None:
+        """Publish all ``(x1,y1,x2,y2,confidence,class_id)`` detections."""
+        snapshot = tuple(
+            (
+                float(det[0]),
+                float(det[1]),
+                float(det[2]),
+                float(det[3]),
+                float(det[4]),
+                int(det[5]),
+            )
+            for det in detections
+        )
+        with self._lock_detector_detections:
+            self._detector_detections = snapshot
+            self._detector_detections_gen = int(frame_gen)
+
+    def get_detector_detections_with_gen(self):
+        """Return the immutable full detection snapshot and its frame generation."""
+        with self._lock_detector_detections:
+            return self._detector_detections, self._detector_detections_gen
+
+    def set_tracked_targets(self, targets) -> None:
+        """Publish immutable PRIMARY_CAT/SECONDARY_CAT tracking snapshots."""
+        snapshot = self._tracked_targets_snapshot(targets)
+        with self._lock_tracked_targets:
+            self._tracked_targets = snapshot
+
+    @staticmethod
+    def _tracked_targets_snapshot(targets) -> dict:
+        snapshot = {}
+        for role, target in targets.items():
+            values = (
+                int(target[0]),
+                float(target[1]),
+                float(target[2]),
+                float(target[3]),
+                float(target[4]),
+                float(target[5]),
+                int(target[6]),
+                float(target[7]),
+            )
+            if len(target) > 8:
+                values += (float(target[8]),)
+            snapshot[str(role)] = values
+        return snapshot
+
+    def publish_tracking_snapshot(
+        self,
+        targets,
+        bbox: Tuple[float, float, float, float, float],
+        *,
+        detector_backed: bool,
+    ) -> None:
+        """Atomically publish role targets and the legacy primary bbox.
+
+        Prediction-only/coasting publications update display coordinates but
+        do not advance the observation generation consumed by VisionAdapter.
+        """
+        snapshot = self._tracked_targets_snapshot(targets)
+        with self._lock_tracking:
+            self._tracked_targets = snapshot
+            self._write_bbox_tracker(*bbox, detector_backed)
+
+    def get_tracking_snapshot(self):
+        """Return role targets and generation-aware primary bbox atomically."""
+        with self._lock_tracking:
+            buf = self._pool.bbox_tracker
+            bbox = (
+                float(buf[0]),
+                float(buf[1]),
+                float(buf[2]),
+                float(buf[3]),
+                float(buf[4]),
+                int(self._bbox_tracker_gen),
+            )
+            return dict(self._tracked_targets), bbox
+
+    def get_tracked_targets(self) -> dict:
+        """Return a detached role-to-target snapshot."""
+        with self._lock_tracked_targets:
+            return dict(self._tracked_targets)
+
     # ── odometry ─────────────────────────────────────────────────────
 
     def set_odometry(self, x: float, y: float, heading_deg: float) -> None:
@@ -305,12 +430,21 @@ class SharedState:
                 self._lores_gray = np.empty(gray.shape, dtype=np.uint8)
             np.copyto(self._lores_gray, gray)
 
-    def get_lores_gray(self) -> "np.ndarray | None":
-        """Return a copy of the latest lores gray frame, or None if unset."""
+    def get_lores_gray(
+        self, dst: "np.ndarray | None" = None
+    ) -> "np.ndarray | None":
+        """Copy lores gray into reusable *dst*, allocating only when needed."""
         with self._lock_lores:
             if self._lores_gray is None:
                 return None
-            return self._lores_gray.copy()
+            if (
+                dst is None
+                or dst.shape != self._lores_gray.shape
+                or dst.dtype != self._lores_gray.dtype
+            ):
+                dst = np.empty_like(self._lores_gray)
+            np.copyto(dst, self._lores_gray)
+            return dst
 
     def has_lores_gray(self) -> bool:
         """Return True if a lores gray frame has been published."""
@@ -319,7 +453,7 @@ class SharedState:
 
     # ── detector model selection ──────────────────────────────────────
     def set_detector_model(self, model_key: str) -> None:
-        """Set the active detector model key (e.g. 'ssd_mobilenet_v2')."""
+        """Set the active detector model key (currently ``rknn``)."""
         with self._lock_detector_model:
             self._detector_model = str(model_key)
 

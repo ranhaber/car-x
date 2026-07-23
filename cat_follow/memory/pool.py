@@ -23,9 +23,9 @@ FRAME_NBYTES: int = FRAME_H * FRAME_W * FRAME_C  # 921 600
 FRAME_RING_N: int = 3
 
 # ---------------------------------------------------------------------------
-# Bbox layout: 5 floats  [x, y, w, h, valid]
+# Bbox layout: 5 floats  [x, y, w, h, confidence/valid]
 #   indices 0-3 : bounding-box (x, y, width, height) in pixels
-#   index   4   : valid flag (1.0 = bbox is current, 0.0 = no detection)
+#   index   4   : confidence; any positive value means the bbox is valid
 # ---------------------------------------------------------------------------
 BBOX_LEN: int = 5
 
