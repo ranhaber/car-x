@@ -5,26 +5,28 @@ Measures **only** ``RKNNLite.inference()`` time on the ROCK 4D. Host
 preprocess (letterbox / color convert) and YOLO postprocess are excluded so
 the numbers reflect NPU invoke cost alone.
 
-Compares four combinations when the matching ``.rknn`` files are present:
+Compares FP and INT8 variants when the matching ``.rknn`` files are present:
 
-  - YOLOv8n 320x320
-  - YOLOv8n 640x640
-  - YOLOv8s 320x320
-  - YOLOv8s 640x640
+  - YOLOv8n/s @ 320/640, FP (``*_rk3576.rknn``)
+  - YOLOv8n/s @ 320/640, INT8 (``*_rk3576_int8.rknn``)
 
 Default filenames under ``--models-dir`` (override with explicit flags)::
 
-    yolov8n_coco_320_rk3576.rknn
-    yolov8n_coco_640_rk3576.rknn
-    yolov8s_coco_320_rk3576.rknn
-    yolov8s_coco_640_rk3576.rknn
+    yolov8n_coco_320_rk3576.rknn / yolov8n_coco_320_rk3576_int8.rknn
+    yolov8n_coco_640_rk3576.rknn / yolov8n_coco_640_rk3576_int8.rknn
+    yolov8s_coco_320_rk3576.rknn / yolov8s_coco_320_rk3576_int8.rknn
+    yolov8s_coco_640_rk3576.rknn / yolov8s_coco_640_rk3576_int8.rknn
 
-Build missing models on x86 / WSL with::
+Build on x86 / WSL with::
 
-    python scripts/convert_yolo_to_rknn.py \\
-      --onnx yolov8n_320.onnx \\
-      --output models/yolov8n_coco_320_rk3576.rknn \\
-      --platform rk3576 --no-quant
+    # FP (keep for accuracy A/B)
+    python scripts/convert_yolo_to_rknn.py --onnx yolov8n_320.onnx \\
+      --output models/yolov8n_coco_320_rk3576.rknn --platform rk3576 --no-quant
+
+    # INT8 (needs calibration image list)
+    python scripts/convert_yolo_to_rknn.py --onnx yolov8n_320.onnx \\
+      --output models/yolov8n_coco_320_rk3576_int8.rknn --platform rk3576 \\
+      --dataset calib.txt
 
 Run on the ROCK 4D (needs ``rknnlite``)::
 
@@ -49,6 +51,7 @@ class ModelSpec:
     label: str
     family: str  # n | s
     size: int  # 320 | 640
+    dtype: str  # fp | int8
     path: str
 
 
@@ -155,32 +158,51 @@ def benchmark_model(
 
 def _default_specs(models_dir: str) -> List[ModelSpec]:
     naming = (
-        ("YOLOv8n 320", "n", 320, "yolov8n_coco_320_rk3576.rknn"),
-        ("YOLOv8n 640", "n", 640, "yolov8n_coco_640_rk3576.rknn"),
-        ("YOLOv8s 320", "s", 320, "yolov8s_coco_320_rk3576.rknn"),
-        ("YOLOv8s 640", "s", 640, "yolov8s_coco_640_rk3576.rknn"),
+        ("YOLOv8n 320 FP", "n", 320, "fp", "yolov8n_coco_320_rk3576.rknn"),
+        ("YOLOv8n 320 INT8", "n", 320, "int8", "yolov8n_coco_320_rk3576_int8.rknn"),
+        ("YOLOv8n 640 FP", "n", 640, "fp", "yolov8n_coco_640_rk3576.rknn"),
+        ("YOLOv8n 640 INT8", "n", 640, "int8", "yolov8n_coco_640_rk3576_int8.rknn"),
+        ("YOLOv8s 320 FP", "s", 320, "fp", "yolov8s_coco_320_rk3576.rknn"),
+        ("YOLOv8s 320 INT8", "s", 320, "int8", "yolov8s_coco_320_rk3576_int8.rknn"),
+        ("YOLOv8s 640 FP", "s", 640, "fp", "yolov8s_coco_640_rk3576.rknn"),
+        ("YOLOv8s 640 INT8", "s", 640, "int8", "yolov8s_coco_640_rk3576_int8.rknn"),
     )
     return [
         ModelSpec(
             label=label,
             family=family,
             size=size,
+            dtype=dtype,
             path=os.path.join(models_dir, filename),
         )
-        for label, family, size, filename in naming
+        for label, family, size, dtype, filename in naming
     ]
 
 
 def _resolve_specs(args: argparse.Namespace) -> List[ModelSpec]:
-    defaults = { (s.family, s.size): s for s in _default_specs(args.models_dir) }
-    overrides = {
-        ("n", 320): args.n320,
-        ("n", 640): args.n640,
-        ("s", 320): args.s320,
-        ("s", 640): args.s640,
+    defaults = {
+        (s.family, s.size, s.dtype): s for s in _default_specs(args.models_dir)
     }
+    overrides = {
+        ("n", 320, "fp"): args.n320,
+        ("n", 320, "int8"): args.n320_int8,
+        ("n", 640, "fp"): args.n640,
+        ("n", 640, "int8"): args.n640_int8,
+        ("s", 320, "fp"): args.s320,
+        ("s", 320, "int8"): args.s320_int8,
+        ("s", 640, "fp"): args.s640,
+        ("s", 640, "int8"): args.s640_int8,
+    }
+    wanted_dtypes = {"fp", "int8"}
+    if args.dtype == "fp":
+        wanted_dtypes = {"fp"}
+    elif args.dtype == "int8":
+        wanted_dtypes = {"int8"}
+
     specs: List[ModelSpec] = []
     for key, default in defaults.items():
+        if default.dtype not in wanted_dtypes:
+            continue
         override = overrides[key]
         path = override if override else default.path
         specs.append(
@@ -188,6 +210,7 @@ def _resolve_specs(args: argparse.Namespace) -> List[ModelSpec]:
                 label=default.label,
                 family=default.family,
                 size=default.size,
+                dtype=default.dtype,
                 path=path,
             )
         )
@@ -198,17 +221,18 @@ def _print_table(results: Iterable[BenchResult], missing: Sequence[ModelSpec]) -
     rows = list(results)
     print()
     print("NPU-only timing (RKNNLite.inference, excludes preprocess/postprocess)")
-    print("-" * 88)
+    print("-" * 98)
     header = (
-        f"{'Model':<14} {'Size':>7} {'Runs':>5} "
+        f"{'Model':<18} {'Dtype':>5} {'Size':>5} {'Runs':>5} "
         f"{'Mean':>8} {'Median':>8} {'P95':>8} {'Min':>8} {'Max':>8} {'FPS':>7}"
     )
     print(header)
-    print("-" * 88)
+    print("-" * 98)
     for result in rows:
         print(
-            f"{result.spec.family.upper():<14} "
-            f"{result.spec.size:>7} "
+            f"{result.spec.family.upper():<18} "
+            f"{result.spec.dtype.upper():>5} "
+            f"{result.spec.size:>5} "
             f"{result.runs:>5} "
             f"{result.mean_ms:>7.2f}ms "
             f"{result.median_ms:>7.2f}ms "
@@ -217,15 +241,15 @@ def _print_table(results: Iterable[BenchResult], missing: Sequence[ModelSpec]) -
             f"{result.max_ms:>7.2f}ms "
             f"{result.fps:>7.1f}"
         )
-    print("-" * 88)
+    print("-" * 98)
 
     if missing:
         print("Missing models (skipped):")
         for spec in missing:
             print(f"  - {spec.label}: {spec.path}")
         print(
-            "Build them with scripts/convert_yolo_to_rknn.py "
-            "--platform rk3576 --no-quant"
+            "Build FP with --no-quant; INT8 with --dataset <calib.txt> "
+            "(scripts/convert_yolo_to_rknn.py --platform rk3576)"
         )
 
     if len(rows) >= 2:
@@ -236,7 +260,7 @@ def _print_table(results: Iterable[BenchResult], missing: Sequence[ModelSpec]) -
             ratio = result.mean_ms / baseline.mean_ms
             marker = "  (baseline)" if result is baseline else ""
             print(
-                f"  {result.spec.label:<14} "
+                f"  {result.spec.label:<18} "
                 f"{result.mean_ms:7.2f} ms  "
                 f"x{ratio:5.2f}{marker}"
             )
@@ -250,12 +274,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--models-dir",
         default="models",
-        help="Directory with default yolov8{n,s}_coco_{320,640}_rk3576.rknn names",
+        help="Directory with default yolov8{n,s}_coco_{320,640}_rk3576[_int8].rknn names",
     )
-    parser.add_argument("--n320", default=None, help="Override path for YOLOv8n 320")
-    parser.add_argument("--n640", default=None, help="Override path for YOLOv8n 640")
-    parser.add_argument("--s320", default=None, help="Override path for YOLOv8s 320")
-    parser.add_argument("--s640", default=None, help="Override path for YOLOv8s 640")
+    parser.add_argument(
+        "--dtype",
+        choices=("all", "fp", "int8"),
+        default="all",
+        help="Which precision variants to include (default: all present)",
+    )
+    parser.add_argument("--n320", default=None, help="Override path for YOLOv8n 320 FP")
+    parser.add_argument("--n640", default=None, help="Override path for YOLOv8n 640 FP")
+    parser.add_argument("--s320", default=None, help="Override path for YOLOv8s 320 FP")
+    parser.add_argument("--s640", default=None, help="Override path for YOLOv8s 640 FP")
+    parser.add_argument(
+        "--n320-int8", default=None, help="Override path for YOLOv8n 320 INT8"
+    )
+    parser.add_argument(
+        "--n640-int8", default=None, help="Override path for YOLOv8n 640 INT8"
+    )
+    parser.add_argument(
+        "--s320-int8", default=None, help="Override path for YOLOv8s 320 INT8"
+    )
+    parser.add_argument(
+        "--s640-int8", default=None, help="Override path for YOLOv8s 640 INT8"
+    )
     parser.add_argument("--runs", type=int, default=100, help="Timed runs per model")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs per model")
     args = parser.parse_args(argv)

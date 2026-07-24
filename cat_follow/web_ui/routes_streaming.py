@@ -10,7 +10,8 @@ from flask import Blueprint, Response
 
 import numpy as np
 
-from cat_follow.memory.pool import FRAME_SHAPE
+from cat_follow.memory.pool import FRAME_BGR_SHAPE, FRAME_H, FRAME_W
+from cat_follow.vision.nv12_utils import nv12_to_bgr
 
 streaming_bp = Blueprint("streaming", __name__)
 
@@ -66,8 +67,7 @@ def _generate_mjpeg():
     except ImportError:
         _has_cv2 = False
 
-    frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
-    display = np.empty(FRAME_SHAPE, dtype=np.uint8)
+    display = np.empty(FRAME_BGR_SHAPE, dtype=np.uint8)
     target_fps = 10.0
     tick = 1.0 / target_fps
     fps_counter = 0
@@ -83,7 +83,17 @@ def _generate_mjpeg():
                 time.sleep(tick)
                 continue
 
-            _ctx.shared.get_frame_latest(frame_buf)
+            frame_lease = _ctx.shared.acquire_latest_frame()
+            if frame_lease is None:
+                time.sleep(tick)
+                continue
+            with frame_lease:
+                if _has_cv2:
+                    # Convert only for an active viewer. Detection remains
+                    # independent of this optional BGR monitoring boundary.
+                    nv12_to_bgr(
+                        frame_lease.frame, FRAME_W, FRAME_H, dst=display
+                    )
             bbox = _ctx.shared.get_bbox_tracker()
             tracked_targets = _ctx.shared.get_tracked_targets()
             state_name = "unknown"
@@ -94,7 +104,6 @@ def _generate_mjpeg():
             target_w, target_h = _ctx.resolution_options[res_key]
 
             if _has_cv2:
-                np.copyto(display, frame_buf)
                 if tracked_targets:
                     colors = {
                         "PRIMARY_CAT": (0, 255, 0),

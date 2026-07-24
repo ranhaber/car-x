@@ -109,6 +109,8 @@ def test_status_prototype_mode(monkeypatch):
     assert data["tracked_targets"]["PRIMARY_CAT"]["track_id"] == 1
     assert data["tracked_targets"]["SECONDARY_CAT"]["confidence"] == 0.8
     assert data["cats"]["PRIMARY_CAT"]["track_id"] == 1
+    assert data["cat_injection"]["enabled"] is False
+    assert data["cat_injection"]["detection_fallback"] is False
 
 
 def test_status_contract_mode(monkeypatch):

@@ -13,6 +13,7 @@ _ENV_NAMES = (
     "HEIGHT",
     "PIXEL_FORMAT",
     "BACKEND",
+    "CAPTURE_BACKEND",
     "FPS",
 )
 
@@ -30,6 +31,7 @@ def test_default_camera_config_preserves_legacy_index_zero():
     assert (config.width, config.height) == (640, 480)
     assert config.pixel_format == ""
     assert config.backend == "default"
+    assert config.capture_backend == "opencv"
     assert config.fps == 30.0
 
 
@@ -39,6 +41,7 @@ def test_rock4d_camera_config_from_environment(monkeypatch):
     monkeypatch.setenv("CAT_FOLLOW_CAMERA_HEIGHT", "1080")
     monkeypatch.setenv("CAT_FOLLOW_CAMERA_PIXEL_FORMAT", "nv12")
     monkeypatch.setenv("CAT_FOLLOW_CAMERA_BACKEND", "V4L2")
+    monkeypatch.setenv("CAT_FOLLOW_CAMERA_CAPTURE_BACKEND", "gst_nv12")
     monkeypatch.setenv("CAT_FOLLOW_CAMERA_FPS", "30")
 
     config = load_camera_config()
@@ -47,6 +50,7 @@ def test_rock4d_camera_config_from_environment(monkeypatch):
     assert (config.width, config.height) == (1920, 1080)
     assert config.pixel_format == "NV12"
     assert config.backend == "v4l2"
+    assert config.capture_backend == "gst_nv12"
     assert config.fps == 30.0
 
 
@@ -61,37 +65,24 @@ def test_non_positive_numeric_settings_are_rejected(monkeypatch, name, value):
         load_camera_config()
 
 
-def test_raw_nv12_is_converted_and_resized(monkeypatch):
-    calls = []
+def test_unknown_capture_backend_is_rejected(monkeypatch):
+    monkeypatch.setenv("CAT_FOLLOW_CAMERA_CAPTURE_BACKEND", "mppjpeg")
+    with pytest.raises(ValueError, match="CAPTURE_BACKEND"):
+        load_camera_config()
 
-    class FakeCv2:
-        COLOR_YUV2BGR_NV12 = 1
-        INTER_AREA = 2
 
-        @staticmethod
-        def cvtColor(frame, conversion):
-            calls.append(("convert", frame.shape, conversion))
-            return np.zeros((4, 8, 3), dtype=np.uint8)
-
-        @staticmethod
-        def resize(frame, size, interpolation):
-            calls.append(("resize", size, interpolation))
-            return np.zeros((size[1], size[0], 3), dtype=np.uint8)
-
-    monkeypatch.setattr(camera_module, "cv2", FakeCv2)
+def test_raw_nv12_is_packed_without_full_frame_color_conversion():
     config = CameraConfig(
         device="/dev/video11",
-        width=8,
-        height=4,
+        width=640,
+        height=480,
         pixel_format="NV12",
         backend="v4l2",
     )
-    raw = np.zeros((6, 8), dtype=np.uint8)
+    raw = np.arange(480 * 640 * 3 // 2, dtype=np.uint8).reshape(720, 640)
 
     frame = camera_module._prepare_frame(raw, config)
 
-    assert frame.shape == (480, 640, 3)
-    assert calls == [
-        ("convert", (6, 8), FakeCv2.COLOR_YUV2BGR_NV12),
-        ("resize", (640, 480), FakeCv2.INTER_AREA),
-    ]
+    assert frame.shape == (720, 640)
+    assert np.array_equal(frame, raw)
+    assert not np.shares_memory(frame, raw)

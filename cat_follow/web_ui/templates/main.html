@@ -204,6 +204,13 @@
       primary <strong x-text="targetText('PRIMARY_CAT')"></strong>
       · secondary <strong x-text="targetText('SECONDARY_CAT')"></strong>
     </div>
+    <div style="margin-top:8px;">
+      live cat injection
+      <strong x-text="status.cat_injection && status.cat_injection.enabled ? 'ON' : 'off'"></strong>
+      <button class="btn-send" @click="toggleCatInjection()" style="margin-left:8px;">
+        <span x-text="status.cat_injection && status.cat_injection.enabled ? 'Stop injection' : 'Inject cat'"></span>
+      </button>
+    </div>
   </div>
 
   <div class="panel">
@@ -358,6 +365,7 @@ function catFollow() {
       cpu_temp: -1,
       battery_v: -1,
       perception: {},
+      cat_injection: { enabled: false, bbox: null, detection_fallback: false },
       decision: null,
       navigation: null,
       lidar: null,
@@ -814,6 +822,29 @@ function catFollow() {
         }
       } catch (e) {
         this.showFeedback('Network error', false);
+      }
+    },
+
+    async toggleCatInjection() {
+      try {
+        this.ensureControlToken();
+        const res = await fetch('/api/dev/inject_cat', {
+          method: 'POST',
+          headers: this.controlHeaders(),
+          body: JSON.stringify({ action: 'toggle' }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          this.status.cat_injection = data;
+          this.showFeedback(
+            data.enabled ? 'Live cat injection enabled' : 'Live cat injection stopped',
+            true
+          );
+        } else {
+          this.showFeedback(data.error || 'Injection request failed', false);
+        }
+      } catch (e) {
+        this.showFeedback('Injection network error', false);
       }
     },
 

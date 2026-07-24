@@ -424,10 +424,19 @@ Obstacle hysteresis must use separate assert and clear thresholds to avoid repea
 ### 11.1 Preallocated Buffers
 Use preallocated frame and inference buffers for camera frames and detector inputs. Avoid unbounded allocation in frame-rate paths.
 
+Production uses a four-slot packed-NV12 `frame_ring` with refcounted
+`FrameLease` readers and per-slot odd/even generations. Detector and stream
+readers pin slots, while the camera drops instead of overwriting pinned/latest
+slots. The detector copies only its 320×320 NV12 crop and converts it directly
+into the preallocated RGB RKNN input tensor. See
+[Frame_Ring_Ownership_Audit.md](Frame_Ring_Ownership_Audit.md) for the full
+ownership contract and ROCK 4D timing validation.
+
 Reuse ideas from:
 - current `cat_follow/memory/pool.py`
 - current `cat_follow/memory/shared_state.py`
 - `cat_ball_tracker` preallocated ring/double-buffer pattern
+- picarx Cat Dome: per-slot generation, reader-skip, owned-buffer pools for async encoders (documented in audit above)
 
 ### 11.2 Optional CPU Affinity
 CPU affinity may be enabled by configuration on Linux.

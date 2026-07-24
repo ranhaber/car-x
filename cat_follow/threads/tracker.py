@@ -16,6 +16,8 @@ from cat_follow.logger import get_logger
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.multitarget import MultiTargetCoordinator
 from cat_follow.multitarget.roles import PRIMARY_CAT, SECONDARY_CAT
+from cat_follow.perception.tuning import apply_affinity
+from cat_follow.perception_config import load_perception_config
 
 log = get_logger("thread.tracker")
 
@@ -65,6 +67,11 @@ def run_tracker_loop(
     on_fps: Optional[Callable[[float], None]] = None,
 ) -> None:
     """Associate detector results and publish the current primary cat."""
+    # Match detector affinity: production pins both to A53 detector cores.
+    perception = load_perception_config()
+    if perception.affinity_enabled:
+        apply_affinity(perception.detector_cores)
+
     coordinator = MultiTargetCoordinator()
     tick = 1.0 / max(1.0, target_fps)
     last_generation = None

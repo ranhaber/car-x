@@ -146,9 +146,21 @@ class PerceptionConfig:
     detector_cores: Tuple[int, ...] = field(default_factory=tuple)
 
     # RKNN model path and input geometry (W, H) for the NPU backend.  The input
-    # size must match the converted .rknn (YOLOv8n COCO 320x320 for rk3576).
-    rknn_model_path: str = "models/yolov8n_coco_320_rk3576.rknn"
+    # size must match the converted .rknn (YOLOv8n COCO INT8 320x320 for rk3576).
+    rknn_model_path: str = "models/yolov8n_coco_320_rk3576_int8.rknn"
     rknn_input_size: Tuple[int, int] = (320, 320)
+
+    # Animal mode: collapse confusable quadrupeds (dog/horse/sheep/cow/bear) to
+    # the cat class so a cat-sized animal counts as a cat at range, where the
+    # stock nano model cannot reliably separate cats from other quadrupeds.
+    animal_mode: bool = False
+
+    # End-to-end test mode: alpha-blend a moving cat sprite into every live
+    # camera frame before motion detection and RKNN. This injects pixels only;
+    # there is intentionally no synthetic-detection fallback.
+    inject_cat_enabled: bool = False
+    inject_cat_image: str = "models/cat_1_320.png"
+    inject_cat_speed_px_s: float = 60.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.score_threshold) or not (
@@ -177,7 +189,13 @@ def load_perception_config() -> PerceptionConfig:
         camera_cores=_core_set("CAMERA_CORES", ()),
         detector_cores=_core_set("DETECTOR_CORES", ()),
         rknn_model_path=_str(
-            "RKNN_MODEL_PATH", "models/yolov8n_coco_320_rk3576.rknn"
+            "RKNN_MODEL_PATH", "models/yolov8n_coco_320_rk3576_int8.rknn"
         ),
         rknn_input_size=_size_pair("RKNN_INPUT", (320, 320)),
+        animal_mode=_bool("ANIMAL_MODE", False),
+        inject_cat_enabled=_bool("INJECT_CAT_ENABLED", False),
+        inject_cat_image=_str("INJECT_CAT_IMAGE", "models/cat_1_320.png"),
+        inject_cat_speed_px_s=_float(
+            "INJECT_CAT_SPEED_PX_S", 60.0, minimum=0.0
+        ),
     )

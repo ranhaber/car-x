@@ -15,12 +15,15 @@ import numpy as np
 FRAME_H: int = 480
 FRAME_W: int = 640
 FRAME_C: int = 3
-FRAME_SHAPE: tuple = (FRAME_H, FRAME_W, FRAME_C)
-FRAME_NBYTES: int = FRAME_H * FRAME_W * FRAME_C  # 921 600
+FRAME_BGR_SHAPE: tuple = (FRAME_H, FRAME_W, FRAME_C)
+FRAME_NV12_SHAPE: tuple = (FRAME_H * 3 // 2, FRAME_W)
+# FRAME_SHAPE is the shared ring-slot shape. The ring stores native NV12.
+FRAME_SHAPE: tuple = FRAME_NV12_SHAPE
+FRAME_NBYTES: int = FRAME_H * FRAME_W * 3 // 2  # 460 800
 
-# Number of rotating frame buffers the camera will write into. Keep small
-# (3 is usually enough to avoid reader/writer contention).
-FRAME_RING_N: int = 3
+# Detector + MJPEG + H.264 may pin independent slots concurrently. Four slots
+# leave the single camera writer one reclaimable slot without blocking.
+FRAME_RING_N: int = 4
 
 # ---------------------------------------------------------------------------
 # Bbox layout: 5 floats  [x, y, w, h, confidence/valid]
@@ -44,10 +47,9 @@ class MemoryPool:
     the attributes (e.g. ``pool.frame_ring = new_array`` is forbidden).
     """
 
-    # Rotating ring of full-frame buffers (uint8, N x H x W x 3)
+    # Rotating ring of packed NV12 buffers (uint8, N x (H*3/2) x W)
     # Camera writes into one slot, readers read the latest published index.
     frame_ring: np.ndarray
-    frame_for_detector: np.ndarray
 
     # Two bbox arrays (float64, length 5 each)
     bbox_tracker: np.ndarray
@@ -66,10 +68,9 @@ def allocate_pool() -> MemoryPool:
     # Allocate a small ring of full-frame buffers so the camera can write
     # into a rotating slot and readers can atomically publish the latest
     # index without copying the whole frame twice.
-    frame_ring_shape = (FRAME_RING_N, FRAME_H, FRAME_W, FRAME_C)
+    frame_ring_shape = (FRAME_RING_N, *FRAME_NV12_SHAPE)
     return MemoryPool(
         frame_ring=np.zeros(frame_ring_shape, dtype=np.uint8),
-        frame_for_detector=np.zeros(FRAME_SHAPE, dtype=np.uint8),
         bbox_tracker=np.zeros(BBOX_LEN, dtype=np.float64),
         bbox_detector=np.zeros(BBOX_LEN, dtype=np.float64),
         odometry=np.zeros(ODOM_LEN, dtype=np.float64),

@@ -53,14 +53,21 @@ class DetectionBackend(Protocol):
         self, frame_bgr: np.ndarray, score_threshold: float
     ) -> list[MultiDetection]: ...
 
+    def infer_all_nv12(
+        self, frame_nv12: np.ndarray, score_threshold: float
+    ) -> list[MultiDetection]: ...
+
     def infer(self, frame_bgr: np.ndarray, score_threshold: float) -> Detection: ...
 
 
 def create_backend(
-    model_path: str, *, input_size: Tuple[int, int] = (320, 320)
+    model_path: str,
+    *,
+    input_size: Tuple[int, int] = (320, 320),
+    animal_mode: bool = False,
 ) -> RknnBackend:
     """Return the RKNN NPU detection backend (the only backend)."""
-    return RknnBackend(model_path, input_size=input_size)
+    return RknnBackend(model_path, input_size=input_size, animal_mode=animal_mode)
 
 
 __all__ = [

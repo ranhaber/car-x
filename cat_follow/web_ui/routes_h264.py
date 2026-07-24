@@ -17,10 +17,8 @@ import json
 import threading
 import time
 
-import numpy as np
-
 from cat_follow.logger import get_logger
-from cat_follow.memory.pool import FRAME_SHAPE
+from cat_follow.memory.pool import FRAME_H, FRAME_W
 
 log = get_logger("web_ui.h264")
 
@@ -63,7 +61,9 @@ def _get_encoder():
 
     with _encoder_lock:
         if _encoder is None:
-            enc = MppH264Encoder(FRAME_SHAPE[1], FRAME_SHAPE[0], fps=15)
+            enc = MppH264Encoder(
+                FRAME_W, FRAME_H, fps=15, pixel_format="NV12"
+            )
             if enc.start():
                 _encoder = enc
         return _encoder
@@ -71,7 +71,6 @@ def _get_encoder():
 
 def _serve_h264(ws) -> None:  # noqa: ANN001
     global _clients
-    frame_buf = np.empty(FRAME_SHAPE, dtype=np.uint8)
     target_fps = 15.0
     tick = 1.0 / target_fps
 
@@ -95,9 +94,14 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
                 time.sleep(tick)
                 continue
 
-            _ctx.shared.get_frame_latest(frame_buf)
-            # Encode without holding _encoder_lock — MPP encode can be slow.
-            chunk = encoder.encode(frame_buf)
+            frame_lease = _ctx.shared.acquire_latest_frame()
+            if frame_lease is None:
+                time.sleep(tick)
+                continue
+            # Encode without holding _encoder_lock. The frame-ring lease keeps
+            # these pixels stable until the synchronous appsrc copy completes.
+            with frame_lease:
+                chunk = encoder.encode(frame_lease.frame)
             if chunk:
                 ws.send(chunk)
 

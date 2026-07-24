@@ -38,7 +38,9 @@ import numpy as np
 from cat_follow.logger import get_logger
 from cat_follow.perception.memory import reclaim_memory
 from cat_follow.perception.timing import perf_ms_from
+from cat_follow.vision.nv12_utils import nv12_to_rgb
 from cat_follow.vision.yolo_postprocess import (
+    ANIMAL_CLASS_IDS_0IDX,
     decode_yolov8_outputs,
     validate_yolo_output_contract,
 )
@@ -70,9 +72,15 @@ class RknnBackend:
         model_path: str,
         *,
         input_size: Tuple[int, int] = _DEFAULT_INPUT,
+        animal_mode: bool = False,
     ) -> None:
         self._model_path = model_path
         self._in_w, self._in_h = input_size
+        # When on, collapse confusable quadrupeds (dog/sheep/cow/...) to the cat
+        # id so a cat-sized animal still counts as a cat at range.
+        self._animal_class_ids_0idx = (
+            ANIMAL_CLASS_IDS_0IDX if animal_mode else frozenset()
+        )
         self._rknn = None
         self._cv2 = None
         self._input_buf: Optional[np.ndarray] = None
@@ -147,7 +155,22 @@ class RknnBackend:
     def infer_all(
         self, frame_bgr: np.ndarray, score_threshold: float
     ) -> list[MultiDetection]:
-        """Return all post-NMS cats as ``(x1, y1, x2, y2, conf, class_id)``."""
+        """Return all post-NMS cats from a compatibility BGR input."""
+        return self._infer_all(frame_bgr, score_threshold, self._raw_infer)
+
+    def infer_all_nv12(
+        self, frame_nv12: np.ndarray, score_threshold: float
+    ) -> list[MultiDetection]:
+        """Convert packed NV12 directly to the RGB NPU tensor and infer."""
+        return self._infer_all(
+            frame_nv12, score_threshold, self._raw_infer_nv12
+        )
+
+    def _infer_all(
+        self, frame: np.ndarray, score_threshold: float, raw_infer
+    ) -> list[MultiDetection]:
+        """Run one raw-input adapter followed by shared YOLO postprocessing."""
+        self.last_perf = {}
         # A failed (re)load is a failure, not "no detection": record it so the
         # detector can escalate rather than run blind after an idle unload.
         if self._rknn is None and not self.load():
@@ -157,9 +180,9 @@ class RknnBackend:
                         self.last_error, self.consecutive_failures)
             return []
         try:
-            post_start = time.perf_counter()
-            outputs, meta = self._raw_infer(frame_bgr)
+            outputs, meta = raw_infer(frame)
             frame_w, frame_h, scale, pad_x, pad_y = meta
+            post_start = time.perf_counter()
             detections = decode_yolov8_outputs(
                 outputs,
                 input_w=self._in_w,
@@ -171,6 +194,7 @@ class RknnBackend:
                 pad_y=pad_y,
                 score_threshold=score_threshold,
                 target_class_ids=frozenset({17}),
+                animal_class_ids_0idx=self._animal_class_ids_0idx,
             )
             post_ms = (time.perf_counter() - post_start) * 1000.0
             self.last_perf["post"] = post_ms
@@ -179,7 +203,7 @@ class RknnBackend:
                 + self.last_perf.get("invoke", 0.0)
                 + post_ms
             )
-            log.info(
+            log.debug(
                 "[RKNN-PERF] t=%.2fms pre=%.2f inv=%.2f post=%.2f total=%.2f",
                 self.last_perf.get("t_ms", 0.0),
                 self.last_perf.get("pre", 0.0),
@@ -258,6 +282,31 @@ class RknnBackend:
             "invoke": (done - t_invoke) * 1000.0,
         }
         return outputs, (frame_w, frame_h, scale, pad_x, pad_y)
+
+    def _raw_infer_nv12(self, frame_nv12: np.ndarray):
+        """Convert model-sized packed NV12 directly into the RGB input tensor."""
+        if self._rknn is None and not self.load():
+            raise RuntimeError(f"RKNN backend not loaded: {self._model_path}")
+        t0 = time.perf_counter()
+        if self._input_buf is None:
+            self._input_buf = np.empty(
+                (1, self._in_h, self._in_w, 3), dtype=np.uint8
+            )
+        nv12_to_rgb(
+            frame_nv12,
+            self._in_w,
+            self._in_h,
+            dst=self._input_buf[0],
+        )
+        t_invoke = time.perf_counter()
+        outputs = self._rknn.inference(inputs=[self._input_buf])
+        done = time.perf_counter()
+        self.last_perf = {
+            "t_ms": perf_ms_from(t0),
+            "pre": (t_invoke - t0) * 1000.0,
+            "invoke": (done - t_invoke) * 1000.0,
+        }
+        return outputs, (self._in_w, self._in_h, 1.0, 0, 0)
 
     def _cv(self):
         if self._cv2 is None:

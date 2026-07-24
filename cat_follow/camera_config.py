@@ -38,6 +38,7 @@ class CameraConfig:
     height: int = 480
     pixel_format: str = ""
     backend: str = "default"
+    capture_backend: str = "opencv"
     fps: float = 30.0
 
     # Optional second (lores) stream from a hardware ISP self-path. When set,
@@ -75,6 +76,15 @@ def load_camera_config() -> CameraConfig:
             f"{_PREFIX}BACKEND must be 'default' or 'v4l2', got {backend!r}"
         )
 
+    capture_backend = os.getenv(
+        f"{_PREFIX}CAPTURE_BACKEND", "opencv"
+    ).strip().lower()
+    if capture_backend not in {"opencv", "gst_nv12"}:
+        raise ValueError(
+            f"{_PREFIX}CAPTURE_BACKEND must be 'opencv' or 'gst_nv12', "
+            f"got {capture_backend!r}"
+        )
+
     pixel_format = os.getenv(f"{_PREFIX}PIXEL_FORMAT", "").strip().upper()
     if pixel_format and len(pixel_format) != 4:
         raise ValueError(f"{_PREFIX}PIXEL_FORMAT must be a four-character code")
@@ -95,6 +105,7 @@ def load_camera_config() -> CameraConfig:
         height=_positive_int("HEIGHT", 480),
         pixel_format=pixel_format,
         backend=backend,
+        capture_backend=capture_backend,
         fps=_positive_float("FPS", 30.0),
         lores_device=lores_device,
         lores_width=_positive_int("LORES_WIDTH", 320),

@@ -1,7 +1,7 @@
 import numpy as np
 import time
 
-from cat_follow.memory.pool import allocate_pool
+from cat_follow.memory.pool import FRAME_SHAPE, allocate_pool
 from cat_follow.memory.shared_state import SharedState
 
 
@@ -10,7 +10,7 @@ def test_frame_ring_publish_and_detector_copy():
     shared = SharedState(pool)
 
     # Destination buffer to receive latest frame
-    dst = np.empty(pool.frame_for_detector.shape, dtype=np.uint8)
+    dst = np.empty(FRAME_SHAPE, dtype=np.uint8)
 
     # Publish first frame (all 11)
     write0 = shared.get_write_buffer()
@@ -29,7 +29,24 @@ def test_frame_ring_publish_and_detector_copy():
     # Ensure the two ring slots are not identical
     assert not np.array_equal(pool.frame_ring[0], pool.frame_ring[1])
 
-    # copy latest to detector frame and confirm
-    shared.copy_latest_to_detector_frame()
-    assert np.array_equal(pool.frame_for_detector, pool.frame_ring[shared._latest_idx])
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+    with lease:
+        assert np.shares_memory(lease.frame, pool.frame_ring)
+        assert np.all(lease.frame == 22)
+
+
+def test_frame_lease_carries_capture_and_publish_timestamps():
+    shared = SharedState(allocate_pool())
+    capture_started_ns = time.monotonic_ns() - 1_000_000
+
+    write = shared.get_write_buffer()
+    write.fill(0)
+    shared.publish_latest_from_write(capture_started_ns=capture_started_ns)
+
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+    with lease:
+        assert lease.capture_started_ns == capture_started_ns
+        assert lease.published_ns >= capture_started_ns
 

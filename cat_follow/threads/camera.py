@@ -2,6 +2,7 @@
 
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -13,15 +14,40 @@ except Exception:
 
 from cat_follow.camera_config import CameraConfig, load_camera_config
 from cat_follow.logger import get_logger
-from cat_follow.memory.pool import FRAME_SHAPE
+from cat_follow.memory.pool import FRAME_BGR_SHAPE, FRAME_H, FRAME_NV12_SHAPE, FRAME_W
 from cat_follow.memory.shared_state import SharedState
+from cat_follow.perception.live_cat_injector import LiveCatInjector
 from cat_follow.perception.tuning import apply_affinity
 from cat_follow.perception_config import load_perception_config
+from cat_follow.vision.nv12_utils import (
+    bgr_to_nv12,
+    nv12_to_bgr,
+    validate_nv12,
+    y_plane,
+)
 
 log = get_logger("thread.camera")
 
 
 def _open_capture(config: CameraConfig):
+    if config.capture_backend == "gst_nv12":
+        from cat_follow.vision.gst_nv12_capture import GstV4l2Nv12Capture, IO_MODE_MMAP
+
+        if config.pixel_format != "NV12":
+            raise ValueError("gst_nv12 capture requires NV12 pixel format")
+        cap = GstV4l2Nv12Capture(
+            config.device,
+            config.width,
+            config.height,
+            config.fps,
+            io_mode=IO_MODE_MMAP,
+        )
+        if cap.start():
+            return cap
+        log.warning(
+            "GStreamer NV12 capture unavailable; falling back to OpenCV."
+        )
+
     if config.backend == "v4l2":
         cap = cv2.VideoCapture(config.source, cv2.CAP_V4L2)
     else:
@@ -33,6 +59,10 @@ def _open_capture(config: CameraConfig):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
     cap.set(cv2.CAP_PROP_FPS, config.fps)
+    if config.pixel_format == "NV12":
+        # Ask OpenCV to expose the driver's packed NV12 bytes instead of
+        # eagerly converting every capture to BGR.
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     return cap
 
 
@@ -61,27 +91,39 @@ def _lores_to_gray(frame: np.ndarray, config: CameraConfig) -> np.ndarray:
     return frame
 
 
-def _prepare_frame(frame: np.ndarray, config: CameraConfig) -> np.ndarray:
-    """Convert a raw NV12 frame when needed, then resize to the pool shape."""
-    if frame.ndim == 2 and config.pixel_format == "NV12":
-        expected_size = config.width * config.height * 3 // 2
-        if frame.size != expected_size:
-            raise ValueError(
-                f"NV12 frame has {frame.size} bytes, expected {expected_size}"
-            )
-        nv12 = frame.reshape((config.height * 3 // 2, config.width))
-        frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+def _prepare_frame(
+    frame: np.ndarray,
+    config: CameraConfig,
+    *,
+    dst: np.ndarray | None = None,
+) -> np.ndarray:
+    """Pack a camera frame as 640x480 NV12, preferably into *dst*."""
+    if dst is None:
+        dst = np.empty(FRAME_NV12_SHAPE, dtype=np.uint8)
+    elif dst.shape != FRAME_NV12_SHAPE or dst.dtype != np.uint8:
+        raise ValueError(
+            f"NV12 destination must be uint8 {FRAME_NV12_SHAPE}, "
+            f"got {dst.dtype} {dst.shape}"
+        )
 
-    if frame.ndim != 3 or frame.shape[2] != FRAME_SHAPE[2]:
+    if frame.ndim == 2 and config.pixel_format == "NV12":
+        nv12 = validate_nv12(frame, config.width, config.height)
+        if (config.width, config.height) == (FRAME_W, FRAME_H):
+            np.copyto(dst, nv12)
+            return dst
+        # Non-production geometries require a BGR resize before repacking.
+        frame = nv12_to_bgr(nv12, config.width, config.height)
+
+    if frame.ndim != 3 or frame.shape[2] != FRAME_BGR_SHAPE[2]:
         raise ValueError(f"unsupported camera frame shape {frame.shape}")
 
-    if frame.shape[:2] != (FRAME_SHAPE[0], FRAME_SHAPE[1]):
+    if frame.shape[:2] != (FRAME_H, FRAME_W):
         frame = cv2.resize(
             frame,
-            (FRAME_SHAPE[1], FRAME_SHAPE[0]),
+            (FRAME_W, FRAME_H),
             interpolation=cv2.INTER_AREA,
         )
-    return frame
+    return bgr_to_nv12(frame, dst=dst)
 
 
 def run_camera_loop(
@@ -112,6 +154,7 @@ def run_camera_loop(
     tick = 1.0 / target_fps
     frame_index = 0
 
+    perception = None
     try:
         perception = load_perception_config()
         if perception.affinity_enabled:
@@ -119,16 +162,31 @@ def run_camera_loop(
     except Exception as exc:  # noqa: BLE001 - tuning must never be fatal
         log.debug("camera affinity/tuning skipped: %s", exc)
 
+    injector = None
+    inject_bgr = None
+    if perception is not None:
+        image_path = Path(perception.inject_cat_image)
+        if not image_path.is_absolute():
+            image_path = Path(__file__).resolve().parents[2] / image_path
+        injector = LiveCatInjector(
+            str(image_path), speed_px_s=perception.inject_cat_speed_px_s
+        )
+        inject_bgr = np.empty(FRAME_BGR_SHAPE, dtype=np.uint8)
+        if perception.inject_cat_enabled:
+            shared.set_cat_injection_enabled(True)
+
     if _HAS_CV2:
         cap = None
         lores_cap = None
         failed_reads = 0
         log.info(
-            "Camera loop started (device=%s, %dx%d %s, backend=%s, %.0f FPS, lores=%s).",
+            "Camera loop started (device=%s, %dx%d %s, backend=%s/%s, "
+            "%.0f FPS, lores=%s).",
             config.device,
             config.width,
             config.height,
             config.pixel_format or "driver-default",
+            config.capture_backend,
             config.backend,
             target_fps,
             config.lores_device or "off",
@@ -161,8 +219,26 @@ def run_camera_loop(
 
                 t0 = time.monotonic()
 
-                ret, frame = cap.read()
+                # GStreamer can map/pack directly into the reserved ring slot.
+                # OpenCV owns its read buffer, so that path reserves afterward.
+                write_buf = None
+                direct_capture = bool(
+                    getattr(cap, "writes_nv12_destination", False)
+                )
+                if direct_capture:
+                    write_buf = shared.try_get_write_buffer()
+                    if write_buf is None:
+                        frame_index += 1
+                        stop_event.wait(tick)
+                        continue
+                    capture_started_ns = time.monotonic_ns()
+                    ret, frame = cap.read(dst=write_buf)
+                else:
+                    capture_started_ns = time.monotonic_ns()
+                    ret, frame = cap.read()
                 if not ret or frame is None:
+                    if write_buf is not None:
+                        shared.abort_frame_write()
                     failed_reads += 1
                     if failed_reads >= 30:
                         log.warning(
@@ -176,27 +252,75 @@ def run_camera_loop(
                     continue
                 failed_reads = 0
 
-                try:
-                    frame = _prepare_frame(frame, config)
-                except ValueError as exc:
-                    log.error("Dropping camera frame: %s", exc)
-                    stop_event.wait(0.1)
-                    continue
+                # Reserve a free ring slot. Capture is latest-wins: if every
+                # slot is pinned by a zero-copy reader, drop this camera frame
+                # instead of blocking the producer behind inference/encoding.
+                if write_buf is None:
+                    write_buf = shared.try_get_write_buffer()
+                    if write_buf is None:
+                        frame_index += 1
+                        elapsed = time.monotonic() - t0
+                        stop_event.wait(max(0.0, tick - elapsed))
+                        continue
 
-                # Copy into the pool's current write buffer and publish index
-                write_buf = shared.get_write_buffer()
-                # OpenCV frames are BGR; we keep the raw layout as-is
-                np.copyto(write_buf, frame)
-                shared.publish_latest_from_write()
+                    try:
+                        _prepare_frame(frame, config, dst=write_buf)
+                    except ValueError as exc:
+                        shared.abort_frame_write()
+                        log.error("Dropping camera frame: %s", exc)
+                        stop_event.wait(0.1)
+                        continue
+
+                injected = False
+                bbox = None
+                if injector is not None:
+                    enabled = shared.cat_injection_enabled()
+                    try:
+                        injector.set_enabled(enabled)
+                        if enabled:
+                            assert inject_bgr is not None
+                            nv12_to_bgr(
+                                write_buf, FRAME_W, FRAME_H, dst=inject_bgr
+                            )
+                            bbox = injector.apply(inject_bgr)
+                            if bbox is not None:
+                                bgr_to_nv12(inject_bgr, dst=write_buf)
+                                injected = True
+                    except Exception as exc:  # noqa: BLE001
+                        # Injection is a diagnostic feature; a missing/bad
+                        # sprite must not take down the real camera pipeline.
+                        log.error("Disabling live cat injection: %s", exc)
+                        injector.set_enabled(False)
+                        shared.set_cat_injection_enabled(False)
+
+                shared.publish_latest_from_write(
+                    capture_started_ns=capture_started_ns
+                )
+                if injector is not None:
+                    # Publish diagnostics only after the matching pixels become
+                    # visible; a dropped camera frame must not advance its bbox.
+                    shared.set_cat_injection_bbox(bbox)
 
                 # Publish a hardware-scaled lores gray frame for motion.
                 if lores_cap is not None:
                     lret, lframe = lores_cap.read()
-                    if lret and lframe is not None:
-                        try:
+                    try:
+                        if injected:
+                            # The hardware lores stream does not contain the
+                            # composited sprite. Derive its motion frame from
+                            # the injected main image so motion gating sees the
+                            # exact pixels subsequently sent to RKNN.
+                            gray = y_plane(write_buf, FRAME_W, FRAME_H)
+                            gray = cv2.resize(
+                                gray,
+                                (config.lores_width, config.lores_height),
+                                interpolation=cv2.INTER_AREA,
+                            )
+                            shared.set_lores_gray(gray)
+                        elif lret and lframe is not None:
                             shared.set_lores_gray(_lores_to_gray(lframe, config))
-                        except Exception as exc:  # noqa: BLE001
-                            log.debug("lores gray publish skipped: %s", exc)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("lores gray publish skipped: %s", exc)
 
                 frame_index += 1
                 elapsed = time.monotonic() - t0
@@ -212,11 +336,20 @@ def run_camera_loop(
         while not stop_event.is_set():
             t0 = time.monotonic()
 
-            # Get the next write buffer from the ring, fill it, and publish.
-            write_buf = shared.get_write_buffer()
-            # Stub: fill entire frame with a rolling value
-            write_buf[:] = frame_index % 256
-            shared.publish_latest_from_write()
+            # Get the next free write slot. Stub capture follows the same
+            # non-blocking latest-wins policy as the real camera.
+            write_buf = shared.try_get_write_buffer()
+            if write_buf is None:
+                elapsed = time.monotonic() - t0
+                stop_event.wait(max(0.0, tick - elapsed))
+                continue
+            # Stub: valid neutral-chroma NV12 with rolling luma.
+            capture_started_ns = time.monotonic_ns()
+            write_buf[:FRAME_H].fill(frame_index % 256)
+            write_buf[FRAME_H:].fill(128)
+            shared.publish_latest_from_write(
+                capture_started_ns=capture_started_ns
+            )
 
             frame_index += 1
             elapsed = time.monotonic() - t0

@@ -7,12 +7,70 @@ inside the get/set methods.
 """
 
 import threading
-from typing import Tuple
+import time
+from typing import Optional, Tuple
 
 import numpy as np
 
 from cat_follow.memory.pool import MemoryPool, BBOX_LEN, ODOM_LEN
 from cat_follow.memory.pool import FRAME_SHAPE
+
+
+class FrameLease:
+    """Pinned, read-only-by-contract view of a published frame-ring slot.
+
+    The camera cannot reuse ``slot_idx`` until :meth:`release` is called.
+    Consumers should use this as a context manager so exceptions cannot leak
+    slot references.
+    """
+
+    __slots__ = (
+        "_owner",
+        "frame",
+        "frame_seq",
+        "capture_started_ns",
+        "published_ns",
+        "slot_generation",
+        "slot_idx",
+        "_released",
+    )
+
+    def __init__(
+        self,
+        owner: "SharedState",
+        slot_idx: int,
+        frame_seq: int,
+        capture_started_ns: int,
+        published_ns: int,
+        slot_generation: int,
+        frame: np.ndarray,
+    ) -> None:
+        self._owner = owner
+        self.slot_idx = slot_idx
+        self.frame_seq = frame_seq
+        self.capture_started_ns = capture_started_ns
+        self.published_ns = published_ns
+        self.slot_generation = slot_generation
+        self.frame = frame
+        self._released = False
+
+    def __enter__(self) -> "FrameLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
+
+    @property
+    def stale(self) -> bool:
+        """Whether the slot generation changed while this lease was held."""
+        return self._owner._frame_lease_stale(self.slot_idx, self.slot_generation)
+
+    def release(self) -> None:
+        """Release this reader's pin. Safe to call more than once."""
+        if self._released:
+            return
+        self._owner._release_frame_slot(self.slot_idx)
+        self._released = True
 
 
 class SharedState:
@@ -36,6 +94,7 @@ class SharedState:
         self._lock_detector_detections = threading.Lock()
         self._lock_tracked_targets = self._lock_tracking
         self._lock_odometry = threading.Lock()
+        self._lock_cat_injection = threading.Lock()
 
         # Legacy detector-model selection slot. Detection is now RKNN-only and
         # env-driven (CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH); this value is kept
@@ -44,22 +103,21 @@ class SharedState:
         self._lock_detector_model = threading.Lock()
         self._detector_model = "rknn"
 
-        # Ring buffer indices for rotating frame buffers. The camera writes
-        # into the slot returned by ``get_write_buffer()``, then calls
-        # ``publish_latest_from_write()`` to atomically publish that slot
-        # as the newest frame. Readers use ``get_frame_latest(dst)`` which
-        # copies from the currently published index.
+        # Ring ownership. A single camera writer marks one slot as WRITING;
+        # zero-copy readers pin published slots with a refcount. The writer
+        # never reuses the latest slot or a pinned slot.
         self._ring_n = self._pool.frame_ring.shape[0]
         self._write_idx = 0
         self._latest_idx = -1
+        self._active_write_idx: Optional[int] = None
+        self._slot_refcounts = [0] * self._ring_n
+        # Odd means write in progress; even means stable/published.
+        self._slot_generations = [0] * self._ring_n
+        self._slot_frame_seqs = [0] * self._ring_n
+        self._slot_capture_started_ns = [0] * self._ring_n
+        self._slot_published_ns = [0] * self._ring_n
+        self._frame_seq = 0
 
-        # Monotonic generation counter for the detector snapshot frame.  Each
-        # time a new frame is snapshotted for detection the generation is
-        # bumped, and the detector tags the bbox it produces with that
-        # generation (see ``set_bbox_detector``/``get_bbox_detector_with_gen``).
-        # The tracker uses this to init/re-init on the *same* frame the detector
-        # saw rather than a later ``frame_latest`` (avoids wrong-pixel init).
-        self._detector_frame_gen = 0
         self._bbox_detector_gen = -1
         # Full post-NMS detection set consumed by PredictiveTracker. Tuples are
         # immutable snapshots, so readers never share mutable detector data.
@@ -85,6 +143,10 @@ class SharedState:
         # detector consumes it and loads/warmups the lazily-unloaded RKNN model
         # before the next detection.
         self._detector_warmup_requested = threading.Event()
+        # Runtime-switchable live-frame test injection. The camera thread owns
+        # the compositor; web/headless controls only update this flag.
+        self._cat_injection_enabled = threading.Event()
+        self._cat_injection_bbox = None
 
     # ── frame_latest ─────────────────────────────────────────────────
 
@@ -99,6 +161,34 @@ class SharedState:
         self._detector_warmup_requested.clear()
         return True
 
+    def set_cat_injection_enabled(self, enabled: bool) -> None:
+        """Enable/disable live camera cat pixels (never synthetic detections)."""
+        if enabled:
+            self._cat_injection_enabled.set()
+        else:
+            self._cat_injection_enabled.clear()
+            with self._lock_cat_injection:
+                self._cat_injection_bbox = None
+
+    def cat_injection_enabled(self) -> bool:
+        return self._cat_injection_enabled.is_set()
+
+    def set_cat_injection_bbox(self, bbox) -> None:
+        """Publish the injected sprite's tight ``xyxy`` pixel bounds."""
+        snapshot = None if bbox is None else tuple(int(value) for value in bbox)
+        with self._lock_cat_injection:
+            self._cat_injection_bbox = snapshot
+
+    def get_cat_injection_status(self) -> dict:
+        """Return injection state and ground-truth bbox for diagnostics only."""
+        with self._lock_cat_injection:
+            bbox = self._cat_injection_bbox
+        return {
+            "enabled": self._cat_injection_enabled.is_set(),
+            "bbox": list(bbox) if bbox is not None else None,
+            "detection_fallback": False,
+        }
+
     def set_frame_latest(self, src: np.ndarray) -> None:
         """Copy *src* into the next write slot and publish it as latest.
 
@@ -109,7 +199,9 @@ class SharedState:
         buffer.
         """
         # Copy into current write buffer, then publish under lock.
-        write_buf = self.get_write_buffer()
+        write_buf = self.try_get_write_buffer()
+        if write_buf is None:
+            return
         np.copyto(write_buf, src)
         self.publish_latest_from_write()
 
@@ -130,66 +222,26 @@ class SharedState:
             else:
                 np.copyto(dst, self._pool.frame_ring[self._latest_idx])
 
-    def copy_latest_to_detector_frame(self) -> None:
-        """Copy ``frame_latest`` → ``frame_for_detector`` under lock.
-
-        Called by the main thread every K frames so the detector has a
-        stable snapshot to work with.
-        """
-        with self._lock_frame:
-            if self._latest_idx < 0:
-                # no frame yet
-                self._pool.frame_for_detector.fill(0)
-            else:
-                np.copyto(self._pool.frame_for_detector, self._pool.frame_ring[self._latest_idx])
-
-    def get_frame_for_detector(self, dst: np.ndarray) -> None:
-        """Copy the current ``frame_for_detector`` into *dst* under lock."""
-        # Validate dst shape and dtype to make misuse obvious.
-        if dst.shape != FRAME_SHAPE:
-            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
-        if dst.dtype != self._pool.frame_for_detector.dtype:
-            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
-
-        with self._lock_frame:
-            np.copyto(dst, self._pool.frame_for_detector)
-
-    def snapshot_detector_frame(self, dst: np.ndarray) -> int:
-        """Atomically copy ``frame_latest`` directly into *dst* and return the
-        new detector-frame generation.
-
-        This is one full-frame copy, rather than staging through
-        ``frame_for_detector``. The legacy staging APIs remain available to
-        callers that explicitly use them.
-        """
-        if dst.shape != FRAME_SHAPE:
-            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
-        if dst.dtype != self._pool.frame_for_detector.dtype:
-            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
-
-        with self._lock_frame:
-            if self._latest_idx < 0:
-                dst.fill(0)
-            else:
-                np.copyto(dst, self._pool.frame_ring[self._latest_idx])
-            self._detector_frame_gen += 1
-            gen = self._detector_frame_gen
-        return gen
-
-    def get_detector_frame_and_gen(self, dst: np.ndarray) -> int:
-        """Copy the current ``frame_for_detector`` into *dst* and return its
-        generation, under a single lock (for the tracker's frame-matched init).
-        """
-        if dst.shape != FRAME_SHAPE:
-            raise ValueError(f"dst has wrong shape {dst.shape}, expected {FRAME_SHAPE}")
-        if dst.dtype != self._pool.frame_for_detector.dtype:
-            raise ValueError(f"dst has wrong dtype {dst.dtype}, expected {self._pool.frame_for_detector.dtype}")
-
-        with self._lock_frame:
-            np.copyto(dst, self._pool.frame_for_detector)
-            return self._detector_frame_gen
-
     # ── ring helpers (camera use) ─────────────────────────────────────
+
+    def try_get_write_buffer(self) -> Optional[np.ndarray]:
+        """Reserve and return a free ring slot, or ``None`` if all are busy.
+
+        This is non-blocking by design: camera capture is latest-wins and must
+        drop a frame rather than wait behind detector or stream work.
+        """
+        with self._lock_frame:
+            if self._active_write_idx is not None:
+                raise RuntimeError("frame write already active")
+
+            for offset in range(self._ring_n):
+                idx = (self._write_idx + offset) % self._ring_n
+                if idx == self._latest_idx or self._slot_refcounts[idx] != 0:
+                    continue
+                self._active_write_idx = idx
+                self._slot_generations[idx] += 1  # even -> odd (WRITING)
+                return self._pool.frame_ring[idx]
+        return None
 
     def get_write_buffer(self) -> np.ndarray:
         """Return a writable view into the pool's current write slot.
@@ -199,24 +251,87 @@ class SharedState:
         ``publish_latest_from_write()`` to make the frame visible to
         readers.
         """
-        # NOTE: This method intentionally does not acquire ``_lock_frame``.
-        # It is safe only when a single writer (the camera thread) uses it.
-        # Add a debug-time sanity check to catch accidental multi-writer use.
-        buf = self._pool.frame_ring[self._write_idx]
+        buf = self.try_get_write_buffer()
+        if buf is None:
+            raise RuntimeError("no free frame-ring write slot")
         if __debug__:
-            # shape/dtype guard
             assert buf.shape == FRAME_SHAPE, f"write buffer shape {buf.shape} != {FRAME_SHAPE}"
             assert buf.dtype == self._pool.frame_ring.dtype
         return buf
 
-    def publish_latest_from_write(self) -> None:
-        """Atomically publish the buffer at the current write index as
-        the latest frame, then advance the write index.
-        """
+    def publish_latest_from_write(
+        self, *, capture_started_ns: Optional[int] = None
+    ) -> None:
+        """Publish the active slot with capture timing and advance its sequence."""
+        published_ns = time.monotonic_ns()
+        if capture_started_ns is None:
+            capture_started_ns = published_ns
+        capture_started_ns = int(capture_started_ns)
+        if capture_started_ns < 0 or capture_started_ns > published_ns:
+            raise ValueError("capture_started_ns must be a past monotonic timestamp")
         with self._lock_frame:
-            self._latest_idx = self._write_idx
-            # advance write index for next frame
-            self._write_idx = (self._write_idx + 1) % self._ring_n
+            idx = self._active_write_idx
+            if idx is None:
+                raise RuntimeError("no active frame write to publish")
+            if self._slot_generations[idx] % 2 != 1:
+                raise RuntimeError("active frame slot is not marked WRITING")
+            self._slot_generations[idx] += 1  # odd -> even (stable)
+            self._frame_seq += 1
+            self._slot_frame_seqs[idx] = self._frame_seq
+            self._slot_capture_started_ns[idx] = capture_started_ns
+            self._slot_published_ns[idx] = published_ns
+            self._latest_idx = idx
+            self._write_idx = (idx + 1) % self._ring_n
+            self._active_write_idx = None
+
+    def abort_frame_write(self) -> None:
+        """Cancel an active write reservation without publishing its pixels."""
+        with self._lock_frame:
+            idx = self._active_write_idx
+            if idx is None:
+                return
+            if self._slot_generations[idx] % 2 == 1:
+                self._slot_generations[idx] += 1
+            self._active_write_idx = None
+            self._write_idx = (idx + 1) % self._ring_n
+
+    def acquire_latest_frame(self) -> Optional[FrameLease]:
+        """Pin and return the latest stable frame without copying pixels."""
+        with self._lock_frame:
+            idx = self._latest_idx
+            if idx < 0:
+                return None
+            slot_generation = self._slot_generations[idx]
+            if slot_generation % 2 != 0:
+                return None
+            self._slot_refcounts[idx] += 1
+            frame_seq = self._slot_frame_seqs[idx]
+            return FrameLease(
+                self,
+                idx,
+                frame_seq,
+                self._slot_capture_started_ns[idx],
+                self._slot_published_ns[idx],
+                slot_generation,
+                self._pool.frame_ring[idx],
+            )
+
+    def latest_frame_generation(self) -> int:
+        """Return the latest published capture sequence, or zero before startup."""
+        with self._lock_frame:
+            return self._frame_seq
+
+    def _release_frame_slot(self, slot_idx: int) -> None:
+        with self._lock_frame:
+            if not 0 <= slot_idx < self._ring_n:
+                raise ValueError(f"invalid frame-ring slot {slot_idx}")
+            if self._slot_refcounts[slot_idx] <= 0:
+                raise RuntimeError(f"frame-ring slot {slot_idx} is not acquired")
+            self._slot_refcounts[slot_idx] -= 1
+
+    def _frame_lease_stale(self, slot_idx: int, slot_generation: int) -> bool:
+        with self._lock_frame:
+            return self._slot_generations[slot_idx] != slot_generation
 
     # ── bbox_tracker ─────────────────────────────────────────────────
 
@@ -289,9 +404,8 @@ class SharedState:
     ) -> None:
         """Write detector bbox into the pre-allocated array under lock.
 
-        ``frame_gen`` is the detector-frame generation this bbox was produced
-        from (see :meth:`snapshot_detector_frame`); it lets the tracker match
-        the bbox to the exact frame the detector inferred on.
+        ``frame_gen`` is the capture sequence from the detector's frame lease;
+        it lets the tracker match the bbox to the exact inferred pixels.
         """
         with self._lock_bbox_detector:
             buf = self._pool.bbox_detector

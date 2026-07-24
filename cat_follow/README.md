@@ -109,7 +109,8 @@ The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
 - field of view: 88.2° diagonal, 75° horizontal, 59° vertical; 15° CRA
 - capture device: `/dev/video11` (RKISP main path)
 - capture format: 640×480 NV12 at 30 FPS, scaled by RKISP in hardware
-- processing format: converted to the existing 640×480 BGR frame pool
+- processing format: native 640×480 NV12 ring; the 320×320 detector crop
+  converts directly into the preallocated RGB RKNN tensor
 - sensor controls: `/dev/v4l-subdev2`, exposure 900, analogue gain 48
 
 Full sensor, lens, and optical specifications are recorded in
@@ -204,13 +205,13 @@ baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
 
 1. **Validate the C1 lidar** — Connect it over USB, install/verify the `/dev/rplidar` udev rule, launch `sllidar_ros2` at 460800 baud, and confirm `/scan`.
 2. **Complete ROCK 4D validation** — Run floor-drive and thermal tests and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
-3. **RKNN model** — YOLOv8n COCO 320×320 for rk3576 is provisioned as
-   `models/yolov8n_coco_320_rk3576.rknn` (built with
-   `scripts/convert_yolo_to_rknn.py --platform rk3576 --no-quant`). Point
-   `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at it. On the ROCK 4D a missing model
-   is a hard error (no CPU fallback). Decoding uses `vision/yolo_postprocess.py`
-   (9-tensor model-zoo layout); chase-start warmup preloads the NPU when
-   `CAT_FOLLOW_PERCEPTION_WARMUP_ON_START=0`.
+3. **RKNN model** — Production uses the calibrated YOLOv8n COCO INT8 320×320
+   model `models/yolov8n_coco_320_rk3576_int8.rknn`. FP and the other
+   n/s 320/640 variants remain available for timing and accuracy A/B. Point
+   `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at the selected model. On the ROCK
+   4D a missing model is a hard error (no CPU fallback). Decoding uses
+   `vision/yolo_postprocess.py` (9-tensor model-zoo layout); an accepted
+   `START_CHASE` requests immediate NPU warmup.
 
 ## 📝 Version History
 

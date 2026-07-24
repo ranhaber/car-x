@@ -242,6 +242,7 @@ def create_app(
     from cat_follow.web_ui.routes_config import config_bp, init_config_routes
     from cat_follow.web_ui.routes_map import map_bp, init_map_routes
     from cat_follow.web_ui.routes_movement import movement_bp, init_movement_routes
+    from cat_follow.web_ui.routes_injection import injection_bp, init_injection_routes
     from cat_follow.motion.sequence_executor import MotionSequenceExecutor
     from cat_follow.motion.prototype_sequence_runner import PrototypeSequenceRunner
 
@@ -263,6 +264,7 @@ def create_app(
     init_config_routes(ctx)
     init_map_routes(ctx)
     init_movement_routes(ctx)
+    init_injection_routes(ctx)
 
     # Optional hardware H.264 WebSocket stream (guarded: no-op if flask-sock /
     # GStreamer mpph264enc are unavailable).
@@ -284,5 +286,6 @@ def create_app(
     app.register_blueprint(config_bp)
     app.register_blueprint(map_bp)
     app.register_blueprint(movement_bp)
+    app.register_blueprint(injection_bp)
 
     return app

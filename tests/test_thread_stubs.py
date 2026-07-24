@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import cat_follow.threads.camera as camera_module
 import cat_follow.threads.detector as detector_module
-from cat_follow.memory.pool import allocate_pool, FRAME_SHAPE
+from cat_follow.memory.pool import allocate_pool, FRAME_H, FRAME_SHAPE
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.threads.camera import run_camera_loop
 from cat_follow.threads.tracker import run_tracker_loop
@@ -125,23 +125,19 @@ def test_camera_writes_frame_latest():
 
 
 def test_camera_frame_has_pattern():
-    """Camera stub fills frames with (frame_index % 256), so at least
-    some pixel values should be non-zero after many frames."""
+    """Camera stub publishes rolling luma with neutral NV12 chroma."""
     shared, _ = _run_threads_for(0.5)
     dst = np.zeros(FRAME_SHAPE, dtype=np.uint8)
     shared.get_frame_latest(dst)
-    # All pixels in one frame should be the same value (stub fills uniformly)
-    val = dst[0, 0, 0]
-    assert np.all(dst == val), "Stub camera should fill the entire frame with one value"
+    luma = dst[0, 0]
+    assert np.all(dst[:FRAME_H] == luma)
+    assert np.all(dst[FRAME_H:] == 128)
 
 
 def test_detector_writes_bbox():
     """Detector stub should write bbox_detector with valid=1."""
     shared, _ = _run_threads_for(0.5)
 
-    # The detector needs frame_for_detector to be populated.
-    # In a real app main would call copy_latest_to_detector_frame().
-    # Our stub detector reads whatever is in the buffer (zeros is fine).
     # The real detector falls back to a stub that periodically publishes a bbox.
     # We need to wait for it.
     time.sleep(0.2)
@@ -151,9 +147,8 @@ def test_detector_writes_bbox():
     )
 
 
-def test_copy_latest_to_detector_during_run():
-    """Simulate main copying frame_latest -> frame_for_detector while
-    threads are running; verify detector still gets a valid frame."""
+def test_acquire_latest_frame_during_run():
+    """A ring lease exposes stable camera pixels while workers are running."""
     pool = allocate_pool()
     shared = SharedState(pool)
     stop = threading.Event()
@@ -176,21 +171,19 @@ def test_copy_latest_to_detector_during_run():
     for t in threads:
         t.start()
 
-    # Simulate main loop copying every 0.1 s for 0.5 s
-    for _ in range(5):
-        time.sleep(0.1)
-        shared.copy_latest_to_detector_frame()
+    time.sleep(0.2)
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+    with lease:
+        snapshot = lease.frame.copy()
+        time.sleep(0.2)
+        assert np.array_equal(lease.frame, snapshot)
 
     stop.set()
     for t in threads:
         t.join(timeout=3.0)
 
-    # After copies, frame_for_detector should be non-zero
-    dst = np.zeros(FRAME_SHAPE, dtype=np.uint8)
-    shared.get_frame_for_detector(dst)
-    assert not np.all(dst == 0), (
-        "frame_for_detector should be non-zero after copies from camera"
-    )
+    assert shared.latest_frame_generation() > 0
 
 
 def test_no_exceptions_during_run():
@@ -489,6 +482,7 @@ def test_detector_escalates_on_repeated_inference_failure(monkeypatch):
 
     pool = allocate_pool()
     shared = SharedState(pool)
+    shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
     stop = threading.Event()
     handshake = detector_module.DetectorHandshake()
     t = threading.Thread(
@@ -612,6 +606,7 @@ def test_detector_runtime_escalation_fires_on_fatal(monkeypatch):
 
     pool = allocate_pool()
     shared = SharedState(pool)
+    shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
     stop = threading.Event()
     t = threading.Thread(
         target=run_detector_loop,

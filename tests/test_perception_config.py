@@ -23,6 +23,10 @@ _ENV_NAMES = (
     "DETECTOR_CORES",
     "RKNN_MODEL_PATH",
     "RKNN_INPUT",
+    "ANIMAL_MODE",
+    "INJECT_CAT_ENABLED",
+    "INJECT_CAT_IMAGE",
+    "INJECT_CAT_SPEED_PX_S",
 )
 
 
@@ -34,7 +38,10 @@ def _clear_env(monkeypatch):
 
 def test_defaults_are_rknn_only():
     config = load_perception_config()
-    assert config.rknn_model_path == "models/yolov8n_coco_320_rk3576.rknn"
+    assert (
+        config.rknn_model_path
+        == "models/yolov8n_coco_320_rk3576_int8.rknn"
+    )
     assert config.rknn_input_size == (320, 320)
     assert config.motion_gating is True
     assert config.score_threshold == 0.5
@@ -43,6 +50,10 @@ def test_defaults_are_rknn_only():
     assert config.affinity_enabled is False
     assert config.camera_cores == ()
     assert config.detector_cores == ()
+    assert config.animal_mode is False
+    assert config.inject_cat_enabled is False
+    assert config.inject_cat_image == "models/cat_1_320.png"
+    assert config.inject_cat_speed_px_s == 60.0
     # The backend is fixed to RKNN; there is no backend/uses_rknn selector.
     assert not hasattr(config, "backend")
     assert not hasattr(config, "uses_rknn")
@@ -57,9 +68,19 @@ def test_env_driven_config(monkeypatch):
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_SCORE_THRESHOLD", "0.65")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH", "models/cat.rknn")
     monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_RKNN_INPUT", "320,240")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_ANIMAL_MODE", "1")
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_INJECT_CAT_ENABLED", "1")
+    monkeypatch.setenv(
+        "CAT_FOLLOW_PERCEPTION_INJECT_CAT_IMAGE", "models/test-cat.png"
+    )
+    monkeypatch.setenv("CAT_FOLLOW_PERCEPTION_INJECT_CAT_SPEED_PX_S", "75")
 
     config = load_perception_config()
     assert config.motion_gating is False
+    assert config.animal_mode is True
+    assert config.inject_cat_enabled is True
+    assert config.inject_cat_image == "models/test-cat.png"
+    assert config.inject_cat_speed_px_s == 75.0
     assert config.affinity_enabled is True
     assert config.camera_cores == (4, 5)
     assert config.detector_cores == (6, 7)

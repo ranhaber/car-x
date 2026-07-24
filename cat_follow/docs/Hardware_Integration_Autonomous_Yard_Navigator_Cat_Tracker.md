@@ -1,8 +1,8 @@
 # Hardware Integration
-**Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
-**Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis  
-**Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic; no IMU installed  
-**Version:** 1.1  
+**Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)
+**Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis
+**Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic; no IMU installed
+**Version:** 1.1
 **Status:** ROCK 4D and Radxa Camera 4K bring-up validated; event-driven ultrasonic on ROCK 4D; lidar, grayscale, and thermal tests pending
 
 ## 1. Purpose
@@ -190,7 +190,8 @@ MIPI CSI-2 interface.
 - Sensor control: I2C5, address `0x1a`
 - Native sensor mode: 3864×2192, SGBRG10
 - Runtime capture: RKISP main path `/dev/video11`
-- Runtime format: 640×480 NV12 at 30 FPS, converted to 640×480 BGR
+- Runtime format: native 640×480 NV12 at 30 FPS through the shared ring;
+  detector crops convert directly to RGB only at the RKNN input boundary
 - Device-tree overlay: `rock-4d-radxa-camera-4k`
 
 The overlay routes the sensor through

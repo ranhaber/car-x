@@ -195,10 +195,9 @@ def main():
             # Poll commands (thread-safe via lock)
             poll_commands(on_cat_location=on_cat_location, on_stop=on_stop)
 
-            # NOTE: The detector thread now owns the detector-frame snapshot
-            # (``snapshot_detector_frame``) atomically with its generation
-            # counter, so the main loop no longer copies here (a second writer
-            # would desync the frame/bbox generation used by the tracker).
+            # The detector acquires a read-only frame-ring lease and tags its
+            # output with that capture sequence. The main loop never copies or
+            # mutates detector pixels.
             frame_count += 1
 
             # Read bbox from shared state (from tracker thread)

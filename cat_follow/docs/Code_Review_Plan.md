@@ -38,6 +38,9 @@ Apply every check below to every relevant file and pipeline.
 - Prefer preallocated buffers, indexes, memory views, and bounded pools.
 - Zero-copy buffers must use ownership/generation handoff so readers never see
   writes in progress.
+- For production perception, use `cat_follow/docs/Frame_Ring_Ownership_Audit.md`
+  as the canonical frame-ring ownership reference (implemented four-slot
+  refcounted leases, per-slot generations, and native NV12 data flow).
 - Check caches, queues, telemetry, detections, and tracks for bounded growth.
 - Release models, frames, files, sockets, and native resources promptly.
 

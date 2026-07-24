@@ -19,6 +19,8 @@ from cat_follow.memory.pool import (
     FRAME_H,
     FRAME_W,
     FRAME_C,
+    FRAME_BGR_SHAPE,
+    FRAME_NV12_SHAPE,
     FRAME_SHAPE,
     FRAME_NBYTES,
     BBOX_LEN,
@@ -36,38 +38,23 @@ def _make_pool() -> MemoryPool:
 # ── tests ────────────────────────────────────────────────────────────────
 
 def test_constants_consistent():
-    """FRAME_SHAPE and FRAME_NBYTES match the individual H/W/C constants."""
-    assert FRAME_SHAPE == (FRAME_H, FRAME_W, FRAME_C)
-    assert FRAME_NBYTES == FRAME_H * FRAME_W * FRAME_C
+    """Ring and display shapes match packed NV12 and BGR geometry."""
+    assert FRAME_BGR_SHAPE == (FRAME_H, FRAME_W, FRAME_C)
+    assert FRAME_NV12_SHAPE == (FRAME_H * 3 // 2, FRAME_W)
+    assert FRAME_SHAPE == FRAME_NV12_SHAPE
+    assert FRAME_NBYTES == FRAME_H * FRAME_W * 3 // 2
 
 
 def test_frame_ring_shape_and_dtype():
     pool = _make_pool()
-    assert pool.frame_ring.shape == (FRAME_RING_N, FRAME_H, FRAME_W, FRAME_C)
+    assert pool.frame_ring.shape == (FRAME_RING_N, *FRAME_NV12_SHAPE)
     assert pool.frame_ring.dtype == np.uint8
-
-
-def test_frame_for_detector_shape_and_dtype():
-    pool = _make_pool()
-    assert pool.frame_for_detector.shape == FRAME_SHAPE
-    assert pool.frame_for_detector.dtype == np.uint8
 
 
 def test_frame_nbytes():
     pool = _make_pool()
     # Test one frame from the ring
     assert pool.frame_ring[0].nbytes == FRAME_NBYTES
-    assert pool.frame_for_detector.nbytes == FRAME_NBYTES
-
-
-def test_frames_are_separate_buffers():
-    """frame_ring and frame_for_detector must be independent arrays."""
-    pool = _make_pool()
-    assert not np.shares_memory(pool.frame_ring, pool.frame_for_detector)
-    pool.frame_ring[0, :, :, :] = 42
-    assert pool.frame_for_detector[0, 0, 0] == 0, (
-        "Writing to frame_ring must not affect frame_for_detector"
-    )
 
 
 def test_bbox_tracker_length_and_dtype():
@@ -95,13 +82,6 @@ def test_odometry_length_and_dtype():
     assert pool.odometry.dtype == np.float64
 
 
-def test_write_read_frame():
-    """Write a known value into a frame buffer, read it back."""
-    pool = _make_pool()
-    pool.frame_for_detector[:] = 128
-    assert np.all(pool.frame_for_detector == 128)
-
-
 def test_write_read_bbox_tracker():
     pool = _make_pool()
     pool.bbox_tracker[:] = [10.0, 20.0, 30.0, 40.0, 1.0]
@@ -120,16 +100,16 @@ def test_no_realloc_on_repeated_writes():
     """Repeated in-place writes must reuse the same underlying buffer."""
     pool = _make_pool()
 
-    frame_id = id(pool.frame_for_detector)
+    frame_id = id(pool.frame_ring)
     bbox_id = id(pool.bbox_tracker)
     odom_id = id(pool.odometry)
 
     for i in range(10):
-        pool.frame_for_detector[:] = i
+        pool.frame_ring[:] = i
         pool.bbox_tracker[:] = [float(i)] * BBOX_LEN
         pool.odometry[:] = [float(i)] * ODOM_LEN
 
-    assert id(pool.frame_for_detector) == frame_id, "frame_for_detector was reallocated"
+    assert id(pool.frame_ring) == frame_id, "frame_ring was reallocated"
     assert id(pool.bbox_tracker) == bbox_id, "bbox_tracker was reallocated"
     assert id(pool.odometry) == odom_id, "odometry was reallocated"
 
@@ -138,7 +118,6 @@ def test_all_buffers_start_at_zero():
     """Every buffer must be zero-initialized."""
     pool = _make_pool()
     assert np.all(pool.frame_ring == 0)
-    assert np.all(pool.frame_for_detector == 0)
     assert np.all(pool.bbox_tracker == 0.0)
     assert np.all(pool.bbox_detector == 0.0)
     assert np.all(pool.odometry == 0.0)

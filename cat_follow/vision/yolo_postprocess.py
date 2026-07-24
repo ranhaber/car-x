@@ -14,6 +14,16 @@ import numpy as np
 
 Detection = tuple[int, int, int, int, float, int]
 
+# Official COCO cat category id (what the tracker/roles treat as PRIMARY_CAT).
+CAT_COCO_ID = 17
+
+# Animal-mode class collapse: raw YOLO 0-indexed COCO-80 classes that a stock
+# nano model confuses a small/far cat with -- cat=15, dog=16, horse=17,
+# sheep=18, cow=19, bear=21.  When animal mode is on, any of these is relabelled
+# as CAT_COCO_ID so a cat-sized animal still counts as a cat regardless of the
+# fine-grained guess (matches ``picarx_cat tracker`` config.ANIMAL_MODE).
+ANIMAL_CLASS_IDS_0IDX: frozenset[int] = frozenset({15, 16, 17, 18, 19, 21})
+
 # YOLO's contiguous COCO-80 index -> official COCO category id.
 _YOLO80_TO_COCO = np.asarray(
     (
@@ -129,8 +139,19 @@ def decode_yolov8_outputs(
     score_threshold: float,
     target_class_ids: frozenset[int] = frozenset({17}),
     nms_threshold: float = 0.45,
+    animal_class_ids_0idx: frozenset[int] = frozenset(),
 ) -> list[Detection]:
-    """Decode, filter and NMS YOLO outputs into frame-space detections."""
+    """Decode, filter and NMS YOLO outputs into frame-space detections.
+
+    When *animal_class_ids_0idx* is non-empty, any detection whose raw YOLO
+    0-indexed class is in that set is relabelled as :data:`CAT_COCO_ID` before
+    the target-class filter runs, so a cat-sized quadruped counts as a cat.
+    """
+    animal_mask_0idx = (
+        np.asarray(sorted(animal_class_ids_0idx), dtype=np.int32)
+        if animal_class_ids_0idx
+        else None
+    )
     validate_yolo_output_contract(outputs)
     box_parts: list[np.ndarray] = []
     score_parts: list[np.ndarray] = []
@@ -151,6 +172,10 @@ def decode_yolov8_outputs(
         class_indices = np.argmax(class_scores, axis=1)
         best_scores = class_scores[np.arange(preliminary.size), class_indices]
         coco_ids = yolo80_to_coco_ids(class_indices)
+        if animal_mask_0idx is not None:
+            is_animal = np.isin(class_indices, animal_mask_0idx)
+            if np.any(is_animal):
+                coco_ids = np.where(is_animal, CAT_COCO_ID, coco_ids)
         keep = (best_scores >= score_threshold) & np.isin(
             coco_ids, tuple(target_class_ids)
         )
@@ -220,6 +245,8 @@ def _cv2():
 
 
 __all__ = [
+    "ANIMAL_CLASS_IDS_0IDX",
+    "CAT_COCO_ID",
     "Detection",
     "decode_yolov8_outputs",
     "validate_yolo_output_contract",

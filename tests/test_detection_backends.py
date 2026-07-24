@@ -7,6 +7,7 @@ import cat_follow.vision.rknn_backend as rknn_module
 from cat_follow.camera_config import CameraConfig, load_camera_config
 from cat_follow.vision.backends import RknnBackend, create_backend
 from cat_follow.vision.yolo_postprocess import (
+    ANIMAL_CLASS_IDS_0IDX,
     _decode_cells_dfl,
     decode_yolov8_outputs,
     validate_yolo_output_contract,
@@ -83,6 +84,55 @@ def test_yolo_decoder_filters_to_cat_and_unletterboxes():
     assert len(detections) == 1
     assert detections[0][4] == pytest.approx(0.9)
     assert detections[0][5] == 17
+
+
+def test_yolo_decoder_drops_dog_without_animal_mode():
+    outputs = _empty_yolo_outputs()
+    # YOLO class index 16 == dog (COCO id 18); not a cat, so it is filtered out
+    # when animal mode is off.
+    outputs[1][0, 16, 20, 20] = 0.9
+    outputs[2][0, 0, 20, 20] = 0.9
+    detections = decode_yolov8_outputs(
+        outputs,
+        input_w=320,
+        input_h=320,
+        frame_w=640,
+        frame_h=480,
+        scale=0.5,
+        pad_x=0,
+        pad_y=40,
+        score_threshold=0.3,
+    )
+    assert detections == []
+
+
+def test_yolo_decoder_remaps_dog_to_cat_in_animal_mode():
+    outputs = _empty_yolo_outputs()
+    # A dog (YOLO 16 -> COCO 18) is relabelled as cat (17) under animal mode.
+    outputs[1][0, 16, 20, 20] = 0.9
+    outputs[2][0, 0, 20, 20] = 0.9
+    detections = decode_yolov8_outputs(
+        outputs,
+        input_w=320,
+        input_h=320,
+        frame_w=640,
+        frame_h=480,
+        scale=0.5,
+        pad_x=0,
+        pad_y=40,
+        score_threshold=0.3,
+        animal_class_ids_0idx=ANIMAL_CLASS_IDS_0IDX,
+    )
+    assert len(detections) == 1
+    assert detections[0][4] == pytest.approx(0.9)
+    assert detections[0][5] == 17
+
+
+def test_rknn_backend_animal_mode_wires_class_ids():
+    default_backend = create_backend("models/foo.rknn")
+    assert default_backend._animal_class_ids_0idx == frozenset()
+    animal_backend = create_backend("models/foo.rknn", animal_mode=True)
+    assert animal_backend._animal_class_ids_0idx == ANIMAL_CLASS_IDS_0IDX
 
 
 def test_yolo_decoder_uses_independent_non_square_strides():

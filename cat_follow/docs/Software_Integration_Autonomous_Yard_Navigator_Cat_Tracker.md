@@ -121,22 +121,22 @@ sudo systemctl disable ros-nav.service cat-follow-ros.service
 Detection is RKNN-only; the runtime has no software inference fallback, so a fresh
 deployment is not functional until a `.rknn` model is present. Build it once on
 an x86 workstation / WSL with `rknn-toolkit2`, copy it to the board, and point
-the env at it. Production uses **YOLOv8n COCO 320×320** (airockchip 9-tensor
-head) targeting **rk3576**. This project does not use a calibration image set;
-build with `--no-quant`.
+the env at it. Production uses calibrated **YOLOv8n COCO INT8 320×320**
+(airockchip 9-tensor head) targeting **rk3576**. FP models remain alongside
+INT8 models for accuracy comparisons.
 
 ```bash
 # On x86 Linux / WSL (rknn-toolkit2 installed); ONNX must be the 9-tensor
 # model-zoo head (not a plain Ultralytics single-tensor export):
 python scripts/convert_yolo_to_rknn.py \
   --onnx yolov8n_320.onnx \
-  --output models/yolov8n_coco_320_rk3576.rknn \
+  --output models/yolov8n_coco_320_rk3576_int8.rknn \
   --platform rk3576 \
-  --no-quant
+  --dataset calib_catft.txt
 
 # Copy to the board (path must match CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH,
 # resolved relative to /opt/car-x):
-scp models/yolov8n_coco_320_rk3576.rknn picarx@<board>:/opt/car-x/models/
+scp models/yolov8n_coco_320_rk3576_int8.rknn picarx@<board>:/opt/car-x/models/
 ```
 
 The board runs the lightweight `rknnlite` runtime (install it into the venv on
@@ -152,6 +152,10 @@ file-existence guard for a clearer message. Ensure
 
 Perception CPU affinity uses **A53 cores only** (`0–3`): camera `0,1`,
 detector `2`, ultrasonic edge worker `3`. Leave A72 `4–7` for ROS/Nav2/control.
+**Priority todo:** time ROS 2 modules (Nav2 / lidar / slam_toolbox / bridge)
+during an active chase to measure A72 load and decide whether core
+distribution/affinity can be rebalanced — detector `invoke` is ~2× slower on
+A53 than A72 because `rknn.inference()` includes host-side CPU work.
 
 ### 3.5 Deployment progress (2026-07-20)
 - [x] ROS 2 Jazzy `ros-base` installed on ROCK 4D.
@@ -177,7 +181,11 @@ failures escalate: the detector records the error in `perception.error` on
 returning empty detections forever.
 
 - Use **Python 3.12 venv** (`/opt/car-x/venv`) with RKNN-Toolkit-Lite2 (`rknnlite`) on the board.
-- Convert YOLOv8n (9-tensor ONNX) on an x86 workstation/WSL with `rknn-toolkit2` (`scripts/convert_yolo_to_rknn.py --platform rk3576 --no-quant`), then set `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH=models/yolov8n_coco_320_rk3576.rknn` (and `CAT_FOLLOW_PERCEPTION_RKNN_INPUT=320,320`).
+- Convert YOLOv8n (9-tensor ONNX) on an x86 workstation/WSL with
+  `rknn-toolkit2` and the representative calibration list, then set
+  `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH=models/yolov8n_coco_320_rk3576_int8.rknn`
+  (and `CAT_FOLLOW_PERCEPTION_RKNN_INPUT=320,320`). Keep the `--no-quant` FP
+  build under its distinct filename for accuracy A/B.
 - Pin perception to A53 cores `0–3` (camera `0,1`, detector `2`, ultrasonic `3`); leave A72 `4–7` for ROS/Nav2/control.
 - Add udev rule for `/dev/rknpu` group access.
 - Consider `cma=512M` or `1024M` in boot env for large camera buffers.
@@ -574,8 +582,34 @@ ROCK 4D has more headroom but camera + NPU + Nav2 still requires tuning.
 - [x] Event-driven HC-SR04 reader (`edge_ultrasonic.py`) wired into contract runtime; GPIO exclusivity via `enable_ultrasonic=False`.
 - [x] Web/UDP motion paths support shared-secret authentication and warn when open.
 - [x] CRITICAL telemetry survives transient sink failure through bounded retry.
+- [ ] **Priority:** profile ROS 2 modules (Nav2 / lidar / slam / bridge) CPU
+  usage during an active chase; use the data to decide whether A53/A72 affinity
+  can be rebalanced (detector invoke is ~11 ms unpinned/A72 vs ~22 ms on A53).
+- [ ] **Priority:** prove `CAT_FOLLOW_PERCEPTION_DETECT_FPS=30` is stable in the
+  production app during a complete chase with ROS 2/Nav2 active. Soak for
+  several minutes and record actual end-to-end detection cadence, 33.3 ms
+  deadline misses/dropped frames, RKNN stage latency, thermal throttling, and
+  per-core CPU utilization/affinity.
 - [ ] Thermal/fan policy documented.
 - [ ] JSONL telemetry includes navigation + scan health end-to-end on hardware.
+- [x] Cat Dome-inspired frame-ring slot pinning implemented for detector,
+  MJPEG, and H.264: four-slot refcounted leases + per-slot generation,
+  center-bottom 320×320 detector crop, and legacy detector staging removed.
+  See [`Frame_Ring_Ownership_Audit.md`](Frame_Ring_Ownership_Audit.md).
+- [x] Native RKISP NV12 software ring path: retain `/dev/video11` 640×480 NV12
+  through capture/ring/motion. The 320×320 AI crop converts directly from NV12
+  into the preallocated RGB RKNN tensor without an intermediate BGR image.
+  MJPEG viewers and injection convert at their explicit boundaries; H.264
+  submits packed NV12 directly to `mpph264enc`. This raw RKISP source does not
+  require `mppjpegdec`.
+- [x] ROCK 4D native NV12 + real RKNN headless smoke: contiguous 460,800-byte
+  `/dev/video11` frames, crop/full conversion equality, camera generation 28,
+  detector generation 27, and ~21–22 ms NPU invoke without web/ROS/motors.
+- [x] Direct NV12→RGB RKNN input benchmark at 30 FPS: 354 headless inferences,
+  color conversion p50 2.08 ms versus 3.63 ms for NV12→BGR→RGB, detector p50
+  16.75 ms/p95 19.57 ms, and zero 33.3 ms detector-processing deadline misses.
+- [ ] Soak frame-drop behavior under concurrent detector + stream leases and
+  active ROS 2/Nav2 load.
 
 ### M4g — Lidar odometry (no encoders / no IMU)
 - [x] Define odometry-source contract: lidar scan matching is the intended

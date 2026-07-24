@@ -4,7 +4,7 @@ Unit tests for cat_follow.memory.shared_state — thread-safe SharedState.
 Covers:
   - Single-thread get/set round-trips for every resource.
   - Concurrent writer + reader on bbox_tracker to verify no torn reads.
-  - Frame copy helpers (set/get frame_latest, copy_latest_to_detector_frame).
+  - Frame copy-out and zero-copy lease ownership.
 
 Run:
     python -m pytest tests/test_shared_state.py -v
@@ -20,7 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from cat_follow.memory.pool import allocate_pool, FRAME_SHAPE, BBOX_LEN
+from cat_follow.memory.pool import allocate_pool, FRAME_RING_N, FRAME_SHAPE, BBOX_LEN
 from cat_follow.memory.shared_state import SharedState
 
 
@@ -47,27 +47,28 @@ def test_bbox_tracker_default_zero():
 
 def test_detector_frame_generation_and_bbox_tagging():
     shared = _make_shared()
-    dst = np.empty(FRAME_SHAPE, dtype=np.uint8)
 
-    # Publish a frame and snapshot it for the detector; the generation bumps.
+    # A detector lease carries the exact capture sequence for bbox tagging.
     src = np.full(FRAME_SHAPE, 7, dtype=np.uint8)
     shared.set_frame_latest(src)
-    gen1 = shared.snapshot_detector_frame(dst)
+    lease1 = shared.acquire_latest_frame()
+    assert lease1 is not None
+    gen1 = lease1.frame_seq
     assert gen1 == 1
-    assert np.array_equal(dst, src)
+    assert np.array_equal(lease1.frame, src)
 
-    # A bbox tagged with gen1 reports gen1; a later snapshot advances the gen so
-    # the previously-tagged bbox no longer matches the current detector frame.
     shared.set_bbox_detector(1.0, 2.0, 3.0, 4.0, 1.0, frame_gen=gen1)
     x, y, w, h, valid, gen = shared.get_bbox_detector_with_gen()
     assert (x, y, w, h, valid, gen) == (1.0, 2.0, 3.0, 4.0, 1.0, gen1)
+    lease1.release()
 
-    gen2 = shared.snapshot_detector_frame(dst)
+    shared.set_frame_latest(np.full(FRAME_SHAPE, 8, dtype=np.uint8))
+    lease2 = shared.acquire_latest_frame()
+    assert lease2 is not None
+    gen2 = lease2.frame_seq
     assert gen2 == 2
-    current_gen = shared.get_detector_frame_and_gen(dst)
-    assert current_gen == gen2
-    # Stale bbox (gen1) != current frame gen (gen2): the tracker would skip init.
-    assert shared.get_bbox_detector_with_gen()[5] != current_gen
+    assert shared.get_bbox_detector_with_gen()[5] != gen2
+    lease2.release()
 
 
 def test_bbox_detector_set_get():
@@ -161,31 +162,87 @@ def test_frame_latest_does_not_alias_src():
     assert np.all(dst == 99), "SharedState must hold a copy, not a reference"
 
 
-def test_copy_latest_to_detector_frame():
+def test_frame_lease_pins_slot_until_release():
     shared = _make_shared()
-    src = np.full(FRAME_SHAPE, 77, dtype=np.uint8)
-    shared.set_frame_latest(src)
-    shared.copy_latest_to_detector_frame()
+    shared.set_frame_latest(np.full(FRAME_SHAPE, 11, dtype=np.uint8))
+    lease = shared.acquire_latest_frame()
 
-    dst = np.zeros(FRAME_SHAPE, dtype=np.uint8)
-    shared.get_frame_for_detector(dst)
-    assert np.all(dst == 77)
+    assert lease is not None
+    assert lease.frame_seq == 1
+    assert np.shares_memory(lease.frame, shared._pool.frame_ring)
+    assert not lease.stale
+
+    # Publish enough frames to wrap the write cursor. The pinned slot must
+    # remain unchanged while the camera rotates through other free slots.
+    for value in (22, 33, 44, 55):
+        write_buf = shared.try_get_write_buffer()
+        assert write_buf is not None
+        write_buf.fill(value)
+        shared.publish_latest_from_write()
+
+    assert np.all(lease.frame == 11)
+    assert not lease.stale
+    lease.release()
+
+    # Once released, the writer may reclaim the old slot.
+    for value in range(66, 66 + FRAME_RING_N):
+        write_buf = shared.try_get_write_buffer()
+        assert write_buf is not None
+        write_buf.fill(value)
+        shared.publish_latest_from_write()
+        if lease.stale:
+            break
+    assert lease.stale
 
 
-def test_detector_frame_independent_of_later_latest():
-    """After copy, changing frame_latest must not affect frame_for_detector."""
+def test_frame_ring_drops_write_when_all_slots_are_pinned():
     shared = _make_shared()
+    leases = []
+    for value in range(1, FRAME_RING_N + 1):
+        write_buf = shared.try_get_write_buffer()
+        assert write_buf is not None
+        write_buf.fill(value)
+        shared.publish_latest_from_write()
+        lease = shared.acquire_latest_frame()
+        assert lease is not None
+        leases.append(lease)
 
-    src1 = np.full(FRAME_SHAPE, 55, dtype=np.uint8)
-    shared.set_frame_latest(src1)
-    shared.copy_latest_to_detector_frame()
+    assert shared.try_get_write_buffer() is None
 
-    src2 = np.full(FRAME_SHAPE, 88, dtype=np.uint8)
-    shared.set_frame_latest(src2)
+    leases[0].release()
+    assert shared.try_get_write_buffer() is not None
+    shared.abort_frame_write()
+    for lease in leases[1:]:
+        lease.release()
 
-    dst = np.zeros(FRAME_SHAPE, dtype=np.uint8)
-    shared.get_frame_for_detector(dst)
-    assert np.all(dst == 55), "Detector frame must keep old snapshot"
+
+def test_slow_frame_reader_never_observes_torn_pixels():
+    shared = _make_shared()
+    shared.set_frame_latest(np.full(FRAME_SHAPE, 9, dtype=np.uint8))
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+    errors = []
+
+    def _writer():
+        for value in range(20, 80):
+            write_buf = shared.try_get_write_buffer()
+            if write_buf is None:
+                continue
+            write_buf.fill(value)
+            shared.publish_latest_from_write()
+
+    writer = threading.Thread(target=_writer)
+    writer.start()
+    for _ in range(20):
+        if not np.all(lease.frame == 9):
+            errors.append("pinned frame changed")
+            break
+        time.sleep(0.001)
+    writer.join(timeout=1.0)
+    lease.release()
+
+    assert not writer.is_alive()
+    assert not errors
 
 
 def test_bbox_tracker_overwrite():

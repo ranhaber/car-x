@@ -106,6 +106,13 @@ def api_status():
     tracked_targets = (
         _ctx.shared.get_tracked_targets() if _ctx and _ctx.shared else {}
     )
+    cat_injection = (
+        _ctx.shared.get_cat_injection_status()
+        if _ctx
+        and _ctx.shared
+        and hasattr(_ctx.shared, "get_cat_injection_status")
+        else {"enabled": False, "bbox": None, "detection_fallback": False}
+    )
     legacy_state = "unknown"
     if _ctx is not None and _ctx.state_machine is not None:
         legacy_state = _ctx.state_machine.state.value
@@ -146,6 +153,7 @@ def api_status():
         "tracked_targets": _tracked_targets_dict(tracked_targets),
         # Alias for role-aware clients; same payload as tracked_targets.
         "cats": _tracked_targets_dict(tracked_targets),
+        "cat_injection": cat_injection,
         "ultrasonic_cm": (
             round(ultrasonic_cm, 1) if ultrasonic_cm is not None else None
         ),
