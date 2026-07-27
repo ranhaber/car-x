@@ -1,21 +1,21 @@
-"""Optional hardware H.264 monitoring stream over WebSocket.
+"""Hardware H.264 monitoring stream over WebSocket.
 
 Uses ``flask-sock`` for the WebSocket transport and the Rockchip MPP encoder
 (:class:`cat_follow.perception.h264_encoder.MppH264Encoder`).  The encoder is
 created lazily on the first connected client and torn down when the last
 client disconnects, so it costs nothing while nobody is watching.
 
-Registration is fully guarded: if ``flask-sock`` or GStreamer/``mpph264enc``
-are unavailable, :func:`init_h264_routes` logs and returns without touching the
-Flask app, leaving MJPEG as the only stream.  Bounding-box/state overlays are
-sent as JSON text frames and drawn client-side (the encoded video stays clean).
+Registration is guarded: if ``flask-sock`` or GStreamer/``mpph264enc`` are
+unavailable, :func:`init_h264_routes` returns ``False`` and monitoring video is
+disabled without stopping the headless perception/control runtime.
+Bounding-box/state overlays are sent as JSON text frames and drawn client-side
+(the encoded video stays clean).
 """
 
 from __future__ import annotations
 
 import json
 import threading
-import time
 
 from cat_follow.logger import get_logger
 from cat_follow.memory.pool import FRAME_H, FRAME_W
@@ -26,6 +26,8 @@ _ctx = None
 _encoder = None
 _encoder_lock = threading.Lock()
 _clients = 0
+_STREAM_FPS = 30
+_OVERLAY_INTERVAL_FRAMES = 3
 
 
 def init_h264_routes(ctx, app) -> bool:
@@ -62,7 +64,7 @@ def _get_encoder():
     with _encoder_lock:
         if _encoder is None:
             enc = MppH264Encoder(
-                FRAME_W, FRAME_H, fps=15, pixel_format="NV12"
+                FRAME_W, FRAME_H, fps=_STREAM_FPS, pixel_format="NV12"
             )
             if enc.start():
                 _encoder = enc
@@ -71,11 +73,21 @@ def _get_encoder():
 
 def _serve_h264(ws) -> None:  # noqa: ANN001
     global _clients
-    target_fps = 15.0
-    tick = 1.0 / target_fps
+    stream_stop = threading.Event()
+    last_frame_gen = 0
+    admitted = False
 
+    # Admission and reservation are one operation. The first connection owns
+    # the sole monitoring encoder until its finally block clears this slot.
     with _encoder_lock:
-        _clients += 1
+        if _clients != 0:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        _clients = 1
+        admitted = True
     if _ctx is not None and getattr(_ctx, "inc_stream_clients", None):
         _ctx.inc_stream_clients()
 
@@ -89,70 +101,96 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
             ws.close()
             return
         while True:
-            t0 = time.monotonic()
-            if _ctx is None or _ctx.shared is None:
-                time.sleep(tick)
-                continue
-
-            frame_lease = _ctx.shared.acquire_latest_frame()
-            if frame_lease is None:
-                time.sleep(tick)
-                continue
-            # Encode without holding _encoder_lock. The frame-ring lease keeps
-            # these pixels stable until the synchronous appsrc copy completes.
-            with frame_lease:
-                chunk = encoder.encode(frame_lease.frame)
-            if chunk:
+            # MPP may emit an access unit after submit's bounded wait. Poll on
+            # every loop, including loops where the camera has no newer frame.
+            for chunk in encoder.poll():
                 ws.send(chunk)
 
-            # Overlay metadata as a JSON text frame (drawn client-side).
-            bbox = _ctx.shared.get_bbox_tracker()
-            tracked_targets = _ctx.shared.get_tracked_targets()
-            state_name = "unknown"
-            if _ctx.state_machine is not None:
-                state_name = _ctx.state_machine.state.value
-            ws.send(
-                json.dumps(
-                    {
-                        "type": "overlay",
-                        "state": state_name,
-                        "bbox": [bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]],
-                        "targets": {
-                            role: {
-                                "track_id": target[0],
-                                "x": target[1],
-                                "y": target[2],
-                                "w": target[3],
-                                "h": target[4],
-                                "confidence": target[5],
-                                "frames_since_update": target[6],
-                                "valid": target[7],
-                            }
-                            for role, target in tracked_targets.items()
-                        },
-                    }
-                )
-            )
+            if _ctx is None or _ctx.shared is None:
+                stream_stop.wait(0.1)
+                continue
 
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, tick - elapsed))
-    except Exception:  # noqa: BLE001 - client disconnected
-        pass
+            frame_gen = _ctx.shared.wait_for_new_frame(
+                last_frame_gen,
+                stream_stop,
+                timeout_s=0.1,
+            )
+            if frame_gen <= last_frame_gen:
+                continue
+            frame_lease = _ctx.shared.acquire_latest_frame()
+            if frame_lease is None:
+                continue
+            if frame_lease.frame_seq <= last_frame_gen:
+                frame_lease.release()
+                continue
+            last_frame_gen = frame_lease.frame_seq
+            # DMA-BUF mode transfers lease ownership to the encoder, which
+            # releases it only after MPP emits the matching PTS. The explicit
+            # NumPy mode retains the legacy synchronous CPU-memory feed.
+            if frame_lease.dmabuf:
+                chunks = encoder.submit_dmabuf(frame_lease)
+            else:
+                with frame_lease:
+                    if frame_lease.frame is None:
+                        continue
+                    chunks = encoder.submit(frame_lease.frame)
+            # submit_dmabuf transfers ownership; on cap miss or push failure it
+            # releases the lease internally. Send every ready AU in FIFO order,
+            # including delayed AUs drained before this input was accepted.
+            for chunk in chunks:
+                ws.send(chunk)
+
+            # Overlay metadata is much smaller than video but sending a second
+            # WebSocket message for every frame adds avoidable TCP scheduling
+            # jitter. Ten updates per second keeps boxes responsive while the
+            # binary H.264 path remains one message per camera generation.
+            if last_frame_gen % _OVERLAY_INTERVAL_FRAMES == 0:
+                bbox = _ctx.shared.get_bbox_tracker()
+                tracked_targets = _ctx.shared.get_tracked_targets()
+                state_name = "unknown"
+                if _ctx.state_machine is not None:
+                    state_name = _ctx.state_machine.state.value
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "overlay",
+                            "state": state_name,
+                            "bbox": [bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]],
+                            "targets": {
+                                role: {
+                                    "track_id": target[0],
+                                    "x": target[1],
+                                    "y": target[2],
+                                    "w": target[3],
+                                    "h": target[4],
+                                    "confidence": target[5],
+                                    "frames_since_update": target[6],
+                                    "valid": target[7],
+                                }
+                                for role, target in tracked_targets.items()
+                            },
+                        }
+                    )
+                )
+
+    except Exception as exc:  # noqa: BLE001 - client disconnected
+        log.debug("H.264 stream loop ended: %s", exc)
     finally:
         # Atomically drop the client count and detach the encoder reference so a
         # concurrent new client never receives an encoder that is about to stop.
         # Stop the old encoder outside the lock (stop can block).
         global _encoder
         enc_to_stop = None
-        with _encoder_lock:
-            _clients = max(0, _clients - 1)
-            if _clients == 0 and _encoder is not None:
-                enc_to_stop = _encoder
-                _encoder = None
+        if admitted:
+            with _encoder_lock:
+                _clients = 0
+                if _encoder is not None:
+                    enc_to_stop = _encoder
+                    _encoder = None
         if enc_to_stop is not None:
             try:
                 enc_to_stop.stop()
             except Exception:  # noqa: BLE001
                 log.warning("H.264 encoder stop failed during last-client teardown")
-        if _ctx is not None and getattr(_ctx, "dec_stream_clients", None):
+        if admitted and _ctx is not None and getattr(_ctx, "dec_stream_clients", None):
             _ctx.dec_stream_clients()

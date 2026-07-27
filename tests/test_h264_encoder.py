@@ -10,6 +10,9 @@ def test_nv12_pipeline_avoids_videoconvert():
     assert "format=NV12" in pipeline
     assert "videoconvert" not in pipeline
     assert "mpph264enc" in pipeline
+    assert "profile=baseline" in pipeline
+    assert "stream-format=byte-stream" in pipeline
+    assert "drop=false" in pipeline
 
 
 def test_bgr_compatibility_pipeline_keeps_videoconvert():
