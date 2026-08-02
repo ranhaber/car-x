@@ -70,14 +70,51 @@ def api_config():
             effective["safety_degraded"] = False
             effective["safety_error"] = None
 
+    target_cfg = getattr(_ctx, "target_runtime_config", None)
+    if target_cfg is None:
+        try:
+            from cat_follow.target_config import load_target_runtime_config
+
+            target_cfg = load_target_runtime_config()
+        except Exception as exc:  # noqa: BLE001
+            target_runtime = {
+                "schema": "target-runtime-config-v1",
+                "applied_to_behavior": False,
+                "error": str(exc),
+            }
+        else:
+            target_runtime = target_cfg.telemetry_dict()
+    else:
+        target_runtime = target_cfg.telemetry_dict()
+
+    from cat_follow.active_config import active_runtime_config_dict
+    from cat_follow.safety_config import SafetyConfig, load_safety_config_from_env
+
+    if isinstance(effective, dict) and effective.get("obstacle_too_close_cm") is not None:
+        active_safety = SafetyConfig(
+            obstacle_too_close_cm=effective["obstacle_too_close_cm"],
+            obstacle_detected_cm=effective["obstacle_detected_cm"],
+        )
+    else:
+        try:
+            active_safety = load_safety_config_from_env()
+        except Exception:  # noqa: BLE001
+            active_safety = SafetyConfig()
+    active_runtime = active_runtime_config_dict(active_safety, target_cfg)
+
     return jsonify({
         "camera": camera,
         "perception": perception,
         "safety_env": env_safety,
         "safety_effective": effective,
+        "active_runtime": active_runtime,
+        "target_runtime": target_runtime,
         "note": (
             "Read-only snapshot of env-driven settings. "
             "Safety failsafe thresholds can also be overridden from Calibration "
-            "(steering_limits.json). Restart is not required for calibration overrides."
+            "(steering_limits.json). Restart is not required for calibration overrides. "
+            "active_runtime reflects values wired into DecisionEngine today; "
+            "target_runtime values are validated and observable but are not applied "
+            "to behavior during migration slice 1."
         ),
     })

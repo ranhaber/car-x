@@ -36,6 +36,10 @@ from cat_follow.control.types import (
     TelemetrySeverity,
 )
 from cat_follow.motion.motor_interface import MotorInterface
+from cat_follow.navigation.geofence import evaluate_geofence
+from cat_follow.perception.perception_lifecycle_manager import (
+    PerceptionLifecycleManager,
+)
 from cat_follow.runtime.shared_state import SharedState, now_monotonic_ms
 from cat_follow.telemetry.async_logger import AsyncLogger
 
@@ -58,6 +62,12 @@ class ControlLoop:
         fsm: FSM,
         motor_interface: MotorInterface,
         logger: Optional[AsyncLogger] = None,
+        comms_manager=None,
+        navigation_manager=None,
+        geofence_polygon=None,
+        perception_lifecycle_manager=None,
+        recording_writer=None,
+        prototype_shared_state=None,
         target_rate_hz: float = DEFAULT_TARGET_RATE_HZ,
         tick_budget_ms: int = DEFAULT_TICK_BUDGET_MS,
         consecutive_overrun_limit: int = DEFAULT_CONSECUTIVE_OVERRUN_LIMIT,
@@ -69,6 +79,12 @@ class ControlLoop:
         self._engine = decision_engine
         self._fsm = fsm
         self._motor = motor_interface
+        self._comms = comms_manager
+        self._navigation_manager = navigation_manager
+        self._geofence_polygon = geofence_polygon
+        self._lifecycle = perception_lifecycle_manager
+        self._recording_writer = recording_writer
+        self._prototype_shared = prototype_shared_state
         self._logger = logger
         self._target_rate_hz = target_rate_hz
         self._tick_budget_ms = tick_budget_ms
@@ -111,12 +127,45 @@ class ControlLoop:
     def consecutive_overruns(self) -> int:
         return self._consecutive_overruns
 
+    def attach_comms_manager(self, comms_manager) -> None:
+        """Wire deferred ACK commit after runtime components are constructed."""
+
+        self._comms = comms_manager
+
+    def attach_prototype_shared_state(self, prototype_shared_state) -> None:
+        """Attach prototype perception SharedState for lifecycle intent publish."""
+
+        self._prototype_shared = prototype_shared_state
+
     # ── single tick (test entry point and run-loop step) ────────────
 
     def tick(self, now_ms: Optional[int] = None) -> DecisionOutput:
         tick_start = now_ms if now_ms is not None else now_monotonic_ms()
+        applied_control_seq = self._tick_count + 1
+
+        if self._comms is not None:
+            self._comms.apply_pending_transactions(
+                applied_control_seq=applied_control_seq,
+                decision_engine=self._engine,
+                fsm=self._fsm,
+            )
 
         snapshot = self._ss.get_snapshot()
+        navigation = snapshot.navigation
+        if self._navigation_manager is not None:
+            navigation = self._navigation_manager.tick(
+                snapshot, self._fsm.state, tick_start
+            )
+            self._ss.update_navigation(navigation)
+        geofence = evaluate_geofence(
+            self._geofence_polygon,
+            pose_x_m=navigation.pose_x_m,
+            pose_y_m=navigation.pose_y_m,
+            pose_received_ms=navigation.pose_received_ms,
+            now_ms=tick_start,
+            previous=snapshot.geofence,
+        )
+        self._ss.update_geofence(geofence)
         decision_input = DecisionInput(
             now_ms=tick_start,
             overhead=snapshot.overhead,
@@ -124,18 +173,72 @@ class ControlLoop:
             vision=snapshot.vision,
             range=snapshot.range,
             lidar=snapshot.lidar,
-            navigation=snapshot.navigation,
+            navigation=navigation,
             system=snapshot.system,
             fsm=snapshot.fsm,
             command=snapshot.command,
+            mission=snapshot.mission,
+            geofence=geofence,
         )
 
         output = self._engine.tick(decision_input)
+        health = self._engine.dual_sensor_health
+        if health is not None:
+            self._ss.update_dual_sensor_health(health.to_dict())
+        if (
+            self._navigation_manager is not None
+            and self._fsm.state
+            in {
+                FsmState.HOME,
+                FsmState.IDLE,
+                FsmState.BRAKE_REVERSE,
+                FsmState.FAILSAFE,
+            }
+        ):
+            # Safety/preemption cancellation is same-tick and bypasses moving
+            # goal refresh rate/displacement filters.
+            self._navigation_manager.cancel()
+        self._ss.update_mission(self._engine.mission_state)
 
         # Publish FSM snapshot before motor apply so external observers
         # can see the FSM result that drove the upcoming actuator command.
         fsm_snapshot = self._fsm.snapshot(received_ms=tick_start)
         self._ss.update_fsm(fsm_snapshot)
+
+        if self._lifecycle is not None:
+            self._engine.clear_expired_recording_postroll(tick_start)
+            # Seed the tick with the writer's last known health so the
+            # pre-merge snapshot cannot claim camera demand for a recorder
+            # that is already degraded.
+            last_recording = (
+                self._recording_writer.runtime_state()
+                if self._recording_writer is not None
+                else None
+            )
+            lifecycle = self._lifecycle.tick(
+                fsm_state=self._fsm.state,
+                mission=self._engine.mission_state,
+                context=self._engine.lifecycle_context(),
+                now_ms=tick_start,
+                recording_feedback=last_recording,
+            )
+            if self._recording_writer is not None:
+                feedback = self._recording_writer.tick(
+                    lifecycle, now_ms=tick_start
+                )
+                lifecycle = self._lifecycle.merge_recording_feedback(feedback)
+            self._ss.update_perception_lifecycle(lifecycle)
+            if self._prototype_shared is not None and hasattr(
+                self._prototype_shared, "set_perception_intent"
+            ):
+                self._prototype_shared.set_perception_intent(
+                    capture_active=lifecycle.capture_active,
+                    detector_required=lifecycle.detector.requested,
+                    detector_mission_override=lifecycle.detector_mission_override,
+                    stream_forced_off=lifecycle.stream_forced_off,
+                    detector_force_off=self._fsm.state
+                    in {FsmState.HOME, FsmState.FAILSAFE},
+                )
 
         decision_state = DecisionState(
             timestamp_ms=int(time.time() * 1000),

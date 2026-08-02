@@ -7,5 +7,5 @@
   "target_distance_cm": 15,
   "obstacle_too_close_cm": 10,
   "obstacle_detected_cm": 50,
-  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle. target_distance_cm = closest approach distance (cm) for obstacle/approach logic. obstacle_too_close_cm = hard failsafe distance; obstacle_detected_cm = veto ramp start (must be greater)."
+  "notes": "Do not exceed max_steer to avoid servo strain. Radii measured for max steer angle. target_distance_cm = closest approach distance (cm) for obstacle/approach logic. obstacle_too_close_cm = proximity stop distance, applied by DecisionEngine as a floor under CAT_FOLLOW_BRAKE_REVERSE_TRIGGER_CM (the larger value wins); obstacle_detected_cm = veto ramp start (must be greater)."
 }

@@ -13,7 +13,7 @@ def test_idle_to_goto_on_cat_location():
     assert sm.state == State.IDLE
     sm.dispatch(Event.CAT_LOCATION_RECEIVED, (100, 50))
     assert sm.state == State.GOTO_TARGET
-    assert sm.target_xy == (100, 50)
+    assert sm.target_xy_cm == (100, 50)
 
 
 def test_goto_to_idle_on_at_target():

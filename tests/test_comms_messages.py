@@ -36,7 +36,7 @@ def test_tracking_message_round_trip():
         cat=TrackingCat(x=10.0, y=20.0, confidence=1.0),
     )
     payload = msg.to_dict()
-    assert payload["type"] == "tracking"
+    assert payload["type"] == "overhead_observation"
     assert payload["frame_id"] == "yard"
     restored = TrackingMessage.from_dict(payload)
     assert restored == msg
@@ -107,15 +107,54 @@ def test_ack_message_round_trip_accepted():
         ack_type=AckType.COMMAND,
         command_id="cmd-0001",
         status=AckStatus.ACCEPTED,
-        state=FsmState.CHASE_A,
+        state=FsmState.GETTING_CLOSE,
         reason=ReasonCode.START_CHASE_ACCEPTED,
         cause=None,
     )
     payload = ack.to_dict()
     assert payload["status"] == "accepted"
+    assert payload["state"] == "GETTING_CLOSE"
     assert payload["cause"] is None
     restored = AckMessage.from_dict(payload)
     assert restored == ack
+
+
+def test_ack_message_accepts_legacy_state_and_reemits_canonical_name():
+    payload = AckMessage(
+        sequence=9001,
+        timestamp_ms=11,
+        ack_sequence=2002,
+        ack_type=AckType.COMMAND,
+        command_id="cmd-legacy",
+        status=AckStatus.ACCEPTED,
+        state=FsmState.GETTING_CLOSE,
+        reason=ReasonCode.START_CHASE_ACCEPTED,
+    ).to_dict()
+    payload["state"] = "CHASE_A"
+
+    restored = AckMessage.from_dict(payload)
+
+    assert restored.state is FsmState.GETTING_CLOSE
+    assert restored.to_dict()["state"] == "GETTING_CLOSE"
+
+
+def test_ack_message_accepts_legacy_brake_state_and_reemits_canonical_name():
+    payload = AckMessage(
+        sequence=9003,
+        timestamp_ms=11,
+        ack_sequence=2004,
+        ack_type=AckType.COMMAND,
+        command_id="cmd-legacy-brake",
+        status=AckStatus.ACCEPTED,
+        state=FsmState.BRAKE_REVERSE,
+        reason=ReasonCode.FINAL_APPROACH,
+    ).to_dict()
+    payload["state"] = "BRAKE"
+
+    restored = AckMessage.from_dict(payload)
+
+    assert restored.state is FsmState.BRAKE_REVERSE
+    assert restored.to_dict()["state"] == "BRAKE_REVERSE"
 
 
 def test_ack_message_round_trip_rejected():

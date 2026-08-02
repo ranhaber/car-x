@@ -4,19 +4,26 @@ Listens on a configurable bind address/port, parses each datagram as JSON,
 dispatches the typed message to ``CommsManager.submit_tracking`` or
 ``CommsManager.submit_command``, and logs malformed packets via telemetry
 without ever killing the receiver thread.
+
+Tracking is published inline because it is a cheap state update.  Commands and
+mission events block until the control loop commits them, so they are handed to
+a single worker thread: overhead tracking must keep flowing while a command is
+in flight, and one worker preserves command ordering.
 """
 
 from __future__ import annotations
 
 import hmac
 import json
+import queue
 import socket
 import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from cat_follow.comms.comms_manager import CommsManager
 from cat_follow.comms.messages import (
     CommandMessage,
+    MissionEventMessage,
     SchemaVersionError,
     TrackingMessage,
 )
@@ -42,6 +49,11 @@ DEFAULT_RECV_BUFSIZE = 65535
 # requiring asynchronous I/O.
 DEFAULT_RECV_TIMEOUT_S = 0.1
 
+# Bound on commands awaiting commit.  Small on purpose: a control loop that is
+# too slow to drain this should shed load visibly rather than queue minutes of
+# stale operator intent.
+DEFAULT_COMMAND_QUEUE_SIZE = 32
+
 # Environment variable holding the shared secret required on command
 # datagrams.  When set, a COMMAND packet must carry a matching top-level
 # ``token`` field or it is dropped.  When unset, command auth is disabled
@@ -49,6 +61,9 @@ DEFAULT_RECV_TIMEOUT_S = 0.1
 # unauthenticated, spoofable transport and commands can move the car, so
 # operators binding beyond localhost should always configure this.
 COMMAND_TOKEN_ENV = COMMS_TOKEN_ENV
+
+_ContractMessage = Union[CommandMessage, MissionEventMessage]
+_QueuedMessage = Tuple[_ContractMessage, Tuple[str, int]]
 
 
 class UdpReceiver:
@@ -65,6 +80,7 @@ class UdpReceiver:
         thread_name: str = "CatFollow-Comms-RX",
         source: str = "UdpReceiver",
         command_token: Optional[str] = None,
+        command_queue_size: int = DEFAULT_COMMAND_QUEUE_SIZE,
     ) -> None:
         self._comms = comms_manager
         self._bind_host = bind_host
@@ -89,6 +105,10 @@ class UdpReceiver:
 
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
+        self._command_thread: Optional[threading.Thread] = None
+        self._command_queue: "queue.Queue[_QueuedMessage]" = queue.Queue(
+            maxsize=command_queue_size
+        )
         self._stop = threading.Event()
 
     # ── lifecycle ───────────────────────────────────────────────────
@@ -103,6 +123,12 @@ class UdpReceiver:
         self._sock.settimeout(self._recv_timeout_s)
         if self._command_token is None:
             self._log_auth_disabled()
+        self._command_thread = threading.Thread(
+            target=self._run_commands,
+            name=f"{self._thread_name}-Cmd",
+            daemon=True,
+        )
+        self._command_thread.start()
         self._thread = threading.Thread(
             target=self._run,
             name=self._thread_name,
@@ -116,6 +142,10 @@ class UdpReceiver:
         self._thread = None
         if thread is not None:
             thread.join(timeout=timeout)
+        command_thread = self._command_thread
+        self._command_thread = None
+        if command_thread is not None:
+            command_thread.join(timeout=timeout)
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -149,7 +179,47 @@ class UdpReceiver:
                 # Socket closed or other transport error.  Bail out of the
                 # loop; ``stop`` releases resources.
                 return
-            self._handle_packet(data, addr)
+            try:
+                self._handle_packet(data, addr)
+            except Exception as exc:  # noqa: BLE001
+                # Ingress must outlive any single packet: losing this thread
+                # would silently stop tracking and command reception until the
+                # process restarts.
+                self._log_packet_error(addr, "handler_error", repr(exc))
+
+    def _run_commands(self) -> None:
+        while True:
+            try:
+                item = self._command_queue.get(timeout=self._recv_timeout_s)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            msg, addr = item
+            try:
+                if isinstance(msg, CommandMessage):
+                    self._comms.submit_command(msg)
+                else:
+                    self._comms.submit_mission_event(msg)
+            except TimeoutError as exc:
+                # The control loop did not commit within the ACK deadline. The
+                # sender retries with the same command_id, which the
+                # idempotency cache resolves, so keep serving the queue.
+                self._log_packet_error(addr, "commit_timeout", str(exc))
+            except Exception as exc:  # noqa: BLE001
+                self._log_packet_error(addr, "handler_error", repr(exc))
+
+    def _enqueue_command(
+        self, msg: "_ContractMessage", addr: Tuple[str, int]
+    ) -> None:
+        try:
+            self._command_queue.put_nowait((msg, addr))
+        except queue.Full:
+            self._log_packet_error(
+                addr,
+                "command_queue_full",
+                "control loop is not draining queued commands",
+            )
 
     def _handle_packet(self, data: bytes, addr: Tuple[str, int]) -> None:
         try:
@@ -160,7 +230,10 @@ class UdpReceiver:
 
         msg_type = payload.get("type") if isinstance(payload, dict) else None
         try:
-            if msg_type == MessageType.TRACKING.value:
+            if msg_type in {
+                MessageType.TRACKING.value,
+                MessageType.OVERHEAD_OBSERVATION.value,
+            }:
                 self._comms.submit_tracking(TrackingMessage.from_dict(payload))
                 return
             if msg_type == MessageType.COMMAND.value:
@@ -173,7 +246,19 @@ class UdpReceiver:
                         "missing or invalid token",
                     )
                     return
-                self._comms.submit_command(CommandMessage.from_dict(payload))
+                self._enqueue_command(CommandMessage.from_dict(payload), addr)
+                return
+            if msg_type == MessageType.MISSION_EVENT.value:
+                if not self._command_authorized(payload):
+                    self._log_packet_error(
+                        addr,
+                        "unauthorized_mission_event",
+                        "missing or invalid token",
+                    )
+                    return
+                self._enqueue_command(
+                    MissionEventMessage.from_dict(payload), addr
+                )
                 return
         except SchemaVersionError as exc:
             self._log_packet_error(addr, "schema_version_error", str(exc))
@@ -239,4 +324,9 @@ class UdpReceiver:
         )
 
 
-__all__ = ["UdpReceiver", "DEFAULT_RECV_BUFSIZE", "DEFAULT_RECV_TIMEOUT_S"]
+__all__ = [
+    "UdpReceiver",
+    "DEFAULT_RECV_BUFSIZE",
+    "DEFAULT_RECV_TIMEOUT_S",
+    "DEFAULT_COMMAND_QUEUE_SIZE",
+]

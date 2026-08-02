@@ -54,7 +54,7 @@
       <div>Status: <strong x-text="sequenceStatus.status || 'idle'"></strong></div>
       <div>FSM: <strong x-text="sequenceStatus.fsm_state || '—'"></strong></div>
       <div>Step: <strong x-text="(sequenceStatus.action_index ?? 0) + '/' + (sequenceStatus.action_count ?? 0)"></strong></div>
-      <div>Failsafe: <strong x-text="(sequenceStatus.obstacle_too_close_cm ?? '—') + ' cm'"></strong></div>
+      <div>Stop distance: <strong x-text="(sequenceStatus.obstacle_too_close_cm ?? '—') + ' cm'"></strong></div>
     </div>
   </div>
 

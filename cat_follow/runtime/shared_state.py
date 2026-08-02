@@ -26,15 +26,21 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from cat_follow.comms.messages import PendingTransaction
 
 from cat_follow.control.types import (
     CommandState,
     DecisionState,
     FSMSnapshot,
+    GeofenceState,
     HomeState,
+    MissionState,
     NavigationState,
     OverheadState,
+    PerceptionLifecycleState,
     RangeState,
     SharedSnapshot,
     SystemState,
@@ -80,6 +86,12 @@ class SharedState:
         self._lock_fsm = threading.Lock()
         self._lock_command = threading.Lock()
         self._lock_decision = threading.Lock()
+        self._lock_runtime_health = threading.Lock()
+        self._lock_mission = threading.Lock()
+        self._lock_geofence = threading.Lock()
+        self._lock_perception_lifecycle = threading.Lock()
+        self._lock_dual_sensor_health = threading.Lock()
+        self._lock_pending = threading.Lock()
 
         self._overhead: OverheadState = OverheadState()
         self._home: HomeState = HomeState()
@@ -94,6 +106,14 @@ class SharedState:
         self._fsm: FSMSnapshot = FSMSnapshot()
         self._command: CommandState = CommandState()
         self._decision: DecisionState = DecisionState()
+        self._mission: MissionState = MissionState()
+        self._geofence: GeofenceState = GeofenceState()
+        self._perception_lifecycle: PerceptionLifecycleState = (
+            PerceptionLifecycleState()
+        )
+        self._dual_sensor_health: Optional[dict] = None
+        self._pending: List[PendingTransaction] = []
+        self._runtime_fatal_reason: Optional[str] = None
 
     # ── overhead (CommsManager) ─────────────────────────────────────
 
@@ -105,7 +125,7 @@ class SharedState:
         with self._lock_overhead:
             return self._overhead
 
-    # ── home (CommsManager) ─────────────────────────────────────────
+    # ── home (HomeStore commit path) ────────────────────────────────
 
     def update_home(self, new: HomeState) -> None:
         with self._lock_home:
@@ -114,6 +134,34 @@ class SharedState:
     def get_home(self) -> HomeState:
         with self._lock_home:
             return self._home
+
+    # ── geofence (Geofence aggregator) ──────────────────────────────
+
+    def update_geofence(self, new: GeofenceState) -> None:
+        with self._lock_geofence:
+            self._geofence = new
+
+    def get_geofence(self) -> GeofenceState:
+        with self._lock_geofence:
+            return self._geofence
+
+    # ── perception lifecycle (PerceptionLifecycleManager) ───────────
+
+    def update_perception_lifecycle(self, new: PerceptionLifecycleState) -> None:
+        with self._lock_perception_lifecycle:
+            self._perception_lifecycle = new
+
+    def get_perception_lifecycle(self) -> PerceptionLifecycleState:
+        with self._lock_perception_lifecycle:
+            return self._perception_lifecycle
+
+    def update_dual_sensor_health(self, payload: Optional[dict]) -> None:
+        with self._lock_dual_sensor_health:
+            self._dual_sensor_health = payload
+
+    def get_dual_sensor_health(self) -> Optional[dict]:
+        with self._lock_dual_sensor_health:
+            return self._dual_sensor_health
 
     # ── vision (VisionTracker) ──────────────────────────────────────
 
@@ -165,6 +213,16 @@ class SharedState:
         with self._lock_system:
             return self._system
 
+    def set_runtime_fatal_reason(self, reason: str) -> None:
+        """Latch the first fatal runtime reason for status/diagnostics."""
+        with self._lock_runtime_health:
+            if self._runtime_fatal_reason is None:
+                self._runtime_fatal_reason = str(reason)
+
+    def get_runtime_fatal_reason(self) -> Optional[str]:
+        with self._lock_runtime_health:
+            return self._runtime_fatal_reason
+
     # ── fsm (FSM) ───────────────────────────────────────────────────
 
     def update_fsm(self, new: FSMSnapshot) -> None:
@@ -184,6 +242,32 @@ class SharedState:
     def get_command(self) -> CommandState:
         with self._lock_command:
             return self._command
+
+    # ── mission (CommsManager / DecisionEngine) ─────────────────────
+
+    def update_mission(self, new: MissionState) -> None:
+        with self._lock_mission:
+            self._mission = new
+
+    def get_mission(self) -> MissionState:
+        with self._lock_mission:
+            return self._mission
+
+    # ── pending transactions (CommsManager ingress) ───────────────
+
+    def enqueue_pending(self, txn: PendingTransaction) -> None:
+        with self._lock_pending:
+            self._pending.append(txn)
+
+    def drain_pending(self) -> List[PendingTransaction]:
+        with self._lock_pending:
+            pending = list(self._pending)
+            self._pending.clear()
+            return pending
+
+    def pending_count(self) -> int:
+        with self._lock_pending:
+            return len(self._pending)
 
     # ── decision (DecisionEngine) ───────────────────────────────────
 
@@ -227,6 +311,12 @@ class SharedState:
             command = self._command
         with self._lock_decision:
             decision = self._decision
+        with self._lock_mission:
+            mission = self._mission
+        with self._lock_geofence:
+            geofence = self._geofence
+        with self._lock_perception_lifecycle:
+            perception_lifecycle = self._perception_lifecycle
 
         return SharedSnapshot(
             overhead=overhead,
@@ -239,4 +329,7 @@ class SharedState:
             fsm=fsm,
             command=command,
             decision=decision,
+            mission=mission,
+            geofence=geofence,
+            perception_lifecycle=perception_lifecycle,
         )

@@ -12,9 +12,11 @@ Run with::
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
@@ -36,12 +38,32 @@ from cat_follow.motion.motor_interface import (
     NoOpMotorBackend,
 )
 from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+from cat_follow.navigation.manager import NavigationManager
+from cat_follow.navigation.map_config import resolve_map_file
+from cat_follow.navigation.startup_seed import (
+    apply_startup_to_shared_state,
+    load_startup_artifacts,
+)
+from cat_follow.home.store import HomeStore, default_home_path
+from cat_follow.navigation.geofence import default_geofence_path
+from cat_follow.perception.perception_lifecycle_manager import (
+    PerceptionLifecycleManager,
+)
+from cat_follow.perception.recording_store import (
+    RecordingStore,
+    default_recording_dir,
+)
+from cat_follow.memory.pool import FRAME_H, FRAME_W
+from cat_follow.perception.recording_encoder import create_recording_encoder
+from cat_follow.perception.recording_writer import RecordingWriter
 from cat_follow.perception_config import load_perception_config
+from cat_follow.active_config import active_runtime_config_dict
 from cat_follow.safety_config import (
     apply_safety_config_to_runtime,
     resolve_safety_config,
 )
-from cat_follow.web_ui.control_policy import require_production_control_tokens
+from cat_follow.target_config import TargetRuntimeConfig, load_target_runtime_config
+from cat_follow.web_ui.control_policy import load_control_auth_policy
 from cat_follow.perception.range_adapter import RangeAdapter
 from cat_follow.perception.vision_adapter import VisionAdapter
 from cat_follow.runtime.control_loop import ControlLoop
@@ -65,7 +87,10 @@ class App:
     logger: AsyncLogger
     control_loop: ControlLoop
     comms_manager: CommsManager
+    navigation_manager: NavigationManager
     stop_event: threading.Event
+    perception_lifecycle_manager: Optional[PerceptionLifecycleManager] = None
+    recording_writer: Optional[RecordingWriter] = None
     udp_receiver: Optional[UdpReceiver] = None
     udp_sender: Optional[UdpSender] = None
     vision_adapter: Optional[VisionAdapter] = None
@@ -76,6 +101,7 @@ class App:
         default_factory=tuple
     )
     prototype_detector_handshake: Optional[Any] = None
+    prototype_camera_handshake: Optional[Any] = None
     ros_nav: bool = False
     start_bicycle_odom: bool = False
     ros_bridge_thread: Optional[threading.Thread] = None
@@ -83,13 +109,26 @@ class App:
     web_ui_thread: Optional[threading.Thread] = None
     apply_safety_config: Optional[Callable[..., Any]] = None
     safety_config: Optional[Any] = None
+    target_runtime_config: Optional[TargetRuntimeConfig] = None
 
     def start(self) -> None:
         self.logger.start()
         try:
             if self.range_source is not None:
                 self.range_source.start()
-            for thread in self.prototype_perception_threads:
+            camera_threads = [
+                t for t in self.prototype_perception_threads if "Camera" in t.name
+            ]
+            other_threads = [
+                t for t in self.prototype_perception_threads if "Camera" not in t.name
+            ]
+            for thread in camera_threads:
+                thread.start()
+            if self.prototype_camera_handshake is not None:
+                self.prototype_camera_handshake.wait_ready()
+            elif camera_threads:
+                time.sleep(0.2)
+            for thread in other_threads:
                 thread.start()
             # Startup handshake: block until the detector worker validates its
             # RKNN backend (or reports the dev/CI stub). A validation failure
@@ -100,13 +139,21 @@ class App:
                 self.vision_adapter.start()
             if self.range_adapter is not None:
                 self.range_adapter.start()
+            if self.recording_writer is not None:
+                self.recording_writer.start()
             if self.ros_nav:
                 self._start_ros_bridge()
-            if self.web_ui_thread is not None:
-                self.web_ui_thread.start()
             self.control_loop.start()
             if self.udp_receiver is not None:
                 self.udp_receiver.start()
+            if self.web_ui_thread is not None:
+                try:
+                    self.web_ui_thread.start()
+                except Exception as exc:  # noqa: BLE001
+                    sys.stderr.write(
+                        f"warning: web UI thread could not start ({exc!r}); "
+                        "core runtime remains active\n"
+                    )
         except BaseException:
             # A partially-started runtime must release every resource it
             # acquired. In particular, ultrasonic/RT-policy failures must not
@@ -125,6 +172,7 @@ class App:
 
             self.ros_bridge_thread = spin_in_thread(
                 self.shared_state,
+                navigation_manager=self.navigation_manager,
                 start_bicycle_odom=self.start_bicycle_odom,
                 safety_config=self.safety_config,
                 bridge_holder=self.ros_bridge_holder,
@@ -148,6 +196,8 @@ class App:
         if self.udp_receiver is not None:
             self.udp_receiver.stop(timeout=timeout)
         self.control_loop.stop(timeout=timeout)
+        if self.recording_writer is not None:
+            self.recording_writer.stop(timeout=timeout)
         if self.range_adapter is not None:
             self.range_adapter.stop(timeout=timeout)
         if self.range_source is not None:
@@ -156,7 +206,19 @@ class App:
             self.vision_adapter.stop(timeout=timeout)
         if self.prototype_perception_stop_event is not None:
             self.prototype_perception_stop_event.set()
-            for thread in self.prototype_perception_threads:
+            camera_threads = [
+                t
+                for t in self.prototype_perception_threads
+                if "Camera" in t.name
+            ]
+            other_threads = [
+                t
+                for t in self.prototype_perception_threads
+                if "Camera" not in t.name
+            ]
+            for thread in other_threads:
+                thread.join(timeout=timeout)
+            for thread in camera_threads:
                 thread.join(timeout=timeout)
         self.logger.stop(timeout=timeout)
         if self.udp_sender is not None:
@@ -185,6 +247,8 @@ def build_app(
     prototype_perception_stop_event: Optional[threading.Event] = None,
     prototype_detector_handshake: Optional[Any] = None,
     prototype_detector_fatal_hook: Optional[Any] = None,
+    prototype_camera_handshake: Optional[Any] = None,
+    prototype_camera_fatal_hook: Optional[Any] = None,
     ros_nav: bool = False,
     start_bicycle_odom: bool = False,
     web_ui: bool = False,
@@ -232,10 +296,16 @@ def build_app(
     """
 
     if web_ui or udp_listen_port is not None:
-        # External motion-capable control planes are fail-closed unless both
-        # production tokens are provisioned or bench mode is explicitly opted
-        # into with CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL=1.
-        auth_policy = require_production_control_tokens()
+        # Missing production credentials disable mutating control planes, but
+        # monitoring must never prevent the camera/detector/tracker/control
+        # runtime from starting. Web routes return 503 through their auth
+        # decorator; UDP ingress is omitted below unless it can fail closed.
+        auth_policy = load_control_auth_policy()
+        if not auth_policy.is_production_ready:
+            sys.stderr.write(
+                "warning: control authentication is incomplete; mutating web "
+                "control and unauthenticated UDP ingress are disabled\n"
+            )
     else:
         auth_policy = None
 
@@ -254,17 +324,86 @@ def build_app(
     # range, or ROS thread starts. Invalid persisted safety values fail startup
     # rather than silently falling back to less conservative defaults.
     safety_config = resolve_safety_config(calibration)
+    # Canonical knobs are activated incrementally; telemetry identifies the
+    # fields currently wired into DecisionEngine and NavigationManager.
+    target_runtime_config = load_target_runtime_config()
+    home_path = target_runtime_config.home_file or default_home_path()
+    home_store = HomeStore(
+        home_path,
+        map_id=resolve_map_file(),
+        calibration_version=0,
+    )
+    geofence_path = (
+        target_runtime_config.geofence_file or default_geofence_path()
+    )
+    startup_artifacts = load_startup_artifacts(
+        home_store=home_store,
+        geofence_path=geofence_path,
+        require_home=target_runtime_config.startup_require_home,
+        require_geofence=target_runtime_config.startup_require_geofence,
+    )
+    apply_startup_to_shared_state(shared_state, startup_artifacts)
+    geofence_polygon = startup_artifacts.geofence
     ros_bridge_holder: dict = {}
     decision_engine = DecisionEngine(
         fsm,
         sequence_executor=sequence_executor,
         obstacle_too_close_cm=safety_config.obstacle_too_close_cm,
+        target_runtime_config=target_runtime_config,
     )
     if motor_backend is None:
         motor_backend = _make_default_backend(use_picarx=use_picarx)
 
     sink_path = log_path if log_path is not None else default_jsonl_path("logs")
     logger = AsyncLogger(sink=JsonlFileSink(sink_path))
+    navigation_manager = NavigationManager(
+        target_runtime_config, logger=logger
+    )
+    perception_lifecycle_manager = PerceptionLifecycleManager(
+        target_runtime_config, logger=logger
+    )
+    recording_dir = (
+        target_runtime_config.recording_dir or default_recording_dir()
+    )
+    recording_store = RecordingStore(
+        recording_dir,
+        quota_bytes=target_runtime_config.recording_quota_bytes,
+        min_free_bytes=target_runtime_config.recording_min_free_bytes,
+    )
+    recovered_segments = recording_store.recover_incomplete()
+    recording_writer = RecordingWriter(
+        recording_store,
+        encoder=create_recording_encoder(
+            prototype_vision_shared_state,
+            width=FRAME_W,
+            height=FRAME_H,
+        ),
+        segment_duration_ms=int(
+            target_runtime_config.recording_segment_sec * 1000
+        ),
+    )
+    logger.log(
+        event_type=TelemetryEventType.CONFIGURATION,
+        severity=TelemetrySeverity.INFO,
+        source="Runtime",
+        state=fsm.state,
+        data={
+            "target_runtime": target_runtime_config.telemetry_dict(),
+            "active_runtime": active_runtime_config_dict(
+                safety_config, target_runtime_config
+            ),
+            "startup": {
+                "ready": startup_artifacts.ready,
+                "home_loaded": startup_artifacts.home is not None,
+                "geofence_loaded": startup_artifacts.geofence is not None,
+                "degraded_reason": startup_artifacts.degraded_reason,
+                "home_path": home_path,
+                "geofence_path": geofence_path,
+                "recording_dir": recording_dir,
+                "recovered_recording_segments": recovered_segments,
+            },
+        },
+    )
 
     motor = MotorInterface(backend=motor_backend, logger=logger)
     control_loop = ControlLoop(
@@ -273,18 +412,32 @@ def build_app(
         fsm=fsm,
         motor_interface=motor,
         logger=logger,
+        navigation_manager=navigation_manager,
+        geofence_polygon=geofence_polygon,
+        perception_lifecycle_manager=perception_lifecycle_manager,
+        recording_writer=recording_writer,
+        prototype_shared_state=prototype_vision_shared_state,
         target_rate_hz=target_rate_hz,
     )
 
     app_stop_event = stop_event or threading.Event()
+    fatal_lock = threading.Lock()
 
-    def _enter_failsafe(reason: str) -> None:
+    def _enter_failsafe(
+        reason: str, *, latch_runtime_fatal: bool = False
+    ) -> None:
         """Synchronously stop motors and latch the FSM into FAILSAFE.
 
         Shared by the comms emergency-stop path and the perception fatal-error
         escalation.  Latching means only an operator ``clear_failsafe`` leaves
         FAILSAFE, so subsequent control ticks keep emitting a safe stop.
         """
+        if latch_runtime_fatal:
+            with fatal_lock:
+                first_fatal = shared_state.get_runtime_fatal_reason() is None
+                shared_state.set_runtime_fatal_reason(reason)
+            if not first_fatal:
+                return
         # Queue CRITICAL telemetry first and wake the async writer promptly.
         # Motor/FSM safety does not wait for disk I/O.
         try:
@@ -315,12 +468,25 @@ def build_app(
     # failures) must stop the whole vehicle, not just the perception threads.
     if prototype_detector_fatal_hook is not None:
         def _on_detector_fatal(message: str) -> None:
-            _enter_failsafe(f"perception_fatal: {message}")
+            _enter_failsafe(
+                f"perception_fatal: {message}", latch_runtime_fatal=True
+            )
             app_stop_event.set()
             if prototype_perception_stop_event is not None:
                 prototype_perception_stop_event.set()
 
         prototype_detector_fatal_hook.set_handler(_on_detector_fatal)
+
+    if prototype_camera_fatal_hook is not None:
+        def _on_camera_fatal(message: str) -> None:
+            _enter_failsafe(
+                f"camera_fatal: {message}", latch_runtime_fatal=True
+            )
+            app_stop_event.set()
+            if prototype_perception_stop_event is not None:
+                prototype_perception_stop_event.set()
+
+        prototype_camera_fatal_hook.set_handler(_on_camera_fatal)
 
     udp_sender: Optional[UdpSender] = None
     if udp_target_host is not None and udp_target_port is not None:
@@ -344,10 +510,22 @@ def build_app(
             and hasattr(prototype_vision_shared_state, "request_detector_warmup")
             else None
         ),
+        home_store=home_store,
+        geofence_polygon=geofence_polygon,
+    )
+    control_loop.attach_comms_manager(comms_manager)
+    comms_manager.bind_runtime(
+        control_loop=control_loop,
+        decision_engine=decision_engine,
+        fsm=fsm,
     )
 
     udp_receiver: Optional[UdpReceiver] = None
-    if udp_listen_port is not None:
+    if (
+        udp_listen_port is not None
+        and auth_policy is not None
+        and (auth_policy.comms_token is not None or auth_policy.allow_unauthenticated)
+    ):
         udp_receiver = UdpReceiver(
             comms_manager=comms_manager,
             bind_host=udp_listen_host or "0.0.0.0",
@@ -367,6 +545,7 @@ def build_app(
             contract_shared_state=shared_state,
             image_width=vision_image_width,
             image_height=vision_image_height,
+            freshness_ttl_ms=target_runtime_config.local_track_stale_ms,
             logger=logger,
         )
 
@@ -405,7 +584,12 @@ def build_app(
             sequence_executor=sequence_executor,
             apply_safety_config=apply_runtime_safety,
             calibration=calibration,
+            target_runtime_config=target_runtime_config,
+            perception_lifecycle_manager=perception_lifecycle_manager,
         )
+
+    if prototype_vision_shared_state is not None:
+        control_loop.attach_prototype_shared_state(prototype_vision_shared_state)
 
     return App(
         shared_state=shared_state,
@@ -416,7 +600,10 @@ def build_app(
         logger=logger,
         control_loop=control_loop,
         comms_manager=comms_manager,
+        navigation_manager=navigation_manager,
         stop_event=app_stop_event,
+        perception_lifecycle_manager=perception_lifecycle_manager,
+        recording_writer=recording_writer,
         udp_receiver=udp_receiver,
         udp_sender=udp_sender,
         vision_adapter=vision_adapter,
@@ -425,12 +612,14 @@ def build_app(
         prototype_perception_threads=prototype_perception_threads,
         prototype_perception_stop_event=prototype_perception_stop_event,
         prototype_detector_handshake=prototype_detector_handshake,
+        prototype_camera_handshake=prototype_camera_handshake,
         ros_nav=ros_nav,
         start_bicycle_odom=start_bicycle_odom,
         ros_bridge_holder=ros_bridge_holder,
         web_ui_thread=web_ui_thread,
         apply_safety_config=apply_runtime_safety,
         safety_config=safety_config,
+        target_runtime_config=target_runtime_config,
     )
 
 
@@ -444,6 +633,8 @@ def _build_web_ui_thread(
     sequence_executor: MotionSequenceExecutor,
     apply_safety_config: Optional[Callable[..., Any]] = None,
     calibration: Optional[Any] = None,
+    target_runtime_config: Optional[TargetRuntimeConfig] = None,
+    perception_lifecycle_manager: Optional[PerceptionLifecycleManager] = None,
 ) -> Optional[threading.Thread]:
     """Build a daemon Flask thread for contract-runtime monitoring."""
     if memory_shared is None:
@@ -472,26 +663,68 @@ def _build_web_ui_thread(
         )
         return None
 
-    flask_app = create_app(
-        shared=memory_shared,
-        state_machine=None,
-        calibration=calibration,
-        picarx=picarx,
-        runtime_shared=runtime_shared,
-        comms_manager=comms_manager,
-        sequence_executor=sequence_executor,
-        apply_safety_config=apply_safety_config,
-    )
+    try:
+        flask_app = create_app(
+            shared=memory_shared,
+            state_machine=None,
+            calibration=calibration,
+            picarx=picarx,
+            runtime_shared=runtime_shared,
+            comms_manager=comms_manager,
+            sequence_executor=sequence_executor,
+            apply_safety_config=apply_safety_config,
+            target_runtime_config=target_runtime_config,
+            perception_lifecycle_manager=perception_lifecycle_manager,
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(
+            f"warning: --web-ui initialization failed ({exc!r}); skipping\n"
+        )
+        return None
 
     def _run() -> None:
-        # threaded=True so MJPEG + status polls don't block each other.
-        flask_app.run(
-            host="0.0.0.0",
-            port=port,
-            debug=False,
-            use_reloader=False,
-            threaded=True,
-        )
+        # threaded=True so H.264 WS + status polls don't block each other.
+        # WebCodecs requires a secure context; enable TLS with
+        # CAT_FOLLOW_WEB_SSL_CERTFILE / CAT_FOLLOW_WEB_SSL_KEYFILE (or
+        # CAT_FOLLOW_WEB_SSL_ADHOC=1 with pyOpenSSL).
+        run_kwargs: dict[str, Any] = {
+            "host": "0.0.0.0",
+            "port": port,
+            "debug": False,
+            "use_reloader": False,
+            "threaded": True,
+        }
+        certfile = os.environ.get("CAT_FOLLOW_WEB_SSL_CERTFILE", "").strip()
+        keyfile = os.environ.get("CAT_FOLLOW_WEB_SSL_KEYFILE", "").strip()
+        if certfile and keyfile:
+            if Path(certfile).is_file() and Path(keyfile).is_file():
+                run_kwargs["ssl_context"] = (certfile, keyfile)
+            else:
+                sys.stderr.write(
+                    "warning: web UI TLS certificate/key is missing; "
+                    "web UI disabled; core runtime remains active\n"
+                )
+                return
+        elif certfile or keyfile:
+            sys.stderr.write(
+                "warning: web UI TLS requires both certificate and key; "
+                "web UI disabled; core runtime remains active\n"
+            )
+            return
+        elif os.environ.get("CAT_FOLLOW_WEB_SSL_ADHOC", "").strip() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            run_kwargs["ssl_context"] = "adhoc"
+        try:
+            flask_app.run(**run_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"warning: web UI server stopped ({exc!r}); "
+                "core runtime remains active\n"
+            )
 
     return threading.Thread(
         target=_run,
@@ -568,6 +801,8 @@ class _PrototypePerception:
     range_read_distance: Callable[[], Optional[float]]
     detector_handshake: Any = None
     detector_fatal_hook: Any = None
+    camera_handshake: Any = None
+    camera_fatal_hook: Any = None
 
 
 def _build_prototype_perception(
@@ -589,6 +824,7 @@ def _build_prototype_perception(
             SharedState as PrototypeSharedState,
         )
         from cat_follow.threads.camera import run_camera_loop
+        from cat_follow.threads.camera import CameraFatalHook, CameraHandshake
         from cat_follow.threads.detector import (
             DetectorFatalHook,
             DetectorHandshake,
@@ -608,10 +844,16 @@ def _build_prototype_perception(
     stop_event = threading.Event()
     detector_handshake = DetectorHandshake()
     detector_fatal_hook = DetectorFatalHook()
+    camera_handshake = CameraHandshake()
+    camera_fatal_hook = CameraFatalHook()
     threads = [
         threading.Thread(
             target=run_camera_loop,
             args=(proto_ss, stop_event),
+            kwargs={
+                "handshake": camera_handshake,
+                "on_fatal": camera_fatal_hook,
+            },
             name="CatFollow-Proto-Camera",
             daemon=True,
         ),
@@ -646,6 +888,8 @@ def _build_prototype_perception(
         range_read_distance=range_read_distance or (lambda: None),
         detector_handshake=detector_handshake,
         detector_fatal_hook=detector_fatal_hook,
+        camera_handshake=camera_handshake,
+        camera_fatal_hook=camera_fatal_hook,
     )
 
 
@@ -829,6 +1073,8 @@ def main(argv: Optional[list] = None) -> int:
             prototype_perception_stop_event=proto.stop_event,
             prototype_detector_handshake=proto.detector_handshake,
             prototype_detector_fatal_hook=proto.detector_fatal_hook,
+            prototype_camera_handshake=proto.camera_handshake,
+            prototype_camera_fatal_hook=proto.camera_fatal_hook,
             web_ui_shared_state=proto.shared_state,
         )
 

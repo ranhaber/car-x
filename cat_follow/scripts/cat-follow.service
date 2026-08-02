@@ -16,14 +16,21 @@ EnvironmentFile=/etc/car-x/car-x.env
 AmbientCapabilities=CAP_SYS_NICE
 CapabilityBoundingSet=CAP_SYS_NICE
 LimitRTPRIO=80
-ExecStartPre=-/usr/bin/v4l2-ctl -d ${CAT_FOLLOW_CAMERA_SENSOR_DEVICE} --set-ctrl=exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}
+# RKAIQ owns AE/AWB/CCM when installed. Apply fixed sensor controls only on
+# installations without a running 3A engine.
+ExecStartPre=-/bin/sh -c 'systemctl -q is-active rkaiq_3A.service || /usr/bin/v4l2-ctl -d "${CAT_FOLLOW_CAMERA_SENSOR_DEVICE}" --set-ctrl="exposure=${CAT_FOLLOW_CAMERA_EXPOSURE},analogue_gain=${CAT_FOLLOW_CAMERA_ANALOGUE_GAIN}"'
 # Fail fast (clear journal message) when the RKNN model has not been provisioned.
 # Path is relative to WorkingDirectory (/opt/car-x). Build YOLOv8n with
 # scripts/convert_yolo_to_rknn.py (rk3576) and copy to /opt/car-x/models/.
 ExecStartPre=/bin/sh -c 'test -f "${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}" || { echo "RKNN model missing: ${CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH}"; exit 1; }'
-ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception
-# Optional monitoring UI (non-authoritative). Uncomment to enable:
-# ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --web-ui --web-ui-port 5000
+# DMA-BUF mode cannot fall back when its native ABI is absent. NumPy mode does
+# not require the library. CAT_FOLLOW_ZEROCOPY_LIB may override the install path.
+ExecStartPre=/bin/sh -c 'if [ "$${CAT_FOLLOW_PERCEPTION_ZEROCOPY}" = "dmabuf" ]; then lib="$${CAT_FOLLOW_ZEROCOPY_LIB:-/opt/car-x/lib/libcat_follow_zerocopy.so}"; test -f "$$lib" || { echo "Native zerocopy library missing for dmabuf mode: $$lib"; exit 1; }; fi'
+# Web UI/H.264/TLS are optional monitoring facilities. Their initialization
+# failures are degraded in-process and must not restart the core runtime.
+# Blank control tokens fail closed: web mutations return 503 and UDP ingress
+# is not opened unless explicit bench mode is enabled.
+ExecStart=/opt/car-x/venv/bin/python -m cat_follow.runtime.app --picarx --with-prototype-perception --web-ui --web-ui-port 5000
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=5

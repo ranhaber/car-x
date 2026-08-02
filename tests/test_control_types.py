@@ -22,11 +22,26 @@ from cat_follow.control.types import (  # noqa: E402
 )
 
 
-def test_v1_fsm_states_do_not_include_search():
-    assert FsmState.IDLE.value == "IDLE"
-    assert FsmState.CHASE_A.value == "CHASE_A"
-    assert FsmState.GOTO.value == "GOTO"
-    assert "SEARCH" not in {state.value for state in FsmState}
+def test_fsm_states_use_canonical_redesign_names():
+    assert {state.value for state in FsmState} == {
+        "HOME",
+        "IDLE",
+        "GETTING_CLOSE",
+        "SEARCH",
+        "CHASE",
+        "BRAKE_REVERSE",
+        "GOTO",
+        "RETURN_HOME",
+        "FAILSAFE",
+    }
+
+
+def test_v1_fsm_names_adapt_to_canonical_names():
+    assert FsmState.CHASE_A is FsmState.GETTING_CLOSE
+    assert FsmState.TRACK_B is FsmState.CHASE
+    assert FsmState("CHASE_A") is FsmState.GETTING_CLOSE
+    assert FsmState("TRACK_B") is FsmState.CHASE
+    assert FsmState("BRAKE") is FsmState.BRAKE_REVERSE
 
 
 def test_command_and_ack_enums_match_contract():

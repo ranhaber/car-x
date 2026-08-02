@@ -36,7 +36,8 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
 try:
@@ -44,28 +45,43 @@ try:
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import LaserScan
+    from sensor_msgs.msg import LaserScan, Range
     from nav_msgs.msg import OccupancyGrid, Odometry
     from geometry_msgs.msg import Twist
+    from rclpy.action import ActionClient
+    from action_msgs.msg import GoalStatus
+    from nav2_msgs.action import NavigateToPose
+    from unique_identifier_msgs.msg import UUID
 
     _HAS_ROS = True
 except Exception:  # pragma: no cover - ROS absent on dev machines
     _HAS_ROS = False
     Node = object  # type: ignore
+    Range = object  # type: ignore
 
 from cat_follow.safety_config import DEFAULT_OBSTACLE_TOO_CLOSE_CM
 from cat_follow.control.types import (
+    NavigationFailureClass,
+    NavigationGoalIntent,
+    NavigationResultStatus,
     NavigationState,
     RangeBackend,
     RangeState,
 )
+from cat_follow.navigation.manager import NavigationManager
 from cat_follow.navigation.map_snapshot import (
     publish_map_grid,
     publish_robot_pose,
     publish_scan_overlay,
 )
 from cat_follow.navigation.odom_source import BICYCLE_ODOM_DISABLED_MSG
+from cat_follow.navigation.ultrasonic_range import (
+    ULTRASONIC_FRAME_ID,
+    ULTRASONIC_RANGE_TOPIC,
+    maybe_build_from_range_state,
+)
 from cat_follow.runtime.shared_state import SharedState, now_monotonic_ms
+from cat_follow.target_config import load_target_runtime_config
 
 
 # Front sector half-angle (radians) used to reduce /scan to a single forward
@@ -217,6 +233,53 @@ def sanitize_odom_pose(
     return float(px), float(py), _yaw_from_quaternion(qx, qy, qz, qw)
 
 
+class ActionGoalRegistry:
+    """Track accepted NavigateToPose handles and cancels that arrive early.
+
+    A goal handle exists only once the action server accepts the goal, but the
+    manager may cancel before that (moving-goal replacement, safety stop).
+    Parking those cancels here lets the accept path apply them, so a goal the
+    manager has already abandoned cannot start executing.  Submit/cancel run on
+    the control thread while accept/result run on the executor thread, so every
+    check-then-act pair is guarded.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._handles: dict[str, object] = {}
+        self._pending_cancels: set[str] = set()
+
+    def handle_for_cancel(self, action_goal_id: str) -> Optional[object]:
+        """Return the handle to cancel, or None after parking the cancel."""
+
+        with self._lock:
+            handle = self._handles.get(action_goal_id)
+            if handle is None:
+                self._pending_cancels.add(action_goal_id)
+            return handle
+
+    def register_accepted(self, action_goal_id: str, handle: object) -> bool:
+        """Store an accepted handle; True when a cancel is already due."""
+
+        with self._lock:
+            self._handles[action_goal_id] = handle
+            cancel_now = action_goal_id in self._pending_cancels
+            self._pending_cancels.discard(action_goal_id)
+            return cancel_now
+
+    def forget(self, action_goal_id: str) -> None:
+        """Drop all bookkeeping for a terminated or rejected goal."""
+
+        with self._lock:
+            self._handles.pop(action_goal_id, None)
+            self._pending_cancels.discard(action_goal_id)
+
+    @property
+    def pending_cancel_count(self) -> int:
+        with self._lock:
+            return len(self._pending_cancels)
+
+
 if _HAS_ROS:
 
     class RosBridge(Node):
@@ -226,12 +289,14 @@ if _HAS_ROS:
             self,
             shared_state: SharedState,
             *,
+            navigation_manager: NavigationManager | None = None,
             obstacle_detected_cm: float = 50.0,
             obstacle_critical_cm: float = DEFAULT_OBSTACLE_TOO_CLOSE_CM,
             cmd_vel_topic: str = DEFAULT_CMD_VEL_TOPIC,
         ) -> None:
             super().__init__("cat_follow_ros_bridge")
             self._ss = shared_state
+            self._navigation_manager = navigation_manager
             # Two-threshold safety pair is read on the /scan callback thread and
             # updated from the web-UI config thread; guard so a reader never sees
             # a torn (detected, critical) pair.
@@ -302,6 +367,142 @@ if _HAS_ROS:
                 )
 
             self.create_timer(1.0 / POSE_PUBLISH_HZ, self._on_pose_timer)
+            self._navigate_client = ActionClient(
+                self, NavigateToPose, "navigate_to_pose"
+            )
+            self._goals = ActionGoalRegistry()
+            try:
+                self._nav_ultrasonic_costmap = bool(
+                    load_target_runtime_config().nav_ultrasonic_costmap
+                )
+            except Exception:  # noqa: BLE001
+                self._nav_ultrasonic_costmap = True
+            self._ultrasonic_pub = None
+            if self._nav_ultrasonic_costmap:
+                topic = ULTRASONIC_RANGE_TOPIC.lstrip("/")
+                self._ultrasonic_pub = self.create_publisher(
+                    Range, topic, qos_profile_sensor_data
+                )
+                self.create_timer(0.05, self._on_ultrasonic_timer)
+                self.get_logger().info(
+                    "publishing ultrasonic Range on '%s' for RangeSensorLayer",
+                    ULTRASONIC_RANGE_TOPIC,
+                )
+            if self._navigation_manager is not None:
+                self._navigation_manager.set_transport(self)
+
+        # ── NavigateToPose transport ────────────────────────────────
+
+        def submit_goal(self, intent: NavigationGoalIntent) -> str:
+            goal_uuid = uuid.uuid4()
+            action_goal_id = goal_uuid.hex
+            uuid_msg = UUID(uuid=list(goal_uuid.bytes))
+            goal = NavigateToPose.Goal()
+            goal.pose.header.frame_id = intent.frame_id
+            goal.pose.header.stamp = self.get_clock().now().to_msg()
+            goal.pose.pose.position.x = float(intent.x_m)
+            goal.pose.pose.position.y = float(intent.y_m)
+            half_yaw = float(intent.yaw_rad) * 0.5
+            goal.pose.pose.orientation.z = math.sin(half_yaw)
+            goal.pose.pose.orientation.w = math.cos(half_yaw)
+            future = self._navigate_client.send_goal_async(
+                goal, goal_uuid=uuid_msg
+            )
+            future.add_done_callback(
+                lambda done: self._on_goal_response(
+                    done,
+                    intent.goal_intent_id,
+                    action_goal_id,
+                )
+            )
+            return action_goal_id
+
+        def cancel_goal(self, action_goal_id: str) -> None:
+            handle = self._goals.handle_for_cancel(action_goal_id)
+            if handle is not None:
+                handle.cancel_goal_async()
+
+        def _on_goal_response(
+            self, future, goal_intent_id: str, action_goal_id: str
+        ) -> None:
+            try:
+                handle = future.result()
+            except Exception:
+                self._goals.forget(action_goal_id)
+                self._report_action_result(
+                    goal_intent_id,
+                    action_goal_id,
+                    NavigationResultStatus.ABORTED,
+                    NavigationFailureClass.PLANNER_FAILURE,
+                )
+                return
+            if not handle.accepted:
+                self._goals.forget(action_goal_id)
+                self._report_action_result(
+                    goal_intent_id,
+                    action_goal_id,
+                    NavigationResultStatus.ABORTED,
+                    NavigationFailureClass.PLANNER_FAILURE,
+                )
+                return
+            cancel_now = self._goals.register_accepted(action_goal_id, handle)
+            result_future = handle.get_result_async()
+            result_future.add_done_callback(
+                lambda done: self._on_action_result(
+                    done, goal_intent_id, action_goal_id
+                )
+            )
+            if cancel_now:
+                handle.cancel_goal_async()
+
+        def _on_action_result(
+            self, future, goal_intent_id: str, action_goal_id: str
+        ) -> None:
+            self._goals.forget(action_goal_id)
+            try:
+                wrapped = future.result()
+                status_code = int(wrapped.status)
+            except Exception:
+                status_code = -1
+            if status_code == GoalStatus.STATUS_SUCCEEDED:
+                status = NavigationResultStatus.SUCCEEDED
+                failure = None
+            elif status_code == GoalStatus.STATUS_CANCELED:
+                status = NavigationResultStatus.CANCELED
+                failure = NavigationFailureClass.PREEMPTED
+            elif status_code == GoalStatus.STATUS_ABORTED:
+                status = NavigationResultStatus.ABORTED
+                failure = NavigationFailureClass.CONTROLLER_FAILURE
+            else:
+                status = NavigationResultStatus.UNKNOWN
+                failure = NavigationFailureClass.CONTROLLER_FAILURE
+            self._report_action_result(
+                goal_intent_id,
+                action_goal_id,
+                status,
+                failure,
+                result_code=status_code,
+            )
+
+        def _report_action_result(
+            self,
+            goal_intent_id: str,
+            action_goal_id: str,
+            status: NavigationResultStatus,
+            failure: NavigationFailureClass | None,
+            *,
+            result_code: int | None = None,
+        ) -> None:
+            if self._navigation_manager is None:
+                return
+            self._navigation_manager.handle_result(
+                goal_intent_id=goal_intent_id,
+                action_goal_id=action_goal_id,
+                status=status,
+                completed_at_ms=now_monotonic_ms(),
+                result_code=result_code,
+                failure_class=failure,
+            )
 
         # ── diagnostics ──────────────────────────────────────────────
 
@@ -540,8 +741,10 @@ if _HAS_ROS:
             else:
                 drive_received_ms = 0
 
+            current = self._ss.get_navigation()
             self._ss.update_navigation(
-                NavigationState(
+                replace(
+                    current,
                     timestamp_ms=int(time.time() * 1000),
                     received_ms=drive_received_ms,
                     fresh=cmd_vel_fresh,
@@ -550,8 +753,55 @@ if _HAS_ROS:
                     heading_valid=self._heading_valid,
                     speed_limit=speed_limit,
                     path_correction=path_correction,
+                    path_viable=bool(
+                        cmd_vel_fresh and self._odom_received_ms > 0
+                    ),
+                    # Until a corridor plugin publishes a wider certified
+                    # envelope, the smoothed Nav2 steering command is the sole
+                    # conservative point permitted for camera pursuit.
+                    safe_steering_min=path_correction,
+                    safe_steering_max=path_correction,
+                    speed_cap_mps=speed_limit * MAX_PLANNER_SPEED_MPS,
+                    pose_x_m=self._odom_x,
+                    pose_y_m=self._odom_y,
+                    pose_yaw_rad=self._heading,
+                    pose_received_ms=self._odom_received_ms,
                 )
             )
+
+        def _on_ultrasonic_timer(self) -> None:
+            """Publish validated sensor_msgs/Range for local RangeSensorLayer.
+
+            Stale SharedState samples are not republished: Nav2's
+            ``no_readings_timeout`` only fires when messages stop arriving, so
+            a dead HC-SR04 must produce a real topic gap rather than a freshly
+            stamped copy of the last good distance.
+            """
+
+            if self._ultrasonic_pub is None:
+                return
+            rs = self._ss.get_range()
+            # Validate against the same ROS clock sample that stamps the
+            # header, so the validated payload matches what Nav2 consumes.
+            now = self.get_clock().now()
+            payload = maybe_build_from_range_state(
+                rs.distance_cm,
+                stamp_sec=now.nanoseconds / 1e9,
+                costmap_layer_enabled=self._nav_ultrasonic_costmap,
+                received_ms=rs.received_ms,
+                now_ms=now_monotonic_ms(),
+            )
+            if payload is None:
+                return
+            msg = Range()
+            msg.header.stamp = now.to_msg()
+            msg.header.frame_id = ULTRASONIC_FRAME_ID
+            msg.radiation_type = int(payload.radiation_type)
+            msg.field_of_view = float(payload.field_of_view)
+            msg.min_range = float(payload.min_range)
+            msg.max_range = float(payload.max_range)
+            msg.range = float(payload.range)
+            self._ultrasonic_pub.publish(msg)
 
         def _on_pose_timer(self) -> None:
             """Publish map-frame pose for the web UI (TF preferred)."""
@@ -590,6 +840,16 @@ if _HAS_ROS:
                 )
 
         def destroy_node(self):  # noqa: ANN201
+            # Cancel before detaching: a goal left running would keep Nav2
+            # driving with nobody consuming its result.
+            if self._navigation_manager is not None:
+                try:
+                    self._navigation_manager.cancel()
+                except Exception as exc:  # noqa: BLE001 - teardown best effort
+                    self.get_logger().warning(
+                        "navigation cancel during shutdown failed: %s", exc
+                    )
+                self._navigation_manager.set_transport(None)
             # Stop and join the worker so no map processing thread leaks.
             self._worker_stop.set()
             worker = getattr(self, "_worker", None)
@@ -601,6 +861,7 @@ if _HAS_ROS:
 def spin_in_thread(
     shared_state: SharedState,
     *,
+    navigation_manager: NavigationManager | None = None,
     start_bicycle_odom: bool = False,
     safety_config=None,
     bridge_holder: dict | None = None,
@@ -629,7 +890,11 @@ def spin_in_thread(
                 "obstacle_detected_cm": safety_config.obstacle_detected_cm,
                 "obstacle_critical_cm": safety_config.obstacle_too_close_cm,
             }
-        bridge = RosBridge(shared_state, **bridge_kwargs)
+        bridge = RosBridge(
+            shared_state,
+            navigation_manager=navigation_manager,
+            **bridge_kwargs,
+        )
         if bridge_holder is not None:
             bridge_holder["node"] = bridge
         nodes = [bridge]
@@ -681,6 +946,7 @@ __all__ = [
     "spin_in_thread",
     "request_shutdown",
     "main",
+    "ActionGoalRegistry",
     "reduce_front_sector",
     "FrontSectorResult",
     "sanitize_cmd_vel",

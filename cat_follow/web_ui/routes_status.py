@@ -35,6 +35,8 @@ def _range_dict(range_state) -> dict:
 
 
 def _navigation_dict(nav) -> dict:
+    intent = nav.goal_intent
+    result = nav.last_result
     return {
         "heading": float(nav.heading),
         "heading_valid": bool(nav.heading_valid),
@@ -43,6 +45,46 @@ def _navigation_dict(nav) -> dict:
         "no_progress": bool(nav.no_progress),
         "dead_end": bool(nav.dead_end),
         "fresh": bool(nav.fresh),
+        "healthy": bool(nav.healthy),
+        "path_viable": bool(nav.path_viable),
+        "safe_steering_min": float(nav.safe_steering_min),
+        "safe_steering_max": float(nav.safe_steering_max),
+        "speed_cap_mps": float(nav.speed_cap_mps),
+        "completion_qualified": bool(nav.completion_qualified),
+        "failures_exhausted": bool(nav.failures_exhausted),
+        "goal_intent": (
+            None
+            if intent is None
+            else {
+                "goal_intent_id": intent.goal_intent_id,
+                "objective_type": intent.objective_type.value,
+                "target_id": intent.target_id,
+                "frame_id": intent.frame_id,
+                "x_m": intent.x_m,
+                "y_m": intent.y_m,
+                "yaw_rad": intent.yaw_rad,
+                "moving_goal": intent.moving_goal,
+                "action_goal_id": intent.action_goal_id,
+                "refresh_count": intent.refresh_count,
+                "last_refresh_ms": intent.last_refresh_ms,
+            }
+        ),
+        "last_result": (
+            None
+            if result is None
+            else {
+                "goal_intent_id": result.goal_intent_id,
+                "action_goal_id": result.action_goal_id,
+                "status": result.status.value,
+                "failure_class": (
+                    result.failure_class.value
+                    if result.failure_class is not None
+                    else None
+                ),
+                "pose_qualified": result.pose_qualified,
+                "dwell_qualified": result.dwell_qualified,
+            }
+        ),
     }
 
 
@@ -174,6 +216,16 @@ def api_status():
         "legacy": legacy,
         **legacy,
     }
+    target_cfg = getattr(_ctx, "target_runtime_config", None) if _ctx else None
+    if target_cfg is not None:
+        payload["effective_target_config"] = target_cfg.telemetry_dict()
+
+    if safety_cfg is not None:
+        from cat_follow.active_config import active_runtime_config_dict
+
+        payload["effective_active_config"] = active_runtime_config_dict(
+            safety_cfg, target_cfg
+        )
 
     runtime_shared = getattr(_ctx, "runtime_shared", None) if _ctx else None
     if runtime_shared is not None:
@@ -183,8 +235,96 @@ def api_status():
         payload["decision"] = _decision_dict(snap.decision)
         payload["range"] = _range_dict(snap.range)
         payload["lidar"] = _range_dict(snap.lidar)
+        dual = (
+            runtime_shared.get_dual_sensor_health()
+            if hasattr(runtime_shared, "get_dual_sensor_health")
+            else None
+        )
+        if dual is not None:
+            payload["dual_sensor_health"] = dual
         payload["navigation"] = _navigation_dict(snap.navigation)
         payload["vision"] = _vision_dict(snap.vision)
+        payload["overhead"] = {
+            "sequence": int(snap.overhead.sequence),
+            "selected_target_id": snap.overhead.selected_target_id,
+            "cat_target_id": snap.overhead.cat.target_id,
+            "perimeter_id": snap.overhead.perimeter_id,
+        }
+        mission = runtime_shared.get_mission()
+        payload["mission"] = {
+            "active_target_id": mission.active_target_id,
+            "last_event_observation_seq": mission.last_event_observation_seq,
+            "blocked_target_id": mission.blocked_target_id,
+            "blocked_through_observation_seq": (
+                mission.blocked_through_observation_seq
+            ),
+            "handoff_deadline_ms": mission.handoff_deadline_ms,
+            "overhead_invalid_started_ms": mission.overhead_invalid_started_ms,
+            "search_stage": mission.search_stage,
+            "search_lock_observations": mission.search_lock_observations,
+            "home_version_frozen": mission.home_version_frozen,
+        }
+        home = snap.home
+        payload["home"] = {
+            "set": bool(home.set),
+            "valid": bool(home.valid),
+            "home_version": int(home.home_version),
+            "map_id": home.map_id,
+            "frame_id": home.frame_id,
+            "frozen_for_mission": bool(home.frozen_for_mission),
+            "checksum": home.checksum,
+        }
+        geofence = snap.geofence
+        payload["geofence"] = {
+            "configured": bool(geofence.configured),
+            "car_geofence_id": geofence.car_geofence_id,
+            "car_inside": bool(geofence.car_inside),
+            "car_distance_to_boundary_cm": geofence.car_distance_to_boundary_cm,
+            "localization_valid_for_containment": bool(
+                geofence.localization_valid_for_containment
+            ),
+            "breach_confirmed": bool(geofence.breach_confirmed),
+        }
+        payload["startup"] = {
+            "ready": bool(snap.system.startup_ready),
+            "seed_applied": bool(snap.system.startup_seed_applied),
+            "degraded_reason": snap.system.startup_degraded_reason,
+        }
+        life = snap.perception_lifecycle
+        payload["perception_lifecycle"] = {
+            "detector": {
+                "requested": bool(life.detector.requested),
+                "active": bool(life.detector.active),
+                "consumer_refcount": int(life.detector.consumer_refcount),
+                "reason": life.detector.reason,
+            },
+            "recording": {
+                "requested": bool(life.recording.requested),
+                "active": bool(life.recording.active),
+                "consumer_refcount": int(life.recording.consumer_refcount),
+                "postroll_deadline_ms": life.recording.postroll_deadline_ms,
+                "degraded_reason": life.recording.degraded_reason,
+                "segment_path": life.recording.segment_path,
+            },
+            "stream": {
+                "requested_clients": int(life.stream_requested_clients),
+                "active_clients": int(life.stream_active_clients),
+                "encoder_ready": bool(life.stream_encoder_ready),
+                "forced_off": bool(life.stream_forced_off),
+                "degraded_reason": life.stream_degraded_reason,
+            },
+            "camera": {
+                "hardware_state": life.camera_hardware_state.value,
+                "streamoff_capable": bool(life.camera_streamoff_capable),
+                "last_revalidation_ms": int(life.camera_last_revalidation_ms),
+                "fatal_fault": bool(life.camera_fatal_fault),
+            },
+        }
         payload["state"] = payload["fsm"]["state"]
+        payload["fatal_reason"] = (
+            runtime_shared.get_runtime_fatal_reason()
+            if hasattr(runtime_shared, "get_runtime_fatal_reason")
+            else None
+        )
 
     return jsonify(payload)

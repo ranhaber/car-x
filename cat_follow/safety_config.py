@@ -1,8 +1,12 @@
 """Safety threshold configuration (env defaults + optional calibration overrides).
 
 Environment variables (startup defaults):
-    CAT_FOLLOW_SAFETY_OBSTACLE_TOO_CLOSE_CM   — hard failsafe distance (default 10)
+    CAT_FOLLOW_SAFETY_OBSTACLE_TOO_CLOSE_CM   — proximity stop distance (default 10)
     CAT_FOLLOW_SAFETY_OBSTACLE_DETECTED_CM    — veto ramp start (default 50)
+
+``obstacle_too_close_cm`` acts as a floor under
+``CAT_FOLLOW_BRAKE_REVERSE_TRIGGER_CM``: DecisionEngine stops on whichever of
+the two distances is more conservative.
 
 Calibration JSON (``steering_limits.json``) may override at runtime when saved
 from the Web UI:

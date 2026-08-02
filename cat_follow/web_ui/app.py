@@ -3,10 +3,10 @@ Flask application: Web UI for cat-follow.
 
 Route modules (Blueprints), same pattern as cat_ball_tracker:
   - routes_pages.py      — GET /, GET /calibration
-  - routes_streaming.py — GET /stream (MJPEG)
+  - routes_h264.py       — WebSocket /ws/h264 (hardware H.264 + overlay JSON)
   - routes_control.py   — POST /api/target, POST /api/stop
   - routes_status.py    — GET /api/status
-  - routes_stream_config.py — POST /api/stream/resolution, GET /api/stream/capabilities
+  - routes_stream_config.py — GET /api/stream/capabilities
   - routes_detector.py   — GET/POST /api/detector_model
   - routes_calibration.py — GET/POST /api/calibration, POST /api/calibrate/run_speed, run_steer
   - routes_config.py     — GET /api/config (read-only camera + perception)
@@ -177,6 +177,8 @@ def create_app(
     comms_manager: Any = None,
     sequence_executor: Any = None,
     apply_safety_config: Any = None,
+    target_runtime_config: Any = None,
+    perception_lifecycle_manager: Any = None,
 ) -> Flask:
     """Create and configure the Flask application with Blueprint routes.
 
@@ -197,6 +199,8 @@ def create_app(
     ctx.runtime_shared = runtime_shared
     ctx.comms_manager = comms_manager
     ctx.apply_safety_config = apply_safety_config
+    ctx.target_runtime_config = target_runtime_config
+    ctx.perception_lifecycle_manager = perception_lifecycle_manager
     ctx.h264_available = False
     ctx.get_tracker_fps = get_tracker_fps
     ctx.get_stream_fps = _get_stream_fps
@@ -209,9 +213,51 @@ def create_app(
     ctx.get_ram_percent = _get_ram_percent
     ctx.get_cpu_temp = _get_cpu_temp
     ctx.get_battery_voltage = _get_battery_voltage
-    ctx.inc_stream_clients = inc_stream_clients
-    ctx.dec_stream_clients = dec_stream_clients
-    ctx.get_stream_clients = get_stream_clients
+    # The lifecycle manager owns the authoritative client count when present;
+    # the module counter is the fallback. Mirrors are *assigned* that count
+    # instead of counting independently, so they cannot drift apart.
+    def _mirror_stream_clients(count: int) -> None:
+        if hasattr(shared, "set_stream_clients"):
+            shared.set_stream_clients(count)
+
+    def _inc_both_stream_clients() -> int:
+        plm = perception_lifecycle_manager
+        if plm is not None:
+            count = plm.register_stream_client()
+        else:
+            count = inc_stream_clients()
+        _mirror_stream_clients(count)
+        return count
+
+    def _dec_both_stream_clients() -> int:
+        plm = perception_lifecycle_manager
+        if plm is not None:
+            count = plm.unregister_stream_client()
+        else:
+            count = dec_stream_clients()
+        _mirror_stream_clients(count)
+        return count
+
+    def _stream_forced_off() -> bool:
+        plm = perception_lifecycle_manager
+        if plm is not None:
+            return bool(plm.last_state().stream_forced_off)
+        if hasattr(shared, "stream_forced_off"):
+            return bool(shared.stream_forced_off())
+        return False
+
+    def _get_both_stream_clients() -> int:
+        plm = perception_lifecycle_manager
+        if plm is not None:
+            return plm.stream_clients
+        if hasattr(shared, "get_stream_clients"):
+            return shared.get_stream_clients()
+        return get_stream_clients()
+
+    ctx.inc_stream_clients = _inc_both_stream_clients
+    ctx.dec_stream_clients = _dec_both_stream_clients
+    ctx.get_stream_clients = _get_both_stream_clients
+    ctx.stream_forced_off = _stream_forced_off
     # Serializes web-initiated direct hardware access (calibration motor tests)
     # so two routines cannot drive the shared Picarx concurrently.
     ctx.hardware_lock = threading.Lock()
@@ -233,7 +279,6 @@ def create_app(
     )
 
     from cat_follow.web_ui.routes_pages import pages_bp, init_pages_routes
-    from cat_follow.web_ui.routes_streaming import streaming_bp, init_streaming_routes
     from cat_follow.web_ui.routes_control import control_bp, init_control_routes
     from cat_follow.web_ui.routes_status import status_bp, init_status_routes
     from cat_follow.web_ui.routes_stream_config import stream_config_bp, init_stream_config_routes
@@ -255,7 +300,6 @@ def create_app(
         )
 
     init_pages_routes()
-    init_streaming_routes(ctx)
     init_control_routes(ctx)
     init_status_routes(ctx)
     init_stream_config_routes(ctx)
@@ -266,8 +310,10 @@ def create_app(
     init_movement_routes(ctx)
     init_injection_routes(ctx)
 
-    # Optional hardware H.264 WebSocket stream (guarded: no-op if flask-sock /
-    # GStreamer mpph264enc are unavailable).
+    # Hardware H.264 WebSocket stream. A production preference for H.264 must
+    # not turn an optional monitoring dependency into a core-runtime startup
+    # dependency; expose capabilities=false and keep the remaining UI alive.
+    require_h264 = os.environ.get("CAT_FOLLOW_WEB_REQUIRE_H264", "1") == "1"
     try:
         from cat_follow.web_ui.routes_h264 import init_h264_routes
 
@@ -276,8 +322,14 @@ def create_app(
         _log.debug("H.264 route registration skipped: %s", exc)
         ctx.h264_available = False
 
+    if require_h264 and not ctx.h264_available:
+        _log.error(
+            "Hardware H.264 stream is required (CAT_FOLLOW_WEB_REQUIRE_H264=1) "
+            "but mpph264enc and/or flask-sock are unavailable on this host; "
+            "continuing without monitoring video."
+        )
+
     app.register_blueprint(pages_bp)
-    app.register_blueprint(streaming_bp)
     app.register_blueprint(control_bp)
     app.register_blueprint(status_bp)
     app.register_blueprint(stream_config_bp)

@@ -22,7 +22,9 @@ from cat_follow.control.fsm import FSM  # noqa: E402
 from cat_follow.control.types import (  # noqa: E402
     CommandName,
     FsmState,
+    RangeBackend,
     RangeState,
+    ReasonCode,
     TelemetryEventType,
 )
 from cat_follow.motion.motor_interface import MotorInterface, NoOpMotorBackend  # noqa: E402
@@ -113,56 +115,96 @@ def test_tick_count_increments():
 
 
 def test_command_acceptance_through_comms_manager_drives_fsm_via_loop():
-    ss, fsm, _, _, _, loop, *_ = _build_stack()
+    ss, fsm, engine, _, _, loop, *_ = _build_stack()
     received_acks = []
     comms = CommsManager(shared_state=ss, ack_sink=received_acks.append)
-
-    # Provide valid tracking so start_chase passes validation.
-    comms.submit_tracking(
-        TrackingMessage(
-            sequence=1,
-            timestamp_ms=1,
-            car=TrackingCar(x=0.0, y=0.0, confidence=1.0),
-            cat=TrackingCat(x=10.0, y=10.0, confidence=1.0),
+    comms.bind_runtime(control_loop=loop, decision_engine=engine, fsm=fsm)
+    loop.attach_comms_manager(comms)
+    now_ms = now_monotonic_ms()
+    ss.update_range(
+        RangeState(
+            received_ms=now_ms,
+            fresh=True,
+            distance_cm=100.0,
+            confidence=1.0,
         )
     )
-
-    # Apply a start_chase command.
-    comms.submit_command(
-        CommandMessage(
-            sequence=2001,
-            timestamp_ms=2,
-            command_id="cmd-start",
-            command=CommandName.START_CHASE,
+    ss.update_lidar_range(
+        RangeState(
+            received_ms=now_ms,
+            fresh=True,
+            backend=RangeBackend.LIDAR_C1,
+            distance_cm=100.0,
+            confidence=1.0,
         )
     )
-    assert received_acks[-1].status.value == "accepted"
+    from tests.test_comms_manager_helpers import durable_home, start_chase_command, tracking_message
 
-    # Run one tick of the loop.
+    ss.update_home(durable_home())
+    comms.submit_tracking(tracking_message(sequence=1))
+
+    submit_error = []
+
+    def _submit():
+        try:
+            comms.submit_command(
+                start_chase_command(sequence=2001, command_id="cmd-start")
+            )
+        except Exception as exc:
+            submit_error.append(exc)
+
+    worker = threading.Thread(target=_submit)
+    worker.start()
+    assert _wait_until(lambda: ss.pending_count() == 1, timeout=0.5)
+    assert received_acks == []
+
     loop.tick(now_ms=now_monotonic_ms())
+    worker.join(timeout=2.0)
+    assert submit_error == []
+    assert received_acks[-1].status.value == "accepted"
+    assert received_acks[-1].state == FsmState.GETTING_CLOSE
+    assert received_acks[-1].applied_control_sequence == 1
 
-    assert fsm.state == FsmState.CHASE_A
-    assert ss.get_fsm().state == FsmState.CHASE_A
-    assert ss.get_decision().requested_state == FsmState.CHASE_A
+    assert fsm.state == FsmState.SEARCH
+    assert ss.get_fsm().state == FsmState.SEARCH
+    assert ss.get_decision().requested_state == FsmState.SEARCH
 
 
 # ── obstacle veto via the loop ─────────────────────────────────────
 
 
-def test_obstacle_too_close_triggers_failsafe_through_loop():
+def test_close_obstacle_triggers_brake_reverse_through_loop():
     ss, fsm, _, _, _, loop, *_ = _build_stack()
-    # Inject a too-close range observation directly into shared state.
+    now_ms = now_monotonic_ms()
+    fsm.force_state(
+        FsmState.GETTING_CLOSE,
+        reason=ReasonCode.START_CHASE_ACCEPTED,
+        now_ms=now_ms,
+    )
+    ss.update_fsm(fsm.snapshot(received_ms=now_ms))
     ss.update_range(
         RangeState(
             timestamp_ms=1,
-            received_ms=now_monotonic_ms(),
+            received_ms=now_ms,
             fresh=True,
             authority="test",
             distance_cm=OBSTACLE_TOO_CLOSE_CM - 1.0,
+            confidence=1.0,
         )
     )
-    loop.tick(now_ms=now_monotonic_ms())
-    assert fsm.state == FsmState.FAILSAFE
+    ss.update_lidar_range(
+        RangeState(
+            timestamp_ms=1,
+            received_ms=now_ms,
+            fresh=True,
+            authority="test",
+            backend=RangeBackend.LIDAR_C1,
+            distance_cm=100.0,
+            confidence=1.0,
+        )
+    )
+    loop.tick(now_ms=now_ms)
+    assert fsm.state == FsmState.BRAKE_REVERSE
     assert ss.get_decision().brake is True
 
 

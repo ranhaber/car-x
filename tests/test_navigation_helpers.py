@@ -16,6 +16,7 @@ from cat_follow.navigation.odom_publisher import (
 from cat_follow.navigation.ros_bridge import (
     MAX_PLANNER_SPEED_MPS,
     MAX_PLANNER_YAW_RATE_RAD_S,
+    ActionGoalRegistry,
     _front_min_distance_cm,
     _yaw_from_quaternion,
     reduce_front_sector,
@@ -145,3 +146,29 @@ def test_odometry_reading_converts_cm_to_m():
         assert abs(yaw - math.radians(90.0)) < 1e-9
     finally:
         odom.reset(0.0, 0.0, 0.0)
+
+
+def test_cancel_after_accept_uses_the_handle_directly():
+    registry = ActionGoalRegistry()
+    handle = object()
+    assert registry.register_accepted("ag-1", handle) is False
+    assert registry.handle_for_cancel("ag-1") is handle
+    assert registry.pending_cancel_count == 0
+
+
+def test_cancel_before_accept_is_applied_when_the_goal_is_accepted():
+    registry = ActionGoalRegistry()
+    # Cancel arrives while the action server has not answered yet.
+    assert registry.handle_for_cancel("ag-1") is None
+    assert registry.pending_cancel_count == 1
+    assert registry.register_accepted("ag-1", object()) is True
+    assert registry.pending_cancel_count == 0
+
+
+def test_rejected_goal_drops_its_parked_cancel():
+    registry = ActionGoalRegistry()
+    registry.handle_for_cancel("ag-1")
+    registry.forget("ag-1")
+    assert registry.pending_cancel_count == 0
+    # A later goal reusing bookkeeping must not inherit the stale cancel.
+    assert registry.register_accepted("ag-1", object()) is False

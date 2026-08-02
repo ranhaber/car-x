@@ -79,6 +79,16 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
 
     # Admission and reservation are one operation. The first connection owns
     # the sole monitoring encoder until its finally block clears this slot.
+    if _ctx is not None and getattr(_ctx, "stream_forced_off", None):
+        try:
+            if _ctx.stream_forced_off():
+                try:
+                    ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+        except Exception:  # noqa: BLE001
+            pass
     with _encoder_lock:
         if _clients != 0:
             try:
@@ -101,6 +111,12 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
             ws.close()
             return
         while True:
+            if _ctx is not None and getattr(_ctx, "stream_forced_off", None):
+                try:
+                    if _ctx.stream_forced_off():
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
             # MPP may emit an access unit after submit's bounded wait. Poll on
             # every loop, including loops where the camera has no newer frame.
             for chunk in encoder.poll():

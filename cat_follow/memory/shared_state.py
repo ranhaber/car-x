@@ -8,12 +8,20 @@ inside the get/set methods.
 
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
 from cat_follow.memory.pool import MemoryPool, BBOX_LEN, ODOM_LEN
 from cat_follow.memory.pool import FRAME_SHAPE
+
+
+class DmabufRequeueError(RuntimeError):
+    """A superseded V4L2 buffer could not be handed back to the driver.
+
+    Raised only after the ring operation that triggered the requeue has already
+    committed, so callers must not treat it as "the frame was not published".
+    """
 
 
 class FrameLease:
@@ -22,6 +30,11 @@ class FrameLease:
     The camera cannot reuse ``slot_idx`` until :meth:`release` is called.
     Consumers should use this as a context manager so exceptions cannot leak
     slot references.
+
+    When ``dmabuf_buffer_index`` is set, :meth:`release` also requeues the
+    underlying V4L2 buffer through the registered callback -- unless the slot
+    is still the latest published frame, whose buffer is only handed back once
+    a newer capture supersedes it.
     """
 
     __slots__ = (
@@ -32,6 +45,10 @@ class FrameLease:
         "published_ns",
         "slot_generation",
         "slot_idx",
+        "dmabuf_fd",
+        "dmabuf_buffer_index",
+        "dmabuf_stride",
+        "dmabuf_size",
         "_released",
     )
 
@@ -43,7 +60,12 @@ class FrameLease:
         capture_started_ns: int,
         published_ns: int,
         slot_generation: int,
-        frame: np.ndarray,
+        frame: Optional[np.ndarray],
+        *,
+        dmabuf_fd: int = -1,
+        dmabuf_buffer_index: int = -1,
+        dmabuf_stride: int = 0,
+        dmabuf_size: int = 0,
     ) -> None:
         self._owner = owner
         self.slot_idx = slot_idx
@@ -52,7 +74,16 @@ class FrameLease:
         self.published_ns = published_ns
         self.slot_generation = slot_generation
         self.frame = frame
+        self.dmabuf_fd = dmabuf_fd
+        self.dmabuf_buffer_index = dmabuf_buffer_index
+        self.dmabuf_stride = dmabuf_stride
+        self.dmabuf_size = dmabuf_size
         self._released = False
+
+    @property
+    def dmabuf(self) -> bool:
+        """True when this lease carries a borrowed camera DMA-BUF fd."""
+        return self.dmabuf_fd >= 0
 
     def __enter__(self) -> "FrameLease":
         return self
@@ -88,10 +119,12 @@ class SharedState:
 
         # One lock per logical resource
         self._lock_frame = threading.Lock()
+        self._frame_cv = threading.Condition(self._lock_frame)
         self._lock_tracking = threading.Lock()
         self._lock_bbox_tracker = self._lock_tracking
         self._lock_bbox_detector = threading.Lock()
         self._lock_detector_detections = threading.Lock()
+        self._detector_cv = threading.Condition(self._lock_detector_detections)
         self._lock_tracked_targets = self._lock_tracking
         self._lock_odometry = threading.Lock()
         self._lock_cat_injection = threading.Lock()
@@ -148,6 +181,163 @@ class SharedState:
         self._cat_injection_enabled = threading.Event()
         self._cat_injection_bbox = None
 
+        # H.264 consumes camera DMA-BUFs directly. Only live inject requires
+        # materializing the full NV12 frame in the NumPy ring.
+        self._lock_stream_clients = threading.Lock()
+        self._stream_clients = 0
+
+        # PerceptionLifecycleManager intent channel for camera/detector threads.
+        self._lock_perception_intent = threading.Lock()
+        self._capture_active = True
+        self._detector_required = False
+        self._detector_mission_override = False
+        self._stream_forced_off = False
+        self._detector_force_off = False
+
+        # Optional zerocopy session + V4L2 requeue hook (camera owns session).
+        self._zerocopy_session = None
+        self._dmabuf_requeue_cb: Optional[Callable[[int], bool]] = None
+        # Buffers whose QBUF failed. They are still owned by us, not the driver,
+        # so they must stay claimed here until a retry (or session teardown)
+        # hands them back; forgetting one leaks it from the V4L2 pool.
+        self._pending_dmabuf_requeue: list[int] = []
+        self._slot_dmabuf_fd = [-1] * self._ring_n
+        self._slot_dmabuf_buffer_index = [-1] * self._ring_n
+        self._slot_dmabuf_size = [0] * self._ring_n
+        self._slot_dmabuf_stride = [0] * self._ring_n
+
+    def set_perception_intent(
+        self,
+        *,
+        capture_active: bool,
+        detector_required: bool,
+        detector_mission_override: bool,
+        stream_forced_off: bool,
+        detector_force_off: bool = False,
+    ) -> None:
+        """Publish lifecycle intent for camera/detector owner threads."""
+
+        with self._lock_perception_intent:
+            self._capture_active = bool(capture_active)
+            self._detector_required = bool(detector_required)
+            self._detector_mission_override = bool(detector_mission_override)
+            self._stream_forced_off = bool(stream_forced_off)
+            self._detector_force_off = bool(detector_force_off)
+
+    def get_perception_intent(self) -> dict:
+        """Return effective intent: detector demand already masked by force-off."""
+        with self._lock_perception_intent:
+            force_off = self._detector_force_off
+            return {
+                "capture_active": self._capture_active,
+                "detector_required": self._detector_required and not force_off,
+                "detector_mission_override": (
+                    self._detector_mission_override and not force_off
+                ),
+                "stream_forced_off": self._stream_forced_off,
+                "detector_force_off": force_off,
+            }
+
+    def capture_active(self) -> bool:
+        with self._lock_perception_intent:
+            return self._capture_active
+
+    def detector_required(self) -> bool:
+        with self._lock_perception_intent:
+            return self._detector_required and not self._detector_force_off
+
+    def detector_mission_override(self) -> bool:
+        with self._lock_perception_intent:
+            return self._detector_mission_override and not self._detector_force_off
+
+    def stream_forced_off(self) -> bool:
+        with self._lock_perception_intent:
+            return self._stream_forced_off
+
+    def _take_dmabuf_requeue_index_locked(self, idx: int) -> int:
+        """Extract a V4L2 buffer to requeue. Caller must hold ``_lock_frame``."""
+        if (
+            self._slot_dmabuf_buffer_index[idx] >= 0
+            and self._slot_refcounts[idx] == 0
+            and self._dmabuf_requeue_cb is not None
+        ):
+            requeue_index = self._slot_dmabuf_buffer_index[idx]
+            self._slot_dmabuf_buffer_index[idx] = -1
+            self._slot_dmabuf_fd[idx] = -1
+            self._slot_dmabuf_size[idx] = 0
+            self._slot_dmabuf_stride[idx] = 0
+            return requeue_index
+        return -1
+
+    def _claim_failed_requeue(self, requeue_index: int) -> None:
+        with self._lock_frame:
+            if requeue_index not in self._pending_dmabuf_requeue:
+                self._pending_dmabuf_requeue.append(requeue_index)
+
+    def _finish_dmabuf_requeue(self, requeue_index: int) -> None:
+        if requeue_index < 0:
+            return
+        with self._lock_frame:
+            requeue_cb = self._dmabuf_requeue_cb
+        if requeue_cb is None:
+            # The session went away between taking the index and handing it
+            # back, so nothing can reach the driver right now.
+            self._claim_failed_requeue(requeue_index)
+            return
+        try:
+            ok = requeue_cb(requeue_index)
+        except BaseException:
+            self._claim_failed_requeue(requeue_index)
+            raise
+        if ok is False:
+            self._claim_failed_requeue(requeue_index)
+            raise DmabufRequeueError(
+                f"dmabuf requeue failed for V4L2 buffer index {requeue_index}"
+            )
+
+    def _finish_dmabuf_requeues(self, requeue_indices) -> None:
+        """Attempt every requeue before raising, so one QBUF failure part-way
+        through cannot strand the buffers queued behind it."""
+        first_error: Optional[DmabufRequeueError] = None
+        for requeue_index in requeue_indices:
+            try:
+                self._finish_dmabuf_requeue(requeue_index)
+            except DmabufRequeueError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def _drain_pending_dmabuf_requeues(self) -> None:
+        """Best-effort retry of buffers an earlier QBUF failure left claimed.
+
+        Never raises: this runs opportunistically on the camera thread, whose
+        caller already escalated the original failure.
+        """
+        with self._lock_frame:
+            requeue_cb = self._dmabuf_requeue_cb
+            pending = self._pending_dmabuf_requeue
+            if requeue_cb is None or not pending:
+                return
+            self._pending_dmabuf_requeue = []
+        still_failed = []
+        for requeue_index in pending:
+            try:
+                if requeue_cb(requeue_index) is False:
+                    still_failed.append(requeue_index)
+            except Exception:  # noqa: BLE001
+                still_failed.append(requeue_index)
+        if still_failed:
+            with self._lock_frame:
+                self._pending_dmabuf_requeue = (
+                    still_failed + self._pending_dmabuf_requeue
+                )
+
+    def pending_dmabuf_requeues(self) -> tuple:
+        """V4L2 buffer indices still owned by us after a failed QBUF."""
+        with self._lock_frame:
+            return tuple(self._pending_dmabuf_requeue)
+
     # ── frame_latest ─────────────────────────────────────────────────
 
     def request_detector_warmup(self) -> None:
@@ -172,6 +362,93 @@ class SharedState:
 
     def cat_injection_enabled(self) -> bool:
         return self._cat_injection_enabled.is_set()
+
+    def set_stream_clients(self, count: int) -> None:
+        with self._lock_stream_clients:
+            self._stream_clients = max(0, int(count))
+
+    def inc_stream_clients(self) -> int:
+        with self._lock_stream_clients:
+            self._stream_clients += 1
+            return self._stream_clients
+
+    def dec_stream_clients(self) -> int:
+        with self._lock_stream_clients:
+            self._stream_clients = max(0, self._stream_clients - 1)
+            return self._stream_clients
+
+    def get_stream_clients(self) -> int:
+        with self._lock_stream_clients:
+            return self._stream_clients
+
+    def needs_numpy_frame_pack(self) -> bool:
+        """True only when live injection requires CPU NV12 pixels."""
+        return self.cat_injection_enabled()
+
+    def attach_zerocopy_session(self, session, *, requeue_cb) -> None:
+        """Register the native capture session owned by the camera thread."""
+        with self._lock_frame:
+            self._zerocopy_session = session
+            self._dmabuf_requeue_cb = requeue_cb
+
+    def zerocopy_session(self):
+        with self._lock_frame:
+            return self._zerocopy_session
+
+    def publish_dmabuf_from_write(
+        self,
+        *,
+        capture_started_ns: int,
+        dmabuf_fd: int,
+        buffer_index: int,
+        image_size: int,
+        stride: int = 0,
+        frame: Optional[np.ndarray] = None,
+    ) -> None:
+        """Publish the active ring slot with optional CPU NV12 + dmabuf metadata."""
+        published_ns = time.monotonic_ns()
+        if capture_started_ns < 0 or capture_started_ns > published_ns:
+            raise ValueError("capture_started_ns must be a past monotonic timestamp")
+        if frame is not None:
+            # The reserved slot belongs exclusively to this single writer until
+            # it publishes, so the full-frame inject copy is done before taking
+            # the lock rather than stalling every reader behind ~450 KiB.
+            with self._lock_frame:
+                write_idx = self._active_write_idx
+            if write_idx is None:
+                raise RuntimeError("no active frame write to publish")
+            np.copyto(self._pool.frame_ring[write_idx], frame)
+        requeue_indices = []
+        with self._lock_frame:
+            idx = self._active_write_idx
+            if idx is None:
+                raise RuntimeError("no active frame write to publish")
+            if self._slot_generations[idx] % 2 != 1:
+                raise RuntimeError("active frame slot is not marked WRITING")
+            replaced_index = self._take_dmabuf_requeue_index_locked(idx)
+            if replaced_index >= 0:
+                requeue_indices.append(replaced_index)
+            previous_latest = self._latest_idx
+            self._slot_generations[idx] += 1
+            self._frame_seq += 1
+            self._slot_frame_seqs[idx] = self._frame_seq
+            self._slot_capture_started_ns[idx] = int(capture_started_ns)
+            self._slot_published_ns[idx] = published_ns
+            self._slot_dmabuf_fd[idx] = int(dmabuf_fd)
+            self._slot_dmabuf_buffer_index[idx] = int(buffer_index)
+            self._slot_dmabuf_size[idx] = int(image_size)
+            self._slot_dmabuf_stride[idx] = int(stride)
+            self._latest_idx = idx
+            self._write_idx = (idx + 1) % self._ring_n
+            self._active_write_idx = None
+            if previous_latest >= 0 and previous_latest != idx:
+                superseded_index = self._take_dmabuf_requeue_index_locked(
+                    previous_latest
+                )
+                if superseded_index >= 0:
+                    requeue_indices.append(superseded_index)
+            self._frame_cv.notify_all()
+        self._finish_dmabuf_requeues(requeue_indices)
 
     def set_cat_injection_bbox(self, bbox) -> None:
         """Publish the injected sprite's tight ``xyxy`` pixel bounds."""
@@ -230,6 +507,8 @@ class SharedState:
         This is non-blocking by design: camera capture is latest-wins and must
         drop a frame rather than wait behind detector or stream work.
         """
+        self._drain_pending_dmabuf_requeues()
+        requeue_index = -1
         with self._lock_frame:
             if self._active_write_idx is not None:
                 raise RuntimeError("frame write already active")
@@ -238,10 +517,24 @@ class SharedState:
                 idx = (self._write_idx + offset) % self._ring_n
                 if idx == self._latest_idx or self._slot_refcounts[idx] != 0:
                     continue
+                requeue_index = self._take_dmabuf_requeue_index_locked(idx)
                 self._active_write_idx = idx
                 self._slot_generations[idx] += 1  # even -> odd (WRITING)
-                return self._pool.frame_ring[idx]
-        return None
+                buf = self._pool.frame_ring[idx]
+                break
+            else:
+                buf = None
+        if buf is None:
+            return None
+        try:
+            self._finish_dmabuf_requeue(requeue_index)
+        except BaseException:
+            # The reservation is only useful if its previous dmabuf went back
+            # to the driver. Give the slot up so a failed QBUF cannot wedge
+            # every later capture behind "frame write already active".
+            self.abort_frame_write()
+            raise
+        return buf
 
     def get_write_buffer(self) -> np.ndarray:
         """Return a writable view into the pool's current write slot.
@@ -269,12 +562,14 @@ class SharedState:
         capture_started_ns = int(capture_started_ns)
         if capture_started_ns < 0 or capture_started_ns > published_ns:
             raise ValueError("capture_started_ns must be a past monotonic timestamp")
+        requeue_index = -1
         with self._lock_frame:
             idx = self._active_write_idx
             if idx is None:
                 raise RuntimeError("no active frame write to publish")
             if self._slot_generations[idx] % 2 != 1:
                 raise RuntimeError("active frame slot is not marked WRITING")
+            previous_latest = self._latest_idx
             self._slot_generations[idx] += 1  # odd -> even (stable)
             self._frame_seq += 1
             self._slot_frame_seqs[idx] = self._frame_seq
@@ -283,6 +578,12 @@ class SharedState:
             self._latest_idx = idx
             self._write_idx = (idx + 1) % self._ring_n
             self._active_write_idx = None
+            if previous_latest >= 0 and previous_latest != idx:
+                requeue_index = self._take_dmabuf_requeue_index_locked(
+                    previous_latest
+                )
+            self._frame_cv.notify_all()
+        self._finish_dmabuf_requeue(requeue_index)
 
     def abort_frame_write(self) -> None:
         """Cancel an active write reservation without publishing its pixels."""
@@ -306,6 +607,15 @@ class SharedState:
                 return None
             self._slot_refcounts[idx] += 1
             frame_seq = self._slot_frame_seqs[idx]
+            dmabuf_fd = self._slot_dmabuf_fd[idx]
+            buffer_index = self._slot_dmabuf_buffer_index[idx]
+            image_size = self._slot_dmabuf_size[idx]
+            stride = self._slot_dmabuf_stride[idx]
+            frame_view = None
+            if dmabuf_fd < 0:
+                frame_view = self._pool.frame_ring[idx]
+            elif self.needs_numpy_frame_pack():
+                frame_view = self._pool.frame_ring[idx]
             return FrameLease(
                 self,
                 idx,
@@ -313,7 +623,11 @@ class SharedState:
                 self._slot_capture_started_ns[idx],
                 self._slot_published_ns[idx],
                 slot_generation,
-                self._pool.frame_ring[idx],
+                frame_view,
+                dmabuf_fd=dmabuf_fd,
+                dmabuf_buffer_index=buffer_index,
+                dmabuf_stride=stride,
+                dmabuf_size=image_size,
             )
 
     def latest_frame_generation(self) -> int:
@@ -321,13 +635,53 @@ class SharedState:
         with self._lock_frame:
             return self._frame_seq
 
+    def wait_for_new_frame(
+        self,
+        last_generation: int,
+        stop_event: threading.Event,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> int:
+        """Wait for a capture generation newer than *last_generation*.
+
+        The bounded wait slices keep shutdown responsive even though
+        ``threading.Event`` and ``threading.Condition`` cannot be waited on
+        atomically.
+        """
+        deadline = (
+            None if timeout_s is None else time.monotonic() + max(0.0, timeout_s)
+        )
+        with self._frame_cv:
+            while self._frame_seq <= last_generation and not stop_event.is_set():
+                wait_s = 0.05
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_s = min(wait_s, remaining)
+                self._frame_cv.wait(wait_s)
+            return self._frame_seq
+
     def _release_frame_slot(self, slot_idx: int) -> None:
+        requeue_index = -1
+        requeue_cb = None
         with self._lock_frame:
             if not 0 <= slot_idx < self._ring_n:
                 raise ValueError(f"invalid frame-ring slot {slot_idx}")
             if self._slot_refcounts[slot_idx] <= 0:
                 raise RuntimeError(f"frame-ring slot {slot_idx} is not acquired")
             self._slot_refcounts[slot_idx] -= 1
+            if (
+                self._slot_refcounts[slot_idx] == 0
+                and self._slot_dmabuf_buffer_index[slot_idx] >= 0
+                and slot_idx != self._latest_idx
+            ):
+                requeue_index = self._slot_dmabuf_buffer_index[slot_idx]
+                self._slot_dmabuf_buffer_index[slot_idx] = -1
+                self._slot_dmabuf_fd[slot_idx] = -1
+                self._slot_dmabuf_size[slot_idx] = 0
+                self._slot_dmabuf_stride[slot_idx] = 0
+        self._finish_dmabuf_requeue(requeue_index)
 
     def _frame_lease_stale(self, slot_idx: int, slot_generation: int) -> bool:
         with self._lock_frame:
@@ -448,11 +802,32 @@ class SharedState:
         with self._lock_detector_detections:
             self._detector_detections = snapshot
             self._detector_detections_gen = int(frame_gen)
+            self._detector_cv.notify_all()
 
     def get_detector_detections_with_gen(self):
         """Return the immutable full detection snapshot and its frame generation."""
         with self._lock_detector_detections:
             return self._detector_detections, self._detector_detections_gen
+
+    def wait_for_detector_update(
+        self,
+        last_generation: int,
+        stop_event: threading.Event,
+        *,
+        timeout_s: float,
+    ) -> int:
+        """Wait for detector output newer than *last_generation* or a deadline."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._detector_cv:
+            while (
+                self._detector_detections_gen <= last_generation
+                and not stop_event.is_set()
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._detector_cv.wait(min(0.05, remaining))
+            return self._detector_detections_gen
 
     def set_tracked_targets(self, targets) -> None:
         """Publish immutable PRIMARY_CAT/SECONDARY_CAT tracking snapshots."""
@@ -532,6 +907,11 @@ class SharedState:
             return (float(buf[0]), float(buf[1]), float(buf[2]))
 
     # ── lores gray frame (optional hardware-scaled motion source) ─────
+
+    def crop_buffer_for_slot(self, slot_idx: int) -> np.ndarray:
+        """Return the paired NV12 crop buffer for capture slot *slot_idx*."""
+        ring_n = self._pool.crop_ring.shape[0]
+        return self._pool.crop_ring[int(slot_idx) % ring_n]
 
     def set_lores_gray(self, gray: np.ndarray) -> None:
         """Publish a single-channel lores gray frame for motion detection.

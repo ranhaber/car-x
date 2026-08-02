@@ -123,6 +123,7 @@ def main():
     )
 
     camera_thread.start()
+    time.sleep(0.2)
     tracker_thread.start()
     detector_thread.start()
 
@@ -169,9 +170,14 @@ def main():
     ultrasonic_none_streak = 0
     ULTRASONIC_FAULT_TICKS = 15  # ~0.5 s at 30 Hz
 
-    def on_cat_location(x: float, y: float):
-        sm.dispatch(Event.CAT_LOCATION_RECEIVED, (x, y))
-        log.info("CMD cat_location (%.2f, %.2f) -> state=%s", x, y, sm.state.value)
+    def on_cat_location_cm(x_cm: float, y_cm: float):
+        sm.dispatch(Event.CAT_LOCATION_RECEIVED, (x_cm, y_cm))
+        log.info(
+            "CMD cat_location (%.1f, %.1f) cm -> state=%s",
+            x_cm,
+            y_cm,
+            sm.state.value,
+        )
 
     def on_stop():
         sm.dispatch(Event.STOP_COMMAND)
@@ -193,7 +199,9 @@ def main():
                 break
 
             # Poll commands (thread-safe via lock)
-            poll_commands(on_cat_location=on_cat_location, on_stop=on_stop)
+            poll_commands(
+                on_cat_location_cm=on_cat_location_cm, on_stop=on_stop
+            )
 
             # The detector acquires a read-only frame-ring lease and tags its
             # output with that capture sequence. The main loop never copies or
@@ -257,14 +265,14 @@ def main():
 
                 elif state == State.GOTO_TARGET:
                     # Search arc the whole way until we reach target; can find cat on the way
-                    target = sm.target_xy
-                    if target is not None:
+                    target_cm = sm.target_xy_cm
+                    if target_cm is not None:
                         if search_start_time <= 0:
                             search_start_time = time.monotonic()
                         pos = location.get_position()
                         heading = location.get_heading_deg()
-                        tx_cm = target[0] * 100.0
-                        ty_cm = target[1] * 100.0
+                        tx_cm = target_cm[0]
+                        ty_cm = target_cm[1]
                         steer, speed, arrived = compute_goto(
                             pos[0], pos[1], heading, tx_cm, ty_cm, calib,
                         )

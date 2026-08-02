@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -153,6 +154,138 @@ def test_receiver_logs_invalid_json_and_keeps_running():
                 for e in captured
             )
         )
+    finally:
+        client.close()
+        receiver.stop()
+        logger.stop()
+
+
+def test_receiver_survives_commit_timeout_and_keeps_receiving():
+    """A stalled control loop must not take the ingress thread down."""
+
+    captured = []
+    logger = AsyncLogger(
+        sink=CallableSink(captured.append),
+        max_queue=32,
+        flush_interval_s=0.05,
+    )
+    logger.start()
+    manager, ss, _ = _make_manager_and_acks()
+
+    def _timeout(_msg):
+        raise TimeoutError("timed out waiting for ACK on command_id='cmd-stalled'")
+
+    manager.submit_command = _timeout
+    receiver, address = _start_receiver(manager, logger=logger)
+    client = _client_socket()
+    try:
+        cmd = CommandMessage(
+            sequence=2001,
+            timestamp_ms=10,
+            command_id="cmd-stalled",
+            command=CommandName.STOP_CHASE,
+            params={},
+        )
+        client.sendto(json.dumps(cmd.to_dict()).encode("utf-8"), address)
+        assert _wait_until(
+            lambda: any(
+                e["data"].get("cause") == "commit_timeout" for e in captured
+            )
+        )
+
+        # Tracking ingress still works after the timed-out command.
+        tracking = TrackingMessage(
+            sequence=9,
+            timestamp_ms=1000,
+            car=TrackingCar(x=1.0, y=2.0, confidence=1.0),
+            cat=TrackingCat(x=3.0, y=4.0, confidence=1.0),
+        )
+        client.sendto(json.dumps(tracking.to_dict()).encode("utf-8"), address)
+        assert _wait_until(lambda: ss.get_overhead().sequence == 9)
+    finally:
+        client.close()
+        receiver.stop()
+        logger.stop()
+
+
+def test_tracking_ingress_continues_while_a_command_is_committing():
+    """A slow command commit must not stall overhead tracking ingress."""
+
+    manager, ss, _ = _make_manager_and_acks()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def _blocking(_msg):
+        entered.set()
+        release.wait(timeout=5.0)
+
+    manager.submit_command = _blocking
+    receiver, address = _start_receiver(manager)
+    client = _client_socket()
+    try:
+        cmd = CommandMessage(
+            sequence=2003,
+            timestamp_ms=10,
+            command_id="cmd-slow",
+            command=CommandName.STOP_CHASE,
+            params={},
+        )
+        client.sendto(json.dumps(cmd.to_dict()).encode("utf-8"), address)
+        assert entered.wait(timeout=2.0)
+
+        tracking = TrackingMessage(
+            sequence=13,
+            timestamp_ms=1000,
+            car=TrackingCar(x=1.0, y=2.0, confidence=1.0),
+            cat=TrackingCat(x=3.0, y=4.0, confidence=1.0),
+        )
+        client.sendto(json.dumps(tracking.to_dict()).encode("utf-8"), address)
+        assert _wait_until(lambda: ss.get_overhead().sequence == 13)
+    finally:
+        release.set()
+        client.close()
+        receiver.stop()
+
+
+def test_receiver_survives_unexpected_handler_error():
+    captured = []
+    logger = AsyncLogger(
+        sink=CallableSink(captured.append),
+        max_queue=32,
+        flush_interval_s=0.05,
+    )
+    logger.start()
+    manager, ss, _ = _make_manager_and_acks()
+
+    def _boom(_msg):
+        raise RuntimeError("unexpected commit failure")
+
+    manager.submit_command = _boom
+    receiver, address = _start_receiver(manager, logger=logger)
+    client = _client_socket()
+    try:
+        cmd = CommandMessage(
+            sequence=2002,
+            timestamp_ms=10,
+            command_id="cmd-boom",
+            command=CommandName.STOP_CHASE,
+            params={},
+        )
+        client.sendto(json.dumps(cmd.to_dict()).encode("utf-8"), address)
+        assert _wait_until(
+            lambda: any(
+                e["data"].get("cause") == "handler_error" for e in captured
+            )
+        )
+
+        tracking = TrackingMessage(
+            sequence=11,
+            timestamp_ms=1000,
+            car=TrackingCar(x=1.0, y=2.0, confidence=1.0),
+            cat=TrackingCat(x=3.0, y=4.0, confidence=1.0),
+        )
+        client.sendto(json.dumps(tracking.to_dict()).encode("utf-8"), address)
+        assert _wait_until(lambda: ss.get_overhead().sequence == 11)
     finally:
         client.close()
         receiver.stop()

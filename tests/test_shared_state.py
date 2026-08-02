@@ -20,8 +20,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import pytest
+
 from cat_follow.memory.pool import allocate_pool, FRAME_RING_N, FRAME_SHAPE, BBOX_LEN
-from cat_follow.memory.shared_state import SharedState
+from cat_follow.memory.shared_state import DmabufRequeueError, SharedState
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -31,6 +33,226 @@ def _make_shared() -> SharedState:
 
 
 # ── single-thread tests ─────────────────────────────────────────────────
+
+def test_needs_numpy_frame_pack():
+    shared = _make_shared()
+    assert shared.needs_numpy_frame_pack() is False
+    shared.inc_stream_clients()
+    # H.264 imports the DMA-BUF directly; viewers no longer require a full
+    # frame copy into the NumPy ring.
+    assert shared.needs_numpy_frame_pack() is False
+    shared.dec_stream_clients()
+    shared.set_cat_injection_enabled(True)
+    assert shared.needs_numpy_frame_pack() is True
+
+
+def test_dmabuf_lease_requeue_callback():
+    shared = _make_shared()
+    requeued: list[int] = []
+
+    def _requeue(index: int) -> None:
+        requeued.append(index)
+
+    shared.attach_zerocopy_session(object(), requeue_cb=_requeue)
+    write_buf = shared.try_get_write_buffer()
+    assert write_buf is not None
+    shared.publish_dmabuf_from_write(
+        capture_started_ns=time.monotonic_ns(),
+        dmabuf_fd=42,
+        buffer_index=3,
+        image_size=460800,
+        stride=640,
+        frame=None,
+    )
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+    assert lease.dmabuf_fd == 42
+    assert lease.dmabuf_buffer_index == 3
+    assert lease.dmabuf_stride == 640
+    assert lease.frame is None
+    lease.release()
+    # The latest slot remains owned by SharedState even with no active reader.
+    # It is requeued as soon as a newer frame supersedes it.
+    assert requeued == []
+    write_buf = shared.try_get_write_buffer()
+    assert write_buf is not None
+    write_buf.fill(1)
+    shared.publish_latest_from_write()
+    assert requeued == [3]
+
+
+def test_pinned_superseded_dmabuf_requeues_on_final_release():
+    shared = _make_shared()
+    requeued: list[int] = []
+    shared.attach_zerocopy_session(
+        object(), requeue_cb=lambda index: requeued.append(index)
+    )
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_dmabuf_from_write(
+        capture_started_ns=time.monotonic_ns(),
+        dmabuf_fd=42,
+        buffer_index=3,
+        image_size=460800,
+        stride=640,
+    )
+    lease = shared.acquire_latest_frame()
+    assert lease is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_dmabuf_from_write(
+        capture_started_ns=time.monotonic_ns(),
+        dmabuf_fd=43,
+        buffer_index=4,
+        image_size=460800,
+        stride=640,
+    )
+    assert requeued == []
+
+    lease.release()
+    assert requeued == [3]
+
+
+def test_failed_requeue_releases_the_reserved_write_slot():
+    """A QBUF failure must not wedge the ring in "frame write already active"."""
+    shared = _make_shared()
+    # No callback yet, so superseded slots keep their dmabuf index and a later
+    # reservation is the thing that has to hand them back to the driver.
+    shared.attach_zerocopy_session(object(), requeue_cb=None)
+    for index in range(FRAME_RING_N):
+        assert shared.try_get_write_buffer() is not None
+        shared.publish_dmabuf_from_write(
+            capture_started_ns=time.monotonic_ns(),
+            dmabuf_fd=40 + index,
+            buffer_index=index,
+            image_size=460800,
+            stride=640,
+        )
+
+    shared.attach_zerocopy_session(object(), requeue_cb=lambda _index: False)
+    try:
+        shared.try_get_write_buffer()
+    except DmabufRequeueError:
+        pass
+    else:
+        raise AssertionError("expected DmabufRequeueError from failed requeue")
+
+    # The reservation must have been given back, not left active.
+    shared.attach_zerocopy_session(object(), requeue_cb=lambda _index: True)
+    assert shared.try_get_write_buffer() is not None
+
+
+def _fill_ring_with_retained_dmabufs(shared, first_index=10):
+    """Publish one dmabuf frame per slot while no requeue callback exists.
+
+    With no callback the ring cannot hand buffers back, so every slot keeps its
+    V4L2 index and a later publish has both a replaced and a superseded buffer
+    to return in one go.
+    """
+    shared.attach_zerocopy_session(object(), requeue_cb=None)
+    for offset in range(FRAME_RING_N):
+        assert shared.try_get_write_buffer() is not None
+        shared.publish_dmabuf_from_write(
+            capture_started_ns=time.monotonic_ns(),
+            dmabuf_fd=40 + offset,
+            buffer_index=first_index + offset,
+            image_size=460800,
+            stride=640,
+        )
+
+
+def test_publish_returns_every_buffer_when_one_requeue_fails():
+    """A QBUF failure must not strand the buffers queued behind it."""
+    shared = _make_shared()
+    _fill_ring_with_retained_dmabufs(shared)
+
+    # Reserve the oldest slot while the callback is still absent, so it keeps
+    # its own buffer and publishing supersedes a second one.
+    assert shared.try_get_write_buffer() is not None
+
+    attempted: list[int] = []
+
+    def _requeue(index: int) -> bool:
+        attempted.append(index)
+        return index != 10
+
+    shared.attach_zerocopy_session(object(), requeue_cb=_requeue)
+    with pytest.raises(DmabufRequeueError):
+        shared.publish_dmabuf_from_write(
+            capture_started_ns=time.monotonic_ns(),
+            dmabuf_fd=44,
+            buffer_index=20,
+            image_size=460800,
+            stride=640,
+        )
+
+    # Both buffers were attempted, and only the failed one is still claimed.
+    assert attempted == [10, 13]
+    assert shared.pending_dmabuf_requeues() == (10,)
+
+
+def test_claimed_buffer_is_retried_on_the_next_capture():
+    shared = _make_shared()
+    _fill_ring_with_retained_dmabufs(shared)
+    assert shared.try_get_write_buffer() is not None
+
+    shared.attach_zerocopy_session(
+        object(), requeue_cb=lambda index: index != 10
+    )
+    with pytest.raises(DmabufRequeueError):
+        shared.publish_dmabuf_from_write(
+            capture_started_ns=time.monotonic_ns(),
+            dmabuf_fd=44,
+            buffer_index=20,
+            image_size=460800,
+            stride=640,
+        )
+    assert shared.pending_dmabuf_requeues() == (10,)
+
+    retried: list[int] = []
+    shared.attach_zerocopy_session(
+        object(), requeue_cb=lambda index: retried.append(index) or True
+    )
+    assert shared.try_get_write_buffer() is not None
+
+    assert 10 in retried
+    assert shared.pending_dmabuf_requeues() == ()
+
+
+def test_failed_reservation_requeue_keeps_the_buffer_claimed():
+    """The ring, not the driver, still owns a buffer whose QBUF failed."""
+    shared = _make_shared()
+    _fill_ring_with_retained_dmabufs(shared)
+
+    shared.attach_zerocopy_session(object(), requeue_cb=lambda _index: False)
+    with pytest.raises(DmabufRequeueError):
+        shared.try_get_write_buffer()
+
+    assert shared.pending_dmabuf_requeues() == (10,)
+
+
+def test_perception_intent_masks_detector_demand_when_forced_off():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        stream_forced_off=False,
+    )
+    assert shared.get_perception_intent()["detector_required"] is True
+
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        stream_forced_off=False,
+        detector_force_off=True,
+    )
+    intent = shared.get_perception_intent()
+    assert intent["detector_force_off"] is True
+    assert intent["detector_required"] is False
+    assert intent["detector_mission_override"] is False
+
 
 def test_bbox_tracker_set_get():
     shared = _make_shared()
@@ -160,6 +382,60 @@ def test_frame_latest_does_not_alias_src():
     dst = np.zeros(FRAME_SHAPE, dtype=np.uint8)
     shared.get_frame_latest(dst)
     assert np.all(dst == 99), "SharedState must hold a copy, not a reference"
+
+
+def test_wait_for_new_frame_wakes_on_publish():
+    shared = _make_shared()
+    stop_event = threading.Event()
+    result = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            shared.wait_for_new_frame(0, stop_event, timeout_s=1.0)
+        )
+    )
+    waiter.start()
+    shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert result == [1]
+
+
+def test_wait_for_detector_update_wakes_on_publish():
+    shared = _make_shared()
+    stop_event = threading.Event()
+    result = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            shared.wait_for_detector_update(-1, stop_event, timeout_s=1.0)
+        )
+    )
+    waiter.start()
+    shared.set_detector_detections([], frame_gen=7)
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert result == [7]
+
+
+def test_event_waits_observe_stop_with_bounded_latency():
+    shared = _make_shared()
+    stop_event = threading.Event()
+    result = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            shared.wait_for_new_frame(0, stop_event, timeout_s=1.0)
+        )
+    )
+    waiter.start()
+    stop_event.set()
+    waiter.join(timeout=0.2)
+
+    assert not waiter.is_alive()
+    assert result == [0]
 
 
 def test_frame_lease_pins_slot_until_release():

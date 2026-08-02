@@ -43,7 +43,7 @@ def test_motion_endpoint_open_when_no_token(monkeypatch):
     proto = PrototypeSharedState(allocate_pool())
     app = create_app(shared=proto)
     client = app.test_client()
-    res = client.post("/api/target", json={"x": 1.0, "y": 2.0})
+    res = client.post("/api/target", json={"x_cm": 100.0, "y_cm": 200.0})
     assert res.status_code == 200
 
 
@@ -56,20 +56,41 @@ def test_motion_endpoint_requires_token_when_set(monkeypatch):
     client = app.test_client()
 
     # Missing token -> 401
-    res = client.post("/api/target", json={"x": 1.0, "y": 2.0})
+    res = client.post("/api/target", json={"x_cm": 100.0, "y_cm": 200.0})
     assert res.status_code == 401
 
     # Wrong token -> 401
     res = client.post(
-        "/api/target", json={"x": 1.0, "y": 2.0}, headers={"X-Control-Token": "nope"}
+        "/api/target", json={"x_cm": 100.0, "y_cm": 200.0}, headers={"X-Control-Token": "nope"}
     )
     assert res.status_code == 401
 
     # Correct token -> 200
     res = client.post(
-        "/api/target", json={"x": 1.0, "y": 2.0}, headers={"X-Control-Token": "s3cret"}
+        "/api/target", json={"x_cm": 100.0, "y_cm": 200.0}, headers={"X-Control-Token": "s3cret"}
     )
     assert res.status_code == 200
+
+
+def test_production_web_degrades_without_h264_and_refuses_mutation(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_COMMS_TOKEN", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_WEB_REQUIRE_H264", "1")
+    monkeypatch.setattr(
+        "cat_follow.web_ui.routes_h264.init_h264_routes",
+        lambda _ctx, _app: False,
+    )
+
+    proto = PrototypeSharedState(allocate_pool())
+    app = create_app(shared=proto)
+    client = app.test_client()
+
+    assert client.get("/api/status").status_code == 200
+    capabilities = client.get("/api/stream/capabilities").get_json()
+    assert capabilities["h264"] is False
+    response = client.post("/api/target", json={"x_cm": 100.0, "y_cm": 200.0})
+    assert response.status_code == 503
 
 
 def test_stop_endpoint_never_requires_token(monkeypatch):
@@ -158,11 +179,16 @@ def test_status_contract_mode(monkeypatch):
     assert res.status_code == 200
     data = res.get_json()
     assert data["mode"] == "contract"
-    assert data["fsm"]["state"] == "CHASE_A"
-    assert data["state"] == "CHASE_A"
+    assert data["fsm"]["state"] == "GETTING_CLOSE"
+    assert data["state"] == "GETTING_CLOSE"
     assert "lidar_veto" in data["decision"]["active_constraints"]
     assert data["lidar"]["distance_cm"] == 85.0
     assert data["navigation"]["path_correction"] == 0.2
+    assert data["overhead"]["selected_target_id"] is None
+    assert data["mission"]["active_target_id"] is None
+    assert data["mission"]["handoff_deadline_ms"] is None
+    assert data["mission"]["search_stage"] == 0
+    assert data["mission"]["search_lock_observations"] == 0
 
 
 def test_stream_capabilities_endpoint():
@@ -172,9 +198,132 @@ def test_stream_capabilities_endpoint():
     res = client.get("/api/stream/capabilities")
     assert res.status_code == 200
     data = res.get_json()
-    assert data["mjpeg"] is True
-    assert "h264" in data
-    assert "resolutions" in data
+    assert data["h264"] in (True, False)
+    assert data["resolution"] == "640x480"
+
+
+def test_start_chase_api_requires_target_id(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    monkeypatch.setenv("CAT_FOLLOW_COMMS_TOKEN", "comms-s3cret")
+
+    from cat_follow.comms.comms_manager import CommsManager
+    from cat_follow.control.decision_engine import DecisionEngine
+    from cat_follow.control.fsm import FSM
+
+    proto = PrototypeSharedState(allocate_pool())
+    runtime = RuntimeSharedState()
+    fsm = FSM()
+    engine = DecisionEngine(fsm)
+    comms = CommsManager(shared_state=runtime, ack_sink=lambda _ack: None)
+    comms.bind_runtime(decision_engine=engine, fsm=fsm)
+
+    app = create_app(shared=proto, runtime_shared=runtime, comms_manager=comms)
+    client = app.test_client()
+
+    missing = client.post(
+        "/api/command/start_chase",
+        headers={"X-Control-Token": "s3cret"},
+    )
+    assert missing.status_code == 400
+
+    with_target = client.post(
+        "/api/command/start_chase",
+        json={"target_id": "cat-17"},
+        headers={"X-Control-Token": "s3cret"},
+    )
+    assert with_target.status_code == 200
+    body = with_target.get_json()
+    assert body["ack"]["status"] == "rejected"
+
+
+def test_target_api_carries_centimeters_to_the_nav2_goal(monkeypatch):
+    """A UI target in cm must reach Nav2 as the same distance in meters."""
+
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
+    monkeypatch.setenv("CAT_FOLLOW_COMMS_TOKEN", "comms-s3cret")
+
+    from cat_follow.comms.comms_manager import CommsManager
+    from cat_follow.control.decision_engine import DecisionEngine
+    from cat_follow.control.fsm import FSM
+    from cat_follow.control.types import CommandName, SharedSnapshot, SystemState
+    from cat_follow.navigation.manager import NavigationManager
+    from cat_follow.target_config import TargetRuntimeConfig
+
+    class _Transport:
+        def __init__(self):
+            self.goals = []
+
+        def submit_goal(self, intent):
+            self.goals.append(intent)
+            return f"goal-{len(self.goals)}"
+
+        def cancel_goal(self, action_goal_id):
+            pass
+
+    from cat_follow.runtime.shared_state import now_monotonic_ms
+
+    proto = PrototypeSharedState(allocate_pool())
+    runtime = RuntimeSharedState()
+    runtime.update_system(SystemState(startup_ready=True))
+    now_ms = now_monotonic_ms()
+    runtime.update_range(
+        RangeState(received_ms=now_ms, fresh=True, distance_cm=100.0, confidence=1.0)
+    )
+    runtime.update_lidar_range(
+        RangeState(
+            received_ms=now_ms,
+            fresh=True,
+            backend=RangeBackend.LIDAR_C1,
+            distance_cm=100.0,
+            confidence=1.0,
+        )
+    )
+    fsm = FSM()
+    engine = DecisionEngine(fsm)
+    comms = CommsManager(shared_state=runtime, ack_sink=lambda _ack: None)
+    comms.bind_runtime(decision_engine=engine, fsm=fsm)
+
+    app = create_app(shared=proto, runtime_shared=runtime, comms_manager=comms)
+    client = app.test_client()
+    res = client.post(
+        "/api/target",
+        json={"x_cm": 250.0, "y_cm": -80.0},
+        headers={"X-Control-Token": "s3cret"},
+    )
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["x_cm"] == 250.0
+    assert body["ack"]["status"] == "accepted"
+
+    command = runtime.get_command()
+    assert command.last_command == CommandName.GO_TO
+    assert command.objective_x_cm == 250.0
+    assert command.objective_y_cm == -80.0
+
+    transport = _Transport()
+    manager = NavigationManager(TargetRuntimeConfig(), transport=transport)
+    manager.tick(SharedSnapshot(command=command), FsmState.GOTO, 1000)
+    assert transport.goals, "GOTO should submit a Nav2 goal"
+    intent = transport.goals[-1]
+    assert intent.x_m == 2.5
+    assert intent.y_m == -0.8
+
+
+def test_target_api_rejects_non_finite_and_missing_centimeters(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_COMMS_TOKEN", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", "1")
+    proto = PrototypeSharedState(allocate_pool())
+    app = create_app(shared=proto)
+    client = app.test_client()
+
+    assert client.post("/api/target", json={"x": 1.0, "y": 2.0}).status_code == 400
+    assert (
+        client.post("/api/target", json={"x_cm": "NaN", "y_cm": 0.0}).status_code
+        == 400
+    )
 
 
 def test_config_endpoint_readonly():
@@ -186,6 +335,42 @@ def test_config_endpoint_readonly():
     data = res.get_json()
     assert "camera" in data
     assert "perception" in data
+    assert data["active_runtime"]["applied_to_behavior"] is True
+    assert data["active_runtime"]["values"]["brake_reverse_trigger_cm"] == 15.0
+    assert data["active_runtime"]["values"]["sensor_recovery_sec"] == 2.0
+    assert data["active_runtime"]["values"]["overhead_invalid_max_sec"] == 10.0
+    assert data["target_runtime"]["applied_to_behavior"] is False
+    assert (
+        data["target_runtime"]["values"]["brake_reverse_trigger_cm"] == 15.0
+    )
+
+
+def test_status_exposes_effective_target_and_active_config(monkeypatch):
+    monkeypatch.setattr(
+        "cat_follow.web_ui.routes_status.range_sensor.get_last_distance_cm",
+        lambda: None,
+    )
+    from cat_follow.target_config import load_target_runtime_config
+
+    proto = PrototypeSharedState(allocate_pool())
+    runtime = RuntimeSharedState()
+    target_cfg = load_target_runtime_config()
+    app = create_app(
+        shared=proto,
+        runtime_shared=runtime,
+        target_runtime_config=target_cfg,
+    )
+    client = app.test_client()
+    res = client.get("/api/status")
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["effective_target_config"]["applied_to_behavior"] is False
+    assert data["effective_active_config"]["applied_to_behavior"] is True
+    assert data["effective_active_config"]["values"]["overhead_invalid_max_sec"] == 10.0
+    assert (
+        data["effective_active_config"]["values"]["brake_reverse_trigger_cm"]
+        == 15.0
+    )
 
 
 def test_build_app_with_web_ui_flag():

@@ -29,27 +29,57 @@ from cat_follow.runtime.shared_state import now_monotonic_ms
 # Direct (from-state, event) -> to-state lookups.  Anything not listed here
 # falls through to the pattern rules in :func:`_resolve_transition`.
 _DIRECT_TRANSITIONS = {
-    (FsmState.HOME, FsmEvent.START_CHASE_ACCEPTED): FsmState.CHASE_A,
-    (FsmState.IDLE, FsmEvent.START_CHASE_ACCEPTED): FsmState.CHASE_A,
-    (FsmState.CHASE_A, FsmEvent.CAT_VISIBLE_STABLE): FsmState.TRACK_B,
-    (FsmState.TRACK_B, FsmEvent.CAT_LOST): FsmState.CHASE_A,
-    (FsmState.TRACK_B, FsmEvent.FINAL_APPROACH_READY): FsmState.BRAKE,
-    (FsmState.BRAKE, FsmEvent.BRAKE_ABORTED_CAT_MOVED): FsmState.TRACK_B,
+    (FsmState.HOME, FsmEvent.START_CHASE_ACCEPTED): FsmState.GETTING_CLOSE,
+    (FsmState.IDLE, FsmEvent.START_CHASE_ACCEPTED): FsmState.GETTING_CLOSE,
+    (FsmState.GETTING_CLOSE, FsmEvent.SEARCH_ENTRY_READY): FsmState.SEARCH,
+    (FsmState.SEARCH, FsmEvent.LOCAL_TRACK_ACQUIRED): FsmState.CHASE,
+    (FsmState.CHASE, FsmEvent.CAT_LOST_NEAR): FsmState.SEARCH,
+    (FsmState.CHASE, FsmEvent.CAT_LOST_FAR): FsmState.GETTING_CLOSE,
+    (FsmState.GETTING_CLOSE, FsmEvent.TARGET_ID_CHANGED): FsmState.IDLE,
+    (FsmState.SEARCH, FsmEvent.TARGET_ID_CHANGED): FsmState.IDLE,
     (FsmState.HOME, FsmEvent.GO_TO_ACCEPTED): FsmState.GOTO,
     (FsmState.IDLE, FsmEvent.GO_TO_ACCEPTED): FsmState.GOTO,
     (FsmState.GOTO, FsmEvent.GO_TO_COMPLETE): FsmState.IDLE,
+    (
+        FsmState.GOTO,
+        FsmEvent.NAVIGATION_FAILURES_EXHAUSTED,
+    ): FsmState.IDLE,
     (FsmState.RETURN_HOME, FsmEvent.RETURN_HOME_COMPLETE): FsmState.HOME,
+    (
+        FsmState.RETURN_HOME,
+        FsmEvent.NAVIGATION_FAILURES_EXHAUSTED,
+    ): FsmState.FAILSAFE,
     (FsmState.FAILSAFE, FsmEvent.CLEAR_FAILSAFE_ACCEPTED): FsmState.IDLE,
 }
 
-# Chase state set used by the ``stop_chase`` pattern rule.
-_CHASE_STATES = frozenset(
-    {FsmState.CHASE_A, FsmState.TRACK_B, FsmState.BRAKE}
+# Chase state set used by the ``stop_chase`` pattern rule.  Public so the
+# DecisionEngine shares one definition instead of keeping a parallel copy that
+# can silently drift from the transition rules.
+CHASE_STATES = frozenset(
+    {
+        FsmState.GETTING_CLOSE,
+        FsmState.SEARCH,
+        FsmState.CHASE,
+        FsmState.BRAKE_REVERSE,
+    }
+)
+
+NORMAL_DRIVING_STATES = frozenset(
+    {
+        FsmState.GETTING_CLOSE,
+        FsmState.SEARCH,
+        FsmState.CHASE,
+        FsmState.GOTO,
+        FsmState.RETURN_HOME,
+    }
 )
 
 
 def _resolve_transition(
-    state: FsmState, event: FsmEvent
+    state: FsmState,
+    event: FsmEvent,
+    *,
+    resume_state: Optional[FsmState] = None,
 ) -> Optional[FsmState]:
     """Return the target state for ``(state, event)`` or ``None`` if rejected."""
 
@@ -57,8 +87,55 @@ def _resolve_transition(
     if target is not None:
         return target
 
+    if (
+        event == FsmEvent.BRAKE_REVERSE_TRIGGERED
+        and state in NORMAL_DRIVING_STATES
+    ):
+        return FsmState.BRAKE_REVERSE
+
+    if (
+        event == FsmEvent.BRAKE_REVERSE_CLEARED
+        and state == FsmState.BRAKE_REVERSE
+        and resume_state in NORMAL_DRIVING_STATES
+    ):
+        return resume_state
+
+    # ``CHASE_STATES`` includes ``BRAKE_REVERSE``, where the matrix additionally
+    # requires the interrupted objective to be a chase.  That predicate needs
+    # the DecisionEngine's saved state, so it is enforced by the command/event
+    # apply path rather than duplicated here.
+    if (
+        event == FsmEvent.PRIMARY_CAT_LEFT_PERIMETER
+        and state in CHASE_STATES
+    ):
+        return FsmState.IDLE
+
+    # Each event below is only ever raised by DecisionEngine from the states
+    # listed here; the sets intentionally differ per event instead of sharing
+    # one over-broad set, so the table cannot silently accept an event from a
+    # state no caller actually uses it from.
+    if (
+        event == FsmEvent.OVERHEAD_RETENTION_EXPIRED
+        and state
+        in {FsmState.GETTING_CLOSE, FsmState.SEARCH, FsmState.CHASE}
+    ):
+        return FsmState.RETURN_HOME
+
+    if event == FsmEvent.SEARCH_EXHAUSTED and state == FsmState.SEARCH:
+        return FsmState.RETURN_HOME
+
+    if event == FsmEvent.HANDOFF_TIMEOUT and state == FsmState.IDLE:
+        return FsmState.RETURN_HOME
+
+    if (
+        event == FsmEvent.NAVIGATION_FAILURES_EXHAUSTED
+        and state
+        in {FsmState.GETTING_CLOSE, FsmState.SEARCH, FsmState.CHASE}
+    ):
+        return FsmState.RETURN_HOME
+
     # ``stop_chase_accepted`` from any chase state -> IDLE.
-    if event == FsmEvent.STOP_CHASE_ACCEPTED and state in _CHASE_STATES:
+    if event == FsmEvent.STOP_CHASE_ACCEPTED and state in CHASE_STATES:
         return FsmState.IDLE
 
     # ``return_home_accepted`` from any non-FAILSAFE state -> RETURN_HOME.
@@ -79,13 +156,21 @@ def _resolve_transition(
     return None
 
 
-def is_transition_allowed(state: FsmState, event: FsmEvent) -> bool:
+def is_transition_allowed(
+    state: FsmState,
+    event: FsmEvent,
+    *,
+    resume_state: Optional[FsmState] = None,
+) -> bool:
     """Return True if ``state`` can transition on ``event``.
 
     Useful for tests and for callers that want to query before applying.
+    ``resume_state`` must be supplied for resume-dependent events such as
+    ``BRAKE_REVERSE_CLEARED``, otherwise they always report disallowed even
+    though :py:meth:`FSM.apply` would accept the restore.
     """
 
-    return _resolve_transition(state, event) is not None
+    return _resolve_transition(state, event, resume_state=resume_state) is not None
 
 
 # ── FSM ─────────────────────────────────────────────────────────────
@@ -148,6 +233,7 @@ class FSM:
         *,
         reason: ReasonCode,
         now_ms: Optional[int] = None,
+        resume_state: Optional[FsmState] = None,
     ) -> TransitionResult:
         """Attempt to apply ``event``.
 
@@ -161,7 +247,9 @@ class FSM:
 
         with self._lock:
             from_state = self._state
-            target = _resolve_transition(from_state, event)
+            target = _resolve_transition(
+                from_state, event, resume_state=resume_state
+            )
             if target is None:
                 descriptor = (
                     f"{from_state.value} + {event.value} -> rejected"
@@ -242,7 +330,9 @@ class FSM:
 
 
 __all__ = [
+    "CHASE_STATES",
     "FSM",
+    "NORMAL_DRIVING_STATES",
     "TransitionResult",
     "is_transition_allowed",
 ]

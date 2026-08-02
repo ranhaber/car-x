@@ -15,8 +15,13 @@ from cat_follow.comms.messages import (  # noqa: E402
     TrackingCat,
     TrackingMessage,
 )
-from cat_follow.control.types import CommandName, FsmState  # noqa: E402
-from cat_follow.runtime.app import build_app  # noqa: E402
+from cat_follow.control.types import (  # noqa: E402
+    CommandName,
+    FsmState,
+    RangeBackend,
+    RangeState,
+)
+from cat_follow.runtime.app import _build_web_ui_thread, build_app  # noqa: E402
 
 
 def _wait_until(predicate, timeout=2.0, interval=0.01):
@@ -26,6 +31,30 @@ def _wait_until(predicate, timeout=2.0, interval=0.01):
             return True
         time.sleep(interval)
     return False
+
+
+def _seed_healthy_sensors(app):
+    from tests.test_comms_manager_helpers import durable_home
+
+    now_ms = int(time.monotonic() * 1000)
+    app.shared_state.update_range(
+        RangeState(
+            received_ms=now_ms,
+            fresh=True,
+            distance_cm=100.0,
+            confidence=1.0,
+        )
+    )
+    app.shared_state.update_lidar_range(
+        RangeState(
+            received_ms=now_ms,
+            fresh=True,
+            backend=RangeBackend.LIDAR_C1,
+            distance_cm=100.0,
+            confidence=1.0,
+        )
+    )
+    app.shared_state.update_home(durable_home())
 
 
 def test_build_app_wires_all_components(tmp_path):
@@ -38,6 +67,12 @@ def test_build_app_wires_all_components(tmp_path):
     assert app.control_loop is not None
     assert app.comms_manager is not None
     assert app.motor_backend is not None
+    assert app.recording_writer is not None
+    assert app.perception_lifecycle_manager is not None
+    assert app.target_runtime_config.brake_reverse_trigger_cm == 15.0
+    # Slice 1 is observability-only: active control still uses the legacy
+    # safety threshold until the BRAKE_REVERSE implementation slice.
+    assert app.decision_engine.obstacle_too_close_cm == 10.0
 
 
 def test_build_app_applies_persisted_calibration_safety(tmp_path):
@@ -79,6 +114,125 @@ def test_app_starts_runs_and_stops_cleanly(tmp_path):
     assert log_path.exists()
     contents = log_path.read_text(encoding="utf-8")
     assert contents.strip(), "JSONL telemetry file should contain at least one event"
+    events = [json.loads(line) for line in contents.splitlines() if line.strip()]
+    config_events = [
+        event for event in events if event["event_type"] == "configuration"
+    ]
+    assert config_events
+    target = config_events[0]["data"]["target_runtime"]
+    assert target["values"]["brake_reverse_trigger_cm"] == 15.0
+    assert target["applied_to_behavior"] is False
+    active = config_events[0]["data"]["active_runtime"]
+    assert active["applied_to_behavior"] is True
+    assert active["values"]["brake_reverse_trigger_cm"] == 15.0
+    assert active["values"]["sensor_recovery_sec"] == 2.0
+    assert active["values"]["overhead_invalid_max_sec"] == 10.0
+
+
+def test_invalid_target_env_fails_build_app(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAT_FOLLOW_BRAKE_REVERSE_RESET_CM", "10")
+    try:
+        build_app(
+            log_path=tmp_path / "telemetry.jsonl",
+            stop_event=threading.Event(),
+            target_rate_hz=200.0,
+        )
+        assert False, "expected ValueError from invalid target config"
+    except ValueError as exc:
+        assert "brake_reverse_reset_cm" in str(exc)
+
+
+def test_target_brake_reverse_env_is_wired_into_decision_engine(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAT_FOLLOW_BRAKE_REVERSE_TRIGGER_CM", "5")
+    app = build_app(
+        log_path=tmp_path / "telemetry.jsonl",
+        stop_event=threading.Event(),
+        target_rate_hz=200.0,
+    )
+    assert app.target_runtime_config.brake_reverse_trigger_cm == 5.0
+    assert app.decision_engine.brake_reverse_trigger_cm == 5.0
+
+
+def test_production_startup_degrades_when_web_and_tokens_unavailable(
+    tmp_path, monkeypatch
+):
+    """Optional monitoring/auth failures must not suppress the core workers."""
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_COMMS_TOKEN", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_WEB_REQUIRE_H264", "1")
+
+    def fail_web_app(**_kwargs):
+        raise RuntimeError("flask-sock unavailable")
+
+    monkeypatch.setattr("cat_follow.web_ui.app.create_app", fail_web_app)
+
+    proto_stop = threading.Event()
+    started = set()
+
+    def worker(name):
+        started.add(name)
+        proto_stop.wait(timeout=2.0)
+
+    proto_threads = tuple(
+        threading.Thread(
+            target=worker,
+            args=(name,),
+            name=f"Production{name}",
+            daemon=True,
+        )
+        for name in ("Camera", "Detector", "Tracker")
+    )
+    app = build_app(
+        log_path=tmp_path / "telemetry.jsonl",
+        target_rate_hz=200.0,
+        web_ui=True,
+        udp_listen_port=0,
+        prototype_perception_threads=proto_threads,
+        prototype_perception_stop_event=proto_stop,
+    )
+
+    assert app.web_ui_thread is None
+    assert app.udp_receiver is None
+    app.start()
+    try:
+        assert _wait_until(lambda: started == {"Camera", "Detector", "Tracker"})
+        assert _wait_until(lambda: app.control_loop.tick_count >= 5)
+    finally:
+        app.stop()
+
+
+def test_missing_tls_files_disable_only_web_server(monkeypatch):
+    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)
+    monkeypatch.delenv("CAT_FOLLOW_COMMS_TOKEN", raising=False)
+    monkeypatch.setenv("CAT_FOLLOW_WEB_SSL_CERTFILE", "/missing/web-ui.crt")
+    monkeypatch.setenv("CAT_FOLLOW_WEB_SSL_KEYFILE", "/missing/web-ui.key")
+    run_kwargs = {}
+    ran = threading.Event()
+
+    class FakeFlaskApp:
+        def run(self, **kwargs):
+            run_kwargs.update(kwargs)
+            ran.set()
+
+    monkeypatch.setattr(
+        "cat_follow.web_ui.app.create_app", lambda **_kwargs: FakeFlaskApp()
+    )
+    thread = _build_web_ui_thread(
+        runtime_shared=None,
+        comms_manager=None,
+        memory_shared=object(),
+        picarx=None,
+        port=5000,
+        sequence_executor=object(),
+    )
+    assert thread is not None
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not ran.is_set()
+    assert run_kwargs == {}
 
 
 def test_app_processes_command_through_full_stack(tmp_path):
@@ -87,35 +241,45 @@ def test_app_processes_command_through_full_stack(tmp_path):
         stop_event=threading.Event(),
         target_rate_hz=200.0,
     )
-
-    # Provide tracking before start_chase so it passes validation.
-    app.comms_manager.submit_tracking(
-        TrackingMessage(
-            sequence=1,
-            timestamp_ms=1,
-            car=TrackingCar(x=0.0, y=0.0, confidence=1.0),
-            cat=TrackingCat(x=10.0, y=10.0, confidence=1.0),
-        )
-    )
-    ack = app.comms_manager.submit_command(
-        CommandMessage(
-            sequence=2001,
-            timestamp_ms=2,
-            command_id="cmd-app-start",
-            command=CommandName.START_CHASE,
-        )
-    )
-    assert ack.status.value == "accepted"
-
+    _seed_healthy_sensors(app)
     app.start()
+
     try:
+        # Provide target-scoped tracking before start_chase validation.
+        app.comms_manager.submit_tracking(
+            TrackingMessage(
+                sequence=1,
+                timestamp_ms=1,
+                perimeter_id="yard-v3",
+                selected_target_id="cat-17",
+                car=TrackingCar(x=0.0, y=0.0, confidence=1.0),
+                cat=TrackingCat(
+                    x=10.0,
+                    y=10.0,
+                    confidence=1.0,
+                    target_id="cat-17",
+                ),
+            )
+        )
+        ack = app.comms_manager.submit_command(
+            CommandMessage(
+                sequence=2001,
+                timestamp_ms=2,
+                command_id="cmd-app-start",
+                command=CommandName.START_CHASE,
+                params={"target_id": "cat-17"},
+            )
+        )
+        assert ack.status.value == "accepted"
+        assert ack.state == FsmState.GETTING_CLOSE
+        assert ack.applied_control_sequence is not None
         assert _wait_until(
-            lambda: app.fsm.state == FsmState.CHASE_A, timeout=2.0
+            lambda: app.fsm.state == FsmState.SEARCH, timeout=2.0
         )
     finally:
         app.stop()
 
-    assert app.shared_state.get_decision().requested_state == FsmState.CHASE_A
+    assert app.shared_state.get_decision().requested_state == FsmState.SEARCH
 
 
 class _FakePrototypeVisionSS:
@@ -163,9 +327,8 @@ def test_app_with_vision_adapter_publishes_vision_state(tmp_path):
         app.stop()
 
 
-def test_app_with_range_adapter_triggers_failsafe_on_obstacle(tmp_path):
-    """A close obstacle reading should propagate through the range adapter
-    and the control loop into a FAILSAFE transition with a brake command."""
+def test_close_range_while_idle_remains_stationary(tmp_path):
+    """Close range does not start reverse without an autonomous objective."""
 
     def read_close_obstacle():
         return 5.0  # below OBSTACLE_TOO_CLOSE_CM
@@ -180,11 +343,10 @@ def test_app_with_range_adapter_triggers_failsafe_on_obstacle(tmp_path):
 
     app.start()
     try:
-        assert _wait_until(
-            lambda: app.fsm.state == FsmState.FAILSAFE, timeout=2.0
-        )
+        assert _wait_until(lambda: app.control_loop.tick_count >= 5)
+        assert app.fsm.state == FsmState.IDLE
         decision = app.shared_state.get_decision()
-        assert decision.brake is True
+        assert decision.speed == 0.0
     finally:
         app.stop()
 
@@ -288,6 +450,7 @@ def test_app_with_udp_transport_round_trip(tmp_path):
         udp_target_host=ack_host,
         udp_target_port=ack_port,
     )
+    _seed_healthy_sensors(app)
     app.start()
 
     client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -301,8 +464,15 @@ def test_app_with_udp_transport_round_trip(tmp_path):
         tracking = TrackingMessage(
             sequence=1,
             timestamp_ms=0,
+            perimeter_id="yard-v3",
+            selected_target_id="cat-17",
             car=TrackingCar(x=0.0, y=0.0, confidence=1.0),
-            cat=TrackingCat(x=10.0, y=10.0, confidence=1.0),
+            cat=TrackingCat(
+                x=10.0,
+                y=10.0,
+                confidence=1.0,
+                target_id="cat-17",
+            ),
         )
         client.sendto(
             json.dumps(tracking.to_dict()).encode("utf-8"),
@@ -313,6 +483,7 @@ def test_app_with_udp_transport_round_trip(tmp_path):
             timestamp_ms=0,
             command_id="cmd-udp-start",
             command=CommandName.START_CHASE,
+            params={"target_id": "cat-17"},
         )
         client.sendto(
             json.dumps(cmd.to_dict()).encode("utf-8"),
@@ -325,9 +496,9 @@ def test_app_with_udp_transport_round_trip(tmp_path):
         assert payload["status"] == "accepted"
         assert payload["command_id"] == "cmd-udp-start"
 
-        # The control loop should advance the FSM into CHASE_A.
+        # The close overhead target advances the FSM into SEARCH.
         assert _wait_until(
-            lambda: app.fsm.state == FsmState.CHASE_A, timeout=2.0
+            lambda: app.fsm.state == FsmState.SEARCH, timeout=2.0
         )
     finally:
         client.close()

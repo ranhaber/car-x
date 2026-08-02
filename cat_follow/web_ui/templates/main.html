@@ -8,6 +8,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    [x-cloak] { display: none !important; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #1a1a2e; color: #e0e0e0;
@@ -31,12 +32,22 @@
       overflow: hidden; margin-bottom: 16px; text-align: center; position: relative;
     }
     .stream-container img, .stream-container canvas {
-      width: 100%; max-width: 640px; height: auto; display: block; margin: 0 auto;
+      width: 100%; max-width: 640px; aspect-ratio: 4 / 3; height: auto;
+      min-height: 240px; display: block; margin: 0 auto; background: #c0392b;
     }
     .stream-overlay {
       position: absolute; left: 12px; top: 10px; font-size: 0.75rem;
       background: rgba(0,0,0,0.55); padding: 4px 8px; border-radius: 4px;
-      color: #9fe870;
+      color: #9fe870; z-index: 2; pointer-events: none;
+    }
+    .stream-live {
+      position: absolute; left: 12px; bottom: 12px; z-index: 2;
+      background: #ffe600; color: #111; font: bold 14px sans-serif;
+      padding: 4px 10px; border-radius: 4px; pointer-events: none;
+    }
+    .stream-warning {
+      background: #4a1c1c; color: #ffb4b4; border: 1px solid #e07070;
+      border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-size: 0.9rem;
     }
 
     .sensor-bar, .panel {
@@ -152,10 +163,11 @@
     </div>
   </div>
 
+  <div class="stream-warning" x-show="streamWarning" x-text="streamWarning"></div>
   <div class="stream-container">
-    <img x-show="streamMode === 'mjpeg'" :src="streamUrl" alt="Live stream" />
-    <canvas x-show="streamMode === 'h264'" x-ref="h264Canvas" width="640" height="480"></canvas>
+    <canvas x-ref="h264Canvas" width="640" height="480"></canvas>
     <div class="stream-overlay" x-text="overlayText()"></div>
+    <div class="stream-live" x-show="h264Live" x-cloak>LIVE</div>
   </div>
 
   <div class="panel map-panel">
@@ -232,12 +244,12 @@
 
   <div class="controls">
     <div class="control-group">
-      <label>X (meters)</label>
-      <input type="number" step="0.1" x-model="targetX" placeholder="0.0" />
+      <label>X (cm)</label>
+      <input type="number" step="1" x-model="targetXCm" placeholder="0" />
     </div>
     <div class="control-group">
-      <label>Y (meters)</label>
-      <input type="number" step="0.1" x-model="targetY" placeholder="0.0" />
+      <label>Y (cm)</label>
+      <input type="number" step="1" x-model="targetYCm" placeholder="0" />
     </div>
     <button class="btn-send" @click="sendTarget()">Send Target</button>
     <button class="btn-chase" @click="startChase()" x-show="status.mode === 'contract'">Start Chase</button>
@@ -246,18 +258,7 @@
 
     <div class="control-group" style="margin-left: auto;">
       <label>Stream</label>
-      <select x-model="streamMode" @change="changeStreamMode()">
-        <option value="mjpeg">MJPEG</option>
-        <option value="h264" :disabled="!caps.h264">H.264</option>
-      </select>
-    </div>
-    <div class="control-group">
-      <label>Stream resolution</label>
-      <select x-model="resolution" @change="changeResolution()">
-        <option value="640x480">640x480</option>
-        <option value="320x240">320x240</option>
-        <option value="160x120">160x120</option>
-      </select>
+      <span class="sensor-value" x-text="caps.h264 ? 'H.264' : 'unavailable'"></span>
     </div>
     <div class="control-group">
       <label>Detector model</label>
@@ -280,8 +281,8 @@
            x-text="status.state"></div>
     </div>
     <div class="status-item">
-      <div class="label">Position</div>
-      <div class="value" x-text="'(' + status.odometry.x.toFixed(2) + ', ' + status.odometry.y.toFixed(2) + ')'"></div>
+      <div class="label">Position (cm)</div>
+      <div class="value" x-text="'(' + status.odometry.x.toFixed(1) + ', ' + status.odometry.y.toFixed(1) + ')'"></div>
     </div>
     <div class="status-item">
       <div class="label">Heading</div>
@@ -330,12 +331,13 @@
 <script>
 function catFollow() {
   return CatFollowActionBuilder.mixin({
-    targetX: 1.0,
-    targetY: 0.0,
+    targetXCm: 100.0,
+    targetYCm: 0.0,
     resolution: '640x480',
-    streamUrl: '/stream',
-    streamMode: 'mjpeg',
-    caps: { mjpeg: true, h264: false },
+    caps: { h264: false },
+    streamWarning: '',
+    streamDebug: 'H.264: starting…',
+    h264Live: false,
     feedback: '',
     feedbackOk: true,
     detectorModel: 'rknn',
@@ -346,8 +348,15 @@ function catFollow() {
     mapData: null,
     _h264Overlay: { state: '', bbox: null, targets: {} },
     _ws: null,
+    _h264Decoder: null,
+    _h264Configured: false,
+    _h264Timestamp: 0,
+    _h264NalBuffer: null,
+    _h264Sps: null,
+    _h264Pps: null,
     _mapPollTimer: null,
     _mapImage: null,
+    _h264PageHideHandler: null,
 
     status: {
       mode: 'prototype',
@@ -395,9 +404,20 @@ function catFollow() {
 
     start() {
       this.initActionBuilder();
+      if (!this._h264PageHideHandler) {
+        this._h264PageHideHandler = () => this.stopH264();
+        window.addEventListener('pagehide', this._h264PageHideHandler, { once: true });
+      }
       this.fetchStatus();
       this.fetchDetectorModel();
-      this.fetchCapabilities();
+      this.fetchCapabilities().then(() => {
+        if (this.caps.h264) {
+          this.startH264();
+        } else {
+          this.showFeedback('H.264 stream unavailable on server', false);
+          this.streamDebug = 'H.264 unavailable';
+        }
+      });
       this.fetchConfig();
       this.fetchMap();
       this._pollTimer = setInterval(() => this.fetchStatus(), 1000);
@@ -429,11 +449,7 @@ function catFollow() {
     },
 
     overlayText() {
-      if (this.streamMode === 'h264' && this._h264Overlay.state) {
-        return 'H.264 · ' + this._h264Overlay.state;
-      }
-      const phase = (this.status.perception && this.status.perception.phase) || '';
-      return (this.status.state || '') + (phase ? ' · ' + phase : '');
+      return this.streamDebug;
     },
 
     isIdleState() {
@@ -463,9 +479,6 @@ function catFollow() {
         const res = await fetch('/api/stream/capabilities');
         if (res.ok) {
           this.caps = await res.json();
-          if (!this.caps.h264 && this.streamMode === 'h264') {
-            this.streamMode = 'mjpeg';
-          }
         }
       } catch (e) { /* ignore */ }
     },
@@ -487,8 +500,9 @@ function catFollow() {
       if (!m) return 'Waiting for /api/map…';
       if (!m.available) return m.note || 'No map yet (start ros-nav / mapping with C1 connected)';
       const pose = m.pose || {};
-      const px = (pose.x != null) ? pose.x.toFixed(2) : '—';
-      const py = (pose.y != null) ? pose.y.toFixed(2) : '—';
+      // The grid is metric because ROS defines it that way; operators read cm.
+      const px = (pose.x != null) ? (pose.x * 100).toFixed(0) : '—';
+      const py = (pose.y != null) ? (pose.y * 100).toFixed(0) : '—';
       const yaw = (pose.yaw != null) ? (pose.yaw * 180 / Math.PI).toFixed(1) + '°' : '—';
       let poseTag;
       if (!m.pose_fresh) poseTag = (pose.frame || '?') + ', stale';
@@ -496,7 +510,7 @@ function catFollow() {
       else poseTag = pose.frame || '?';
       const mapTag = m.map_fresh ? '' : ' · map stale';
       return m.width + '×' + m.height + ' @ ' + Number(m.resolution_m).toFixed(3) + ' m/cell'
-        + ' · pose (' + px + ', ' + py + ') ' + yaw
+        + ' · pose (' + px + ', ' + py + ') cm ' + yaw
         + ' [' + poseTag + ']'
         + mapTag
         + ' · source ' + (m.source || '—');
@@ -634,11 +648,11 @@ function catFollow() {
         const res = await fetch('/api/target', {
           method: 'POST',
           headers: this.controlHeaders(),
-          body: JSON.stringify({ x: parseFloat(this.targetX), y: parseFloat(this.targetY) }),
+          body: JSON.stringify({ x_cm: parseFloat(this.targetXCm), y_cm: parseFloat(this.targetYCm) }),
         });
         const data = await res.json();
         if (res.ok) {
-          this.showFeedback('Target sent: (' + data.x + ', ' + data.y + ') [' + data.mode + ']', true);
+          this.showFeedback('Target sent: (' + data.x_cm + ', ' + data.y_cm + ') cm [' + data.mode + ']', true);
         } else {
           this.showFeedback(data.error || 'Error', false);
         }
@@ -692,108 +706,326 @@ function catFollow() {
       }
     },
 
-    async changeResolution() {
-      try {
-        this.ensureControlToken();
-        const res = await fetch('/api/stream/resolution', {
-          method: 'POST',
-          headers: this.controlHeaders(),
-          body: JSON.stringify({ resolution: this.resolution }),
-        });
-        if (res.ok) {
-          if (this.streamMode === 'mjpeg') {
-            this.streamUrl = '';
-            setTimeout(() => { this.streamUrl = '/stream'; }, 100);
-          }
-          this.showFeedback('Resolution: ' + this.resolution, true);
-        } else {
-          const data = await res.json().catch(() => ({}));
-          this.showFeedback(data.error || 'Resolution change denied', false);
+    _appendH264Bytes(chunk) {
+      // Each WebSocket binary message is one complete access unit from appsink.
+      this._processH264AccessUnit(new Uint8Array(chunk));
+    },
+
+    _splitAnnexBNals(buffer) {
+      const nals = [];
+      const len = buffer.length;
+      const startCodeLength = (pos) => {
+        if (pos + 3 < len && buffer[pos] === 0 && buffer[pos + 1] === 0) {
+          if (buffer[pos + 2] === 1) return 3;
+          if (buffer[pos + 2] === 0 && buffer[pos + 3] === 1) return 4;
         }
+        return 0;
+      };
+
+      const starts = [];
+      for (let pos = 0; pos + 3 < len;) {
+        const codeLength = startCodeLength(pos);
+        if (codeLength) {
+          starts.push({ codeStart: pos, nalStart: pos + codeLength });
+          pos += codeLength;
+        } else {
+          pos += 1;
+        }
+      }
+
+      for (let index = 0; index < starts.length; index++) {
+        const end = index + 1 < starts.length
+          ? starts[index + 1].codeStart
+          : len;
+        if (end > starts[index].nalStart) {
+          nals.push(buffer.subarray(starts[index].nalStart, end));
+        }
+      }
+      return nals;
+    },
+
+    _buildAvcC(sps, pps) {
+      const spsLen = sps.length;
+      const ppsLen = pps.length;
+      const out = new Uint8Array(11 + spsLen + ppsLen);
+      out[0] = 1;
+      out[1] = sps[1];
+      out[2] = sps[2];
+      out[3] = sps[3];
+      out[4] = 0xff;
+      out[5] = 0xe1;
+      out[6] = (spsLen >> 8) & 0xff;
+      out[7] = spsLen & 0xff;
+      out.set(sps, 8);
+      let o = 8 + spsLen;
+      out[o++] = 1;
+      out[o++] = (ppsLen >> 8) & 0xff;
+      out[o++] = ppsLen & 0xff;
+      out.set(pps, o);
+      return out.buffer;
+    },
+
+    _ensureH264DecoderConfigured() {
+      if (this._h264Configured || !this._h264Sps || !this._h264Pps || !this._h264Decoder) {
+        return this._h264Configured;
+      }
+      const profile = Array.from(this._h264Sps.subarray(1, 4))
+        .map((value) => value.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+      try {
+        this._h264Decoder.configure({
+          codec: 'avc1.' + profile,
+          codedWidth: 640,
+          codedHeight: 480,
+          optimizeForLatency: true,
+          hardwareAcceleration: 'prefer-software',
+        });
+        this._h264Configured = true;
+        this.streamDebug = 'H.264 cfg avc1.' + profile;
+        return true;
       } catch (e) {
-        this.showFeedback('Error changing resolution', false);
+        console.error('VideoDecoder.configure failed', e);
+        this.streamWarning = 'VideoDecoder.configure failed: ' + (e && e.message ? e.message : e);
+        this.streamDebug = 'H.264 configure failed';
+        return false;
       }
     },
 
-    changeStreamMode() {
-      this.stopH264();
-      if (this.streamMode === 'h264') {
-        if (!this.caps.h264) {
-          this.streamMode = 'mjpeg';
-          this.showFeedback('H.264 unavailable on this host', false);
-          return;
+    _processH264AccessUnit(au) {
+      const nals = this._splitAnnexBNals(au);
+      let isKey = false;
+      let hasVcl = false;
+      for (const nal of nals) {
+        if (!nal.length) continue;
+        const type = nal[0] & 0x1f;
+        if (type === 7) this._h264Sps = nal;
+        else if (type === 8) this._h264Pps = nal;
+        else if (type === 5) { isKey = true; hasVcl = true; }
+        else if (type === 1) hasVcl = true;
+      }
+      if (!hasVcl) return;
+      if (!this._ensureH264DecoderConfigured()) return;
+      if (!isKey && !this._h264SawKey) return;
+
+      try {
+        this._h264Decoder.decode(new EncodedVideoChunk({
+          type: isKey ? 'key' : 'delta',
+          timestamp: this._h264Timestamp,
+          data: au,
+        }));
+        if (isKey) this._h264SawKey = true;
+        this._h264Submitted = (this._h264Submitted || 0) + 1;
+        this._h264Timestamp += 33333;
+      } catch (e) {
+        console.error('VideoDecoder.decode failed', e);
+        this.streamWarning = 'VideoDecoder.decode failed: ' + (e && e.message ? e.message : e);
+      }
+    },
+
+    _drawH264Overlays(ctx) {
+      const msg = this._h264Overlay || {};
+      const colors = { PRIMARY_CAT: '#2ecc71', SECONDARY_CAT: '#f39c12' };
+      if (msg.targets && Object.keys(msg.targets).length) {
+        for (const [role, target] of Object.entries(msg.targets)) {
+          if (!target.valid) continue;
+          ctx.strokeStyle = colors[role] || '#ffffff';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(target.x, target.y, target.w, target.h);
+          ctx.fillStyle = colors[role] || '#ffffff';
+          ctx.font = '13px sans-serif';
+          ctx.fillText(role + ' #' + target.track_id, target.x, Math.max(14, target.y - 4));
         }
-        this.streamUrl = '';
-        this.startH264();
-        this.showFeedback('Switched to H.264 WebSocket stream', true);
-      } else {
-        this.streamUrl = '/stream';
-        this.showFeedback('Switched to MJPEG', true);
+      } else if (msg.bbox && msg.bbox[4]) {
+        ctx.strokeStyle = '#2ecc71';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]);
+      }
+    },
+
+    _renderH264Frame(ctx) {
+      const queue = this._h264RenderQueue || [];
+      const frame = queue.shift();
+      if (!frame) {
+        this._h264Stalls = (this._h264Stalls || 0) + 1;
+        return;
+      }
+      try {
+        ctx.drawImage(frame, 0, 0, 640, 480);
+        this._drawH264Overlays(ctx);
+        this._h264Frames = (this._h264Frames || 0) + 1;
+        this.h264Live = true;
+        if ((this._h264Frames % 30) === 1) {
+          let px = 'n/a';
+          try {
+            const sample = ctx.getImageData(320, 240, 1, 1).data;
+            px = sample[0] + ',' + sample[1] + ',' + sample[2];
+          } catch (e) { /* ignore */ }
+          const now = performance.now();
+          const elapsed = Math.max(1, now - this._h264FpsStarted);
+          const fps = (this._h264Frames * 1000 / elapsed).toFixed(2);
+          this.streamDebug =
+            'H.264 fps=' + fps
+            + ' stalls=' + this._h264Stalls
+            + ' buffered=' + queue.length
+            + ' dropped=' + this._h264Dropped
+            + ' out=' + this._h264Frames
+            + ' in=' + (this._h264Submitted || 0)
+            + ' px=' + px;
+        }
+      } finally {
+        frame.close();
       }
     },
 
     startH264() {
+      if (!window.isSecureContext) {
+        this.streamWarning =
+          'WebCodecs needs HTTPS (or http://127.0.0.1 via SSH tunnel).';
+        this.streamDebug = 'H.264 blocked (insecure HTTP)';
+        return;
+      }
+      if (!('VideoDecoder' in window)) {
+        this.showFeedback('WebCodecs VideoDecoder not supported in this browser', false);
+        this.streamDebug = 'H.264 unsupported browser';
+        return;
+      }
+      const canvas = this.$refs.h264Canvas;
+      if (!canvas) {
+        this.streamWarning = 'H.264 canvas ref missing';
+        this.streamDebug = 'H.264 canvas missing';
+        return;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        this.streamWarning = 'H.264 canvas context unavailable';
+        this.streamDebug = 'H.264 no 2d context';
+        return;
+      }
+      canvas.width = 640;
+      canvas.height = 480;
+      ctx.fillStyle = '#c0392b';
+      ctx.fillRect(0, 0, 640, 480);
+      ctx.fillStyle = '#ffe600';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.fillText('waiting for video…', 160, 240);
+
+      this._h264Sps = null;
+      this._h264Pps = null;
+      this._h264Configured = false;
+      this._h264SawKey = false;
+      this._h264Frames = 0;
+      this._h264Decoded = 0;
+      this._h264Submitted = 0;
+      this._h264Timestamp = 0;
+      this._h264FpsStarted = 0;
+      this._h264Stalls = 0;
+      this._h264Dropped = 0;
+      this._h264RenderQueue = [];
+      this._h264RenderTimer = null;
+      this.h264Live = false;
+
+      try {
+        this._h264Decoder = new VideoDecoder({
+          output: (frame) => {
+            this._h264Decoded += 1;
+            this._h264RenderQueue.push(frame);
+            while (this._h264RenderQueue.length > 6) {
+              const dropped = this._h264RenderQueue.shift();
+              dropped.close();
+              this._h264Dropped += 1;
+            }
+            if (
+              this._h264RenderTimer === null
+              && this._h264RenderQueue.length >= 3
+            ) {
+              this._h264FpsStarted = performance.now();
+              this._h264RenderTimer = setInterval(
+                () => this._renderH264Frame(ctx),
+                1000 / 30,
+              );
+            }
+          },
+          error: (e) => {
+            console.error('H.264 decoder error', e);
+            this.streamWarning = 'H.264 decoder error: ' + (e && e.message ? e.message : e);
+          },
+        });
+      } catch (e) {
+        this.streamWarning = 'Cannot create VideoDecoder: ' + (e && e.message ? e.message : e);
+        this.streamDebug = 'H.264 decoder create failed';
+        this._h264Decoder = null;
+        return;
+      }
+
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(proto + '://' + location.host + '/ws/h264');
+      let ws;
+      try {
+        ws = new WebSocket(proto + '://' + location.host + '/ws/h264');
+      } catch (e) {
+        this.streamWarning = 'Cannot open H.264 WebSocket: ' + (e && e.message ? e.message : e);
+        this.streamDebug = 'H.264 WS create failed';
+        this.stopH264();
+        return;
+      }
       ws.binaryType = 'arraybuffer';
       this._ws = ws;
-      const canvas = this.$refs.h264Canvas;
-      const ctx = canvas ? canvas.getContext('2d') : null;
+      this.streamDebug = 'H.264 WS connecting…';
+      ws.onopen = () => { this.streamDebug = 'H.264 WS open'; };
       ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           try {
             const msg = JSON.parse(ev.data);
-            if (msg.type === 'overlay') {
-              this._h264Overlay = msg;
-              if (ctx && msg.targets && Object.keys(msg.targets).length) {
-                const colors = {
-                  PRIMARY_CAT: '#2ecc71',
-                  SECONDARY_CAT: '#f39c12',
-                };
-                for (const [role, target] of Object.entries(msg.targets)) {
-                  if (!target.valid) continue;
-                  ctx.strokeStyle = colors[role] || '#ffffff';
-                  ctx.lineWidth = 2;
-                  ctx.strokeRect(target.x, target.y, target.w, target.h);
-                  ctx.fillStyle = colors[role] || '#ffffff';
-                  ctx.font = '13px sans-serif';
-                  ctx.fillText(role + ' #' + target.track_id, target.x, Math.max(14, target.y - 4));
-                }
-              } else if (ctx && msg.bbox && msg.bbox[4]) {
-                // Compatibility for a producer that only publishes bbox_tracker.
-                ctx.strokeStyle = '#2ecc71';
-                ctx.lineWidth = 2;
-                ctx.strokeRect(msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]);
-              }
-            }
+            if (msg.type === 'overlay') this._h264Overlay = msg;
           } catch (e) { /* ignore */ }
           return;
         }
-        // Without a JS H.264 decoder we still keep the WS open for encode
-        // load testing / client counting. Show status on canvas.
-        if (ctx) {
-          ctx.fillStyle = '#0f0f23';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.fillStyle = '#9fe870';
-          ctx.font = '16px sans-serif';
-          ctx.fillText('H.264 stream connected (raw Annex-B chunks)', 24, 40);
-          ctx.fillText('State: ' + (this._h264Overlay.state || '—'), 24, 68);
-          ctx.fillText('Install a browser MSE/WebCodecs client later for video decode', 24, 96);
-        }
+        if (!this._h264Decoder) return;
+        this._appendH264Bytes(ev.data);
       };
-      ws.onerror = () => this.showFeedback('H.264 WebSocket error', false);
+      ws.onerror = () => {
+        this.showFeedback('H.264 WebSocket error', false);
+        this.streamDebug = 'H.264 WS error';
+      };
       ws.onclose = () => {
-        if (this.streamMode === 'h264') {
-          this.showFeedback('H.264 WebSocket closed', false);
-        }
+        if (this._ws !== ws) return;
+        this._ws = null;
+        this._cleanupH264Decoder();
+        this.showFeedback('H.264 WebSocket closed', false);
+        this.streamDebug = 'H.264 WS closed';
+        this.h264Live = false;
       };
+    },
+
+    _cleanupH264Decoder() {
+      if (this._h264RenderTimer !== null) {
+        clearInterval(this._h264RenderTimer);
+        this._h264RenderTimer = null;
+      }
+      for (const frame of (this._h264RenderQueue || [])) {
+        try { frame.close(); } catch (e) {}
+      }
+      this._h264RenderQueue = [];
+      if (this._h264Decoder) {
+        try {
+          if (this._h264Decoder.state !== 'closed') this._h264Decoder.close();
+        } catch (e) {}
+        this._h264Decoder = null;
+      }
     },
 
     stopH264() {
       if (this._ws) {
-        try { this._ws.close(); } catch (e) {}
+        const ws = this._ws;
         this._ws = null;
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try { ws.close(); } catch (e) {}
       }
+      this._cleanupH264Decoder();
+      this.h264Live = false;
     },
 
     async fetchDetectorModel() {

@@ -40,4 +40,12 @@
     <origin xyz="0.114 0.0 0.05" rpy="0 0 0"/>
   </joint>
 
+  <!-- Forward HC-SR04 ultrasonic: bumper center, ~4 cm up. -->
+  <link name="ultrasonic_link"/>
+  <joint name="base_to_ultrasonic" type="fixed">
+    <parent link="base_link"/>
+    <child link="ultrasonic_link"/>
+    <origin xyz="0.125 0.0 0.04" rpy="0 0 0"/>
+  </joint>
+
 </robot>

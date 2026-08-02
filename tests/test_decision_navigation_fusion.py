@@ -8,6 +8,7 @@ from cat_follow.control.decision_engine import (
 from cat_follow.control.fsm import FSM
 from cat_follow.control.types import (
     CommandState,
+    CarTrackingState,
     DecisionInput,
     FSMSnapshot,
     FsmState,
@@ -17,6 +18,7 @@ from cat_follow.control.types import (
     RangeBackend,
     RangeState,
     SystemState,
+    TrackingObjectState,
     VisionState,
 )
 
@@ -31,6 +33,16 @@ def _fresh_range(now_ms=1000):
     )
 
 
+def _fresh_lidar(now_ms=1000):
+    return RangeState(
+        received_ms=now_ms,
+        fresh=True,
+        backend=RangeBackend.LIDAR_C1,
+        distance_cm=100.0,
+        confidence=1.0,
+    )
+
+
 def _input(
     *,
     fsm_state=FsmState.CHASE_A,
@@ -38,63 +50,79 @@ def _input(
     navigation=None,
     lidar=None,
     range=None,
+    vision=None,
+    home=None,
 ) -> DecisionInput:
     return DecisionInput(
         now_ms=now_ms,
-        overhead=OverheadState(received_ms=now_ms, fresh=True, sequence=1),
-        home=HomeState(),
-        vision=VisionState(),
+        overhead=OverheadState(
+            received_ms=now_ms,
+            fresh=True,
+            sequence=1,
+            selected_target_id="cat-17",
+            car=CarTrackingState(confidence=1.0),
+            cat=TrackingObjectState(
+                x=300.0,
+                confidence=1.0,
+                target_id="cat-17",
+            ),
+        ),
+        home=home or HomeState(),
+        vision=vision or VisionState(),
         range=range if range is not None else _fresh_range(now_ms),
         navigation=navigation or NavigationState(),
         system=SystemState(),
         fsm=FSMSnapshot(state=fsm_state),
         command=CommandState(),
-        lidar=lidar or RangeState(),
+        lidar=lidar if lidar is not None else _fresh_lidar(now_ms),
     )
 
 
 def _engine(state=FsmState.CHASE_A):
     fsm = FSM(initial_state=state)
-    return DecisionEngine(fsm), fsm
+    engine = DecisionEngine(fsm)
+    if state in {FsmState.GETTING_CLOSE, FsmState.SEARCH, FsmState.CHASE}:
+        engine.set_active_target_id("cat-17")
+    return engine, fsm
 
 
-def test_lidar_close_triggers_failsafe():
+def test_lidar_close_triggers_brake_reverse():
     engine, fsm = _engine(FsmState.CHASE_A)
     lidar = RangeState(
         received_ms=1000,
         fresh=True,
         backend=RangeBackend.LIDAR_C1,
         distance_cm=OBSTACLE_TOO_CLOSE_CM - 2.0,
+        confidence=1.0,
     )
     decision = engine.tick(_input(lidar=lidar))
-    assert fsm.state == FsmState.FAILSAFE
+    assert fsm.state == FsmState.BRAKE_REVERSE
     assert decision.brake is True
-    assert "obstacle_too_close" in decision.active_constraints
-    assert "lidar_obstacle" in decision.active_constraints
+    assert "brake_reverse" in decision.active_constraints
 
 
-def test_lidar_critical_triggers_veto():
+def test_lidar_critical_flag_does_not_override_distance_policy():
     engine, fsm = _engine(FsmState.CHASE_A)
     lidar = RangeState(
         received_ms=1000,
         fresh=True,
         backend=RangeBackend.LIDAR_C1,
         distance_cm=40.0,
+        confidence=1.0,
         obstacle_critical=True,
     )
     decision = engine.tick(_input(lidar=lidar))
-    assert fsm.state == FsmState.FAILSAFE
-    assert "obstacle_veto" in decision.active_constraints
-    assert "lidar_veto" in decision.active_constraints
+    assert fsm.state == FsmState.CHASE_A
+    assert "obstacle_veto" not in decision.active_constraints
 
 
-def test_stale_lidar_does_not_veto():
+def test_stale_lidar_starts_health_hold():
     engine, fsm = _engine(FsmState.CHASE_A)
     # Very close but the sample is old (received long ago) -> aged out.
     lidar = RangeState(received_ms=1, fresh=True, distance_cm=1.0)
     decision = engine.tick(_input(now_ms=100000, lidar=lidar))
     assert fsm.state == FsmState.CHASE_A
-    assert "obstacle_too_close" not in decision.active_constraints
+    assert "sensor_health_hold" in decision.active_constraints
 
 
 def test_navigation_drives_goto_speed_and_steer():
@@ -110,22 +138,18 @@ def test_navigation_path_correction_is_clamped():
     engine, _ = _engine(FsmState.CHASE_A)
     nav = NavigationState(received_ms=1000, fresh=True, path_correction=5.0, speed_limit=2.0)
     decision = engine.tick(_input(fsm_state=FsmState.CHASE_A, navigation=nav))
-    # Nav2 path_correction still biases steering (clamped)...
     assert decision.steering == 1.0
-    # ...but in CHASE_A Nav2 is advisory only: local pursuit owns speed, which is
-    # 0 in the V1 shell, so the car holds rather than being driven by Nav2.
-    assert decision.speed == 0.0
-    assert "nav_advisory" in decision.active_constraints
+    assert decision.speed == 2.0
+    assert "navigation" in decision.active_constraints
 
 
-def test_navigation_chase_a_holds_speed_but_biases_steer():
+def test_navigation_getting_close_drives_speed_and_steer():
     engine, _ = _engine(FsmState.CHASE_A)
     nav = NavigationState(received_ms=1000, fresh=True, path_correction=0.3, speed_limit=0.9)
     decision = engine.tick(_input(fsm_state=FsmState.CHASE_A, navigation=nav))
     assert abs(decision.steering - 0.3) < 1e-9
-    assert decision.speed == 0.0
+    assert decision.speed == 0.9
     assert "navigation" in decision.active_constraints
-    assert "nav_advisory" in decision.active_constraints
 
 
 def test_stale_navigation_keeps_zero_motion():
@@ -148,4 +172,202 @@ def test_navigation_drive_fails_closed_without_usable_obstacle_sensor():
     )
     assert decision.speed == 0.0
     assert decision.steering == 0.0
-    assert "obstacle_sensor_unavailable" in decision.active_constraints
+    assert "sensor_health_hold" in decision.active_constraints
+
+
+def test_chase_clamps_camera_request_without_adding_nav_correction():
+    engine, fsm = _engine(FsmState.CHASE)
+    nav = NavigationState(
+        received_ms=1000,
+        fresh=True,
+        authority="NavigationManager",
+        healthy=True,
+        path_viable=True,
+        safe_steering_min=-0.2,
+        safe_steering_max=0.3,
+        path_correction=-0.7,
+        speed_limit=0.5,
+    )
+    vision = VisionState(
+        received_ms=1000,
+        fresh=True,
+        cat_visible=True,
+        associated_target_id="cat-17",
+        x_offset_norm=0.8,
+    )
+    decision = engine.tick(
+        _input(
+            fsm_state=FsmState.CHASE,
+            navigation=nav,
+            vision=vision,
+        )
+    )
+    assert fsm.state == FsmState.CHASE
+    assert decision.steering == 0.3
+    assert decision.steering != 0.1  # camera + path_correction is forbidden
+    assert decision.target_source.value == "cat_local"
+    assert "camera_steering_clamped" in decision.active_constraints
+
+
+def test_chase_stops_when_navigation_path_is_not_viable():
+    engine, _ = _engine(FsmState.CHASE)
+    nav = NavigationState(
+        received_ms=1000,
+        fresh=True,
+        authority="NavigationManager",
+        healthy=True,
+        path_viable=False,
+        speed_limit=0.5,
+    )
+    vision = VisionState(
+        received_ms=1000,
+        fresh=True,
+        cat_visible=True,
+        associated_target_id="cat-17",
+    )
+    decision = engine.tick(
+        _input(
+            fsm_state=FsmState.CHASE,
+            navigation=nav,
+            vision=vision,
+        )
+    )
+    assert decision.speed == 0.0
+    assert decision.brake
+    assert decision.reason.value == "navigation_path_blocked"
+
+
+def test_correlated_goto_completion_enters_idle():
+    engine, fsm = _engine(FsmState.GOTO)
+    nav = NavigationState(completion_qualified=True)
+    decision = engine.tick(
+        _input(fsm_state=FsmState.GOTO, navigation=nav)
+    )
+    assert fsm.state == FsmState.IDLE
+    assert decision.speed == 0.0
+
+
+def test_exhausted_chase_navigation_returns_home_when_safe():
+    engine, fsm = _engine(FsmState.GETTING_CLOSE)
+    nav = NavigationState(failures_exhausted=True)
+    engine.tick(
+        _input(
+            fsm_state=FsmState.GETTING_CLOSE,
+            navigation=nav,
+            home=HomeState(set=True),
+        )
+    )
+    assert fsm.state == FsmState.RETURN_HOME
+
+
+def test_exhausted_return_home_navigation_enters_failsafe():
+    engine, fsm = _engine(FsmState.RETURN_HOME)
+    nav = NavigationState(failures_exhausted=True)
+    decision = engine.tick(
+        _input(fsm_state=FsmState.RETURN_HOME, navigation=nav)
+    )
+    assert fsm.state == FsmState.FAILSAFE
+    assert decision.brake
+
+
+def test_exhausted_getting_close_without_home_enters_failsafe():
+    engine, fsm = _engine(FsmState.GETTING_CLOSE)
+    nav = NavigationState(failures_exhausted=True)
+    decision = engine.tick(
+        _input(
+            fsm_state=FsmState.GETTING_CLOSE,
+            navigation=nav,
+            home=HomeState(set=False),
+        )
+    )
+    assert fsm.state == FsmState.FAILSAFE
+    assert decision.brake
+    assert "safe_return_unavailable" in decision.active_constraints
+
+
+def test_exhausted_goto_enters_idle():
+    engine, fsm = _engine(FsmState.GOTO)
+    nav = NavigationState(failures_exhausted=True)
+    decision = engine.tick(
+        _input(fsm_state=FsmState.GOTO, navigation=nav)
+    )
+    assert fsm.state == FsmState.IDLE
+    assert decision.speed == 0.0
+    assert decision.brake
+
+
+def test_qualified_return_home_completion_enters_home():
+    engine, fsm = _engine(FsmState.RETURN_HOME)
+    nav = NavigationState(completion_qualified=True)
+    decision = engine.tick(
+        _input(fsm_state=FsmState.RETURN_HOME, navigation=nav)
+    )
+    assert fsm.state == FsmState.HOME
+    assert decision.speed == 0.0
+
+
+def test_exhausted_chase_return_home_clears_chase_target_publication():
+    engine, fsm = _engine(FsmState.GETTING_CLOSE)
+    engine.tick(_input(fsm_state=FsmState.GETTING_CLOSE, home=HomeState(set=True)))
+
+    engine.tick(
+        _input(
+            fsm_state=FsmState.GETTING_CLOSE,
+            navigation=NavigationState(failures_exhausted=True),
+            home=HomeState(set=True),
+        )
+    )
+    assert fsm.state == FsmState.RETURN_HOME
+
+    driving = engine.tick(
+        _input(
+            fsm_state=FsmState.RETURN_HOME,
+            navigation=NavigationState(
+                received_ms=1000, fresh=True, path_correction=0.2, speed_limit=0.4
+            ),
+            home=HomeState(set=True),
+        )
+    )
+    assert driving.target_source.value == "home"
+    assert driving.target_x is None
+    assert driving.target_y is None
+
+
+def test_exhausted_chase_failsafes_when_return_transition_is_rejected(monkeypatch):
+    engine, fsm = _engine(FsmState.GETTING_CLOSE)
+
+    def _reject(event, **kwargs):
+        from cat_follow.control.fsm import TransitionResult
+
+        return TransitionResult(
+            accepted=False,
+            from_state=fsm.state,
+            to_state=fsm.state,
+            rejected_descriptor="forced_rejection",
+        )
+
+    monkeypatch.setattr(fsm, "apply", _reject)
+    decision = engine.tick(
+        _input(
+            fsm_state=FsmState.GETTING_CLOSE,
+            navigation=NavigationState(failures_exhausted=True),
+            home=HomeState(set=True),
+        )
+    )
+    assert decision.brake
+    assert "return_home_transition_rejected" in decision.active_constraints
+    assert "safe_return_unavailable" not in decision.active_constraints
+
+
+def test_nav_success_without_completion_qualification_stays_in_goto():
+    engine, fsm = _engine(FsmState.GOTO)
+    nav = NavigationState(
+        received_ms=1000,
+        fresh=True,
+        path_correction=0.4,
+        speed_limit=0.5,
+        completion_qualified=False,
+    )
+    decision = engine.tick(_input(fsm_state=FsmState.GOTO, navigation=nav))
+    assert fsm.state == FsmState.GOTO
+    assert decision.steering == 0.4

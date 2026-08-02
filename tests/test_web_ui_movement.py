@@ -78,21 +78,6 @@ def test_query_param_token_rejected(monkeypatch):
     assert res.status_code == 401
 
 
-def test_stream_resolution_requires_token(monkeypatch):
-    monkeypatch.delenv("CAT_FOLLOW_ALLOW_UNAUTHENTICATED_CONTROL", raising=False)
-    monkeypatch.setenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", "s3cret")
-    monkeypatch.setenv("CAT_FOLLOW_COMMS_TOKEN", "comms")
-    app, _ = _make_app(token="s3cret")
-    client = app.test_client()
-    assert client.post("/api/stream/resolution", json={"resolution": "320x240"}).status_code == 401
-    res = client.post(
-        "/api/stream/resolution",
-        json={"resolution": "320x240"},
-        headers={"X-Control-Token": "s3cret"},
-    )
-    assert res.status_code == 200
-    assert res.get_json()["resolution"] == "320x240"
-
 
 def test_misconfigured_auth_fails_closed(monkeypatch):
     monkeypatch.delenv("CAT_FOLLOW_WEB_CONTROL_TOKEN", raising=False)

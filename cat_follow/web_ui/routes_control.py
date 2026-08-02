@@ -2,7 +2,7 @@
 Control API: send target and stop.
 
 Routes:
-    POST /api/target — Set cat target (x, y) in meters
+    POST /api/target — Set cat target (x_cm, y_cm) in centimeters
     POST /api/stop   — Stop command
     POST /api/command/start_chase — Contract START_CHASE (when CommsManager present)
     POST /api/command/emergency_stop — Contract EMERGENCY_STOP
@@ -11,11 +11,12 @@ Routes:
 from __future__ import annotations
 
 import uuid
+from math import isfinite
 
 from flask import Blueprint, request, jsonify
 
 from cat_follow.logger import get_logger
-from cat_follow.commands import set_cat_location, set_stop_command
+from cat_follow.commands import set_cat_location_cm, set_stop_command
 from cat_follow.web_ui.auth import require_control_token
 
 control_bp = Blueprint("control", __name__)
@@ -38,6 +39,7 @@ def _submit_contract_command(command, params=None):
         return None, False
 
     from cat_follow.comms.messages import CommandMessage
+    from cat_follow.control.types import AckStatus
     from cat_follow.runtime.shared_state import now_monotonic_ms
     from cat_follow.web_ui.command_seq import next_web_command_seq
 
@@ -56,6 +58,8 @@ def _submit_contract_command(command, params=None):
         "reason": ack.reason.value,
         "cause": ack.cause.value if ack.cause is not None else None,
         "command_id": ack.command_id,
+        "applied": ack.status == AckStatus.ACCEPTED,
+        "applied_control_seq": ack.applied_control_sequence,
     }, True
 
 
@@ -70,25 +74,32 @@ def init_control_routes(ctx):
 def api_target():
     data = request.get_json(silent=True) or {}
     try:
-        x = float(data["x"])
-        y = float(data["y"])
+        x_cm = float(data["x_cm"])
+        y_cm = float(data["y_cm"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "Need JSON with x and y (meters)"}), 400
+        return jsonify({"error": "Need JSON with x_cm and y_cm (centimeters)"}), 400
+    if not isfinite(x_cm) or not isfinite(y_cm):
+        return jsonify({"error": "x_cm and y_cm must be finite"}), 400
 
     from cat_follow.control.types import CommandName
 
     ack, used = _submit_contract_command(
         CommandName.GO_TO,
-        params={"target": {"x": x, "y": y, "frame_id": "yard"}},
+        params={"target": {"x_cm": x_cm, "y_cm": y_cm, "frame_id": "yard"}},
     )
-    set_cat_location(x, y)
+    set_cat_location_cm(x_cm, y_cm)
     _log.info(
-        "API target received: (%.2f, %.2f) meters (contract=%s)",
-        x,
-        y,
+        "API target received: (%.1f, %.1f) cm (contract=%s)",
+        x_cm,
+        y_cm,
         used,
     )
-    body = {"status": "ok", "x": x, "y": y, "mode": "contract" if used else "prototype"}
+    body = {
+        "status": "ok",
+        "x_cm": x_cm,
+        "y_cm": y_cm,
+        "mode": "contract" if used else "prototype",
+    }
     if ack is not None:
         body["ack"] = ack
     return jsonify(body)
@@ -101,7 +112,17 @@ def api_stop():
 
     abort_sequence_on_operator_stop("operator_stop")
 
-    ack, used = _submit_contract_command(CommandName.STOP_CHASE)
+    params = {}
+    data = request.get_json(silent=True) or {}
+    target_id = data.get("target_id")
+    if target_id:
+        params["target_id"] = str(target_id)
+    elif _ctx is not None and getattr(_ctx, "runtime_shared", None):
+        active = _ctx.runtime_shared.get_mission().active_target_id
+        if active:
+            params["target_id"] = active
+
+    ack, used = _submit_contract_command(CommandName.STOP_CHASE, params=params or None)
     set_stop_command()
     _log.info("API stop received (contract=%s)", used)
     body = {"status": "ok", "mode": "contract" if used else "prototype"}
@@ -115,7 +136,21 @@ def api_stop():
 def api_start_chase():
     from cat_follow.control.types import CommandName
 
-    ack, used = _submit_contract_command(CommandName.START_CHASE)
+    data = request.get_json(silent=True) or {}
+    target_id = data.get("target_id")
+    if not target_id and _ctx is not None and getattr(_ctx, "runtime_shared", None):
+        target_id = _ctx.runtime_shared.get_overhead().selected_target_id
+    if not target_id:
+        return jsonify(
+            {
+                "error": "target_id required in JSON body or overhead selected_target_id",
+            }
+        ), 400
+
+    ack, used = _submit_contract_command(
+        CommandName.START_CHASE,
+        params={"target_id": str(target_id)},
+    )
     if not used:
         return jsonify({"error": "CommsManager not available (prototype mode)"}), 400
     return jsonify({"status": "ok", "mode": "contract", "ack": ack})

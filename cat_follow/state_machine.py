@@ -59,7 +59,7 @@ class StateMachine:
     def __init__(self):
         self._lock = threading.Lock()
         self._state = State.IDLE
-        self._target_xy: Optional[Tuple[float, float]] = None  # from CAT_LOCATION_RECEIVED
+        self._target_xy_cm: Optional[Tuple[float, float]] = None  # from CAT_LOCATION_RECEIVED
         self._last_bbox: Optional[Tuple[float, float, float, float]] = None  # (x,y,w,h) from CAT_FOUND
 
     @property
@@ -68,9 +68,9 @@ class StateMachine:
             return self._state
 
     @property
-    def target_xy(self) -> Optional[Tuple[float, float]]:
+    def target_xy_cm(self) -> Optional[Tuple[float, float]]:
         with self._lock:
-            return self._target_xy
+            return self._target_xy_cm
 
     @property
     def last_bbox(self) -> Optional[Tuple[float, float, float, float]]:
@@ -88,7 +88,7 @@ class StateMachine:
             if new_state is not None:
                 self._state = new_state
                 if event == Event.CAT_LOCATION_RECEIVED and payload is not None:
-                    self._target_xy = tuple(payload[:2])
+                    self._target_xy_cm = tuple(payload[:2])
                 if event == Event.CAT_FOUND and payload is not None:
                     self._last_bbox = tuple(payload[:4]) if len(payload) >= 4 else None
             return self._state
@@ -97,5 +97,5 @@ class StateMachine:
         """Force IDLE and clear target/bbox."""
         with self._lock:
             self._state = State.IDLE
-            self._target_xy = None
+            self._target_xy_cm = None
             self._last_bbox = None
