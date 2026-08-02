@@ -6,6 +6,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Generated AI review packs (token-optimized review context)
+.cursor/review_pack/
+.cursor/review_pack_*/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -15,6 +19,7 @@ __pycache__/
 venv/
 .venv/
 env/
+.pytest_cache/
 
 # Build / backup
 build/
@@ -29,3 +34,8 @@ cat_follow/scripts/_remote-*.sh
 
 # Runtime telemetry / captured artifacts
 logs/
+var/
+
+# Large local model binaries (keep fixtures/images; not RKNN weights)
+models/*.rknn
+

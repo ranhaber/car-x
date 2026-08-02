@@ -1,5 +1,12 @@
 # High-Level Design: Cat-Follow Car with State Machine
 
+> **Legacy prototype document.** This file describes the historical
+> `cat_follow/main_loop.py` / `cat_follow/state_machine.py` behavior only. It is
+> not the contract-runtime or future production FSM. The canonical target is
+> `cat_follow/docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+> Do not use the state names, 15 cm arrival behavior, or control policy below
+> when implementing the target runtime.
+
 This document defines the **high-level design**, **state machine**, and **baby step-by-step implementation plan** for a PiCar-X that: stays at home (0,0), receives a cat location, drives toward it, searches for the cat, approaches to 15 cm, follows the cat if it moves, re-acquires on loss, and stops only on command. **Each step is testable in isolation.**
 
 **Clarifications (camera straight, car centers cat, calibration, modular file plan):** see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md**.

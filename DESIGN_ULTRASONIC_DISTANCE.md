@@ -1,5 +1,11 @@
 # Design: Ultrasonic as source of truth for distance
 
+> **Legacy/prototype companion document.** The production hardware notes in
+> this file remain useful, but the historical single-source distance behavior
+> is not the canonical target safety contract. The target requires both lidar
+> and ultrasonic, with a configurable 15 cm `BRAKE_REVERSE` trigger; see
+> `cat_follow/docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
 > **ROCK 4D production:** The contract runtime (`runtime.app --with-prototype-perception`)
 > uses **`cat_follow/perception/edge_ultrasonic.py`** with libgpiod v1 both-edge
 > events, not the legacy `robot_hat.Ultrasonic` polling path described below.

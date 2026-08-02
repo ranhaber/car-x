@@ -2,25 +2,91 @@
 
 **Version:** 0.7.1
 
-Modular cat-follow feature for PiCar-X. Camera stays straight; car steers and drives to keep the cat in the middle of the frame.
+Autonomous yard-navigation and cat-tracking software for the PiCar-X chassis
+on a Radxa ROCK 4D. The production platform uses the Radxa 4K IMX415 camera,
+RKNN inference, ROS 2/Nav2, Slamtec RPLIDAR C1, RF2O lidar odometry, and a
+forward HC-SR04 ultrasonic sensor.
+
+## Architecture and implementation status
+
+The approved future behavior is defined by
+`docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+It is a **target specification and is not implemented yet**. Its canonical FSM
+is `HOME`, `IDLE`, `GETTING_CLOSE`, `SEARCH`, `CHASE`, `BRAKE_REVERSE`, `GOTO`,
+`RETURN_HOME`, and `FAILSAFE`. `DecisionEngine` is the sole drivetrain
+authority; `NavigationManager` owns Nav2 goals; `PerceptionLifecycleManager`
+owns independent detector, recording, and stream consumers. Detection must
+remain headless and independent of monitoring clients.
+
+The target uses stable overhead `target_id` identity with bearing-gated local
+association, RF2O-only odometry, dual lidar-and-ultrasonic motion health,
+actual-position geofence enforcement, durable mission-frozen home, and a
+formal straight reverse when either fresh sensor reads strictly below 15 cm.
+Monitoring is client-driven hardware H.264 only; recording is an independent
+hardware H.264 segmented-Matroska pipeline. There is no bicycle-odometry,
+MJPEG/software-monitoring, or TFLite fallback in the production target.
+
+The current `runtime.app` is a migration-stage contract runtime. It still has
+the legacy FSM and incomplete/advisory Nav2 authority, PhaseMachine-driven
+perception lifecycle, no canonical `NavigationManager` or
+`PerceptionLifecycleManager`, and no complete target protocol/recording/reverse
+implementation. Do not interpret current behavior or historical version notes
+as satisfying the canonical target or its validation matrix.
+
+### Current runtime repair status
+
+- Detection/tracking/control remain headless. Web UI import/start/TLS,
+  Flask-Sock/GStreamer/MPP H.264, and control-auth configuration failures
+  degrade optional monitoring or mutating control availability without
+  stopping the core.
+- Guarded mutating routes fail closed when the production token pair is
+  incomplete (`503`) or the supplied web token is invalid (`401`). Stop and
+  emergency-stop stay open.
+- Camera open/read/dequeue failures retry to configured limits. Persistent
+  failure, a five-second no-publish condition, zero-copy startup/QBUF failure,
+  or detector fatal error e-stops, latches `FAILSAFE`, stops the app, and lets
+  systemd `Restart=on-failure` restart it.
+- Native DMA-BUF mode performs a startup dequeue→RGA/RKNN→QBUF self-test,
+  validates center-bottom crop/model geometry, synchronizes the C ABI with
+  `ctypes`, and uses native/Python ownership guards. Idle unload releases only
+  RKNN/model resources, preserving camera/RGA/DMA state.
+- H.264 monitoring has one viewer/encoder owner, at most one pending camera
+  lease, and explicit polling for delayed access units when no new frame
+  arrives.
+
+These repairs are host-verified (**511 tests passing**). A temporary ROCK 4D
+build also passed native compilation, 10-frame RGA/RKNN validation, model
+unload/reload, 10-frame same-input parity (count delta 0), repeat-session fd
+cleanup, and 30/30 DMA-BUF MPP/H.264 output. Deployment, long concurrent soak,
+lores motion, forced camera-fault, and browser playback gates remain pending.
 
 ## Layout
 
-- **state_machine.py** — States and events; `dispatch(event, payload)`.
-- **commands.py** — Stub: `set_cat_location(x,y)`, `set_stop_command()`; `poll_commands(on_cat_location, on_stop)`.
+- **control/** — Current contract FSM and `DecisionEngine`; this is the legacy
+  implementation being migrated to the canonical target FSM.
+- **state_machine.py** — Older standalone state machine used by
+  `main_loop.py`; not the canonical target FSM.
+- **commands.py** — Stub: `set_cat_location_cm(x_cm, y_cm)`, `set_stop_command()`; `poll_commands(on_cat_location_cm, on_stop)`.
 - **calibration/** — `loader.py` + JSONs: speed–time–distance, steering limits (incl. target approach distance). Stored in `cat_follow/calibration/*.json`; loaded once at startup.
 - **motion/** — `driver`, `center_cat_control()`, `limits`, `goto_xy` (runtime goto), `search`. Runtime goto uses **motion/goto_xy.py**; **calibration/goto_xy.py** is for calibration runs only.
 - **vision/** — YOLOv8n COCO RKNN backend (`rknn_backend.py`) with 9-tensor model-zoo DFL/NMS decoding (`yolo_postprocess.py`). P1 publishes the best cat into the existing single-bbox contract; RKNN is the only backend.
 - **threads/** — Camera, role-aware `PredictiveTracker` (constant velocity, two-stage high/low-confidence association), and RKNN detector. The tracker keeps sticky `PRIMARY_CAT`/`SECONDARY_CAT` identities but publishes only the primary through the existing chase bbox. Camera capture and detection remain independent of the web UI.
-- **odometry.py** — Bicycle-model dead reckoning (position, heading). Used via **location/** facade.
+- **navigation/** and **ros_ws/** — Current ROS bridge/bring-up, Nav2, C1, and
+  RF2O integration. The canonical target supports RF2O only; the full
+  `NavigationManager` goal-lifecycle boundary is pending.
 - **range_sensor.py** — Throttled/cached distance facade; `set_reader()` for edge worker or `set_car()` for legacy polling.
 - **perception/edge_ultrasonic.py** — libgpiod v1 HC-SR04 edge worker (`CatFollow-UltrasonicIRQ`); production ROCK 4D path.
 - **perception/range_adapter.py** — Polls `range_sensor.get_distance_cm()` → `SharedState.range` (~20 Hz).
 - **runtime/app.py** — Contract runtime (`--picarx`, `--with-prototype-perception`, optional `--ros-nav`, `--web-ui`); wires edge ultrasonic + adapters.
-- **main_loop.py** — Legacy tick loop (polling ultrasonic via `set_car`); production uses `runtime.app`.
+- **main_loop.py** — Explicitly legacy standalone tick loop with old states and
+  polling ultrasonic via `set_car`; it is neither the production service entry
+  point nor the canonical target architecture.
 - **web_ui/** — Flask app (`app.py` factory + Blueprint route modules). Live UI: `templates/main.html`. Starts from `main_loop` or `runtime.app --web-ui`.
 
-## Run (stub mode, no hardware)
+## Run the legacy stub (no hardware)
+
+This command exercises `main_loop.py` only. Its states and transitions are
+legacy behavior and are not examples of the canonical target FSM.
 
 From **car-x** root:
 
@@ -31,8 +97,8 @@ python -m cat_follow.main_loop
 Then from another terminal or in code:
 
 ```python
-from cat_follow.commands import set_cat_location, set_stop_command
-set_cat_location(100, 50)   # state -> GOTO_TARGET then SEARCH
+from cat_follow.commands import set_cat_location_cm, set_stop_command
+set_cat_location_cm(100, 50)   # centimeters; state -> GOTO_TARGET then SEARCH
 # set_stop_command()        # state -> IDLE
 ```
 
@@ -68,8 +134,13 @@ Optional monitoring UI (non-authoritative) on the contract runtime:
 Then open `http://<rock-ip>:5000/`. The Control page shows contract FSM,
 DecisionEngine constraints, lidar/ultrasonic, navigation fusion, perception
 phase, a live occupancy map + robot pose (from ROS `/map` + TF when
-`--ros-nav` is running), and optional H.264 when Rockchip MPP is available.
-Disconnecting the browser stops stream encode (VM-24) while detection continues.
+`--ros-nav` is running), and hardware H.264 video with client-side detection
+overlays (WebCodecs). If `mpph264enc`, Flask-Sock, TLS, or the web server is
+unavailable, monitoring video/UI degrades without stopping the headless core;
+there is no MJPEG/software video fallback. Only one H.264 viewer is admitted.
+Disconnecting it stops current monitoring encode while headless detection
+continues. The canonical independent consumer lifecycle and recording contract
+remain pending.
 
 ### Control-channel authentication
 
@@ -81,8 +152,8 @@ CAT_FOLLOW_WEB_CONTROL_TOKEN=<strong-random-secret>
 CAT_FOLLOW_COMMS_TOKEN=<strong-random-secret>
 ```
 
-`CAT_FOLLOW_WEB_CONTROL_TOKEN` protects motion-causing control, calibration,
-and stream-resolution routes. Supply it as the `X-Control-Token` header
+`CAT_FOLLOW_WEB_CONTROL_TOKEN` protects motion-causing control and calibration
+routes. Supply it as the `X-Control-Token` header
 (preferred) or a JSON/form `token` field. Query-string tokens are not accepted
 (they leak into access logs). Stop and emergency-stop routes intentionally
 remain open so any operator can halt the vehicle.
@@ -109,8 +180,15 @@ The ROCK 4D deployment is configured for the Radxa Camera 4K (IMX415):
 - field of view: 88.2° diagonal, 75° horizontal, 59° vertical; 15° CRA
 - capture device: `/dev/video11` (RKISP main path)
 - capture format: 640×480 NV12 at 30 FPS, scaled by RKISP in hardware
-- processing format: native 640×480 NV12 ring; the 320×320 detector crop
-  converts directly into the preallocated RGB RKNN tensor
+- processing format: native 640×480 NV12 ring; paired 320×320 NV12 crop
+  (RGA when available), converted to RGB for the RKNN model. The standalone
+  Option B proof performs crop + NV12→RGB fd-to-fd in RGA.
+- DMA-BUF motion source: when
+  `CAT_FOLLOW_PERCEPTION_ZEROCOPY=dmabuf` and motion gating is enabled,
+  configure a real lores/luma stream (normally
+  `CAT_FOLLOW_CAMERA_LORES_DEVICE=/dev/video12`; empty/unset disables it, which
+  is the shipped default in `scripts/car-x.env`). An fd is not motion evidence;
+  if lores is unavailable, disable motion gating explicitly.
 - sensor controls: `/dev/v4l-subdev2`, exposure 900, analogue gain 48
 
 Full sensor, lens, and optical specifications are recorded in
@@ -158,12 +236,11 @@ the Jazzy ARM64 repository does not publish `ros-jazzy-sllidar-ros2`, the
 official Slamtec `sllidar_ros2` driver was built successfully from source in
 `/opt/car-x/ros_ws`, together with `cat_follow_bringup`. The udev rule, WiFi
 power-save configuration, runtime environment, and systemd units have been
-installed. Both ROS services remain disabled and inactive until the C1 is
-connected and a yard map exists.
-
-Hardware validation remains pending: the C1 was not connected during
-installation. The stable `/dev/rplidar` rule is installed, but device creation
-and `/scan` output cannot be verified until the hardware arrives.
+installed. The C1 has since passed bring-up on `/dev/rplidar`: health was OK
+and `/scan` ran at about 10 Hz. RF2O stationary sanity passed with a single
+`/odom` publisher and `odom->base_link`. Drivable motion, yard mapping/Nav2,
+thermal, and canonical target tests remain pending; services remain
+operator-controlled until those tests and a production yard map are complete.
 
 Build or rebuild the ROS workspace:
 
@@ -186,9 +263,12 @@ See `docs/Hardware_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`,
 
 - **Web UI → Calibration tab:** Run speed/steer tests (Start/Stop), measure distance or radius, enter values in the table/fields, then click **Save calibration** to write to disk.
 - **Storage:** `cat_follow/calibration/speed_time_distance.json`, `steering_limits.json`.
-- **On startup:** `main_loop` creates `Calibration()`, which loads these JSONs. Odometry and goto use `get_cm_per_sec(speed)`; steering uses `get_max_steer_angle_deg()` and turn radii. Saving from the Web UI also updates the in-memory calibration for the current run (no restart needed for that session).
+- **Legacy startup:** `main_loop` loads these values for standalone goto and
+  steering calculations. This is not the target odometry path. Production
+  localization uses RF2O/Nav2; normalized-drive conversion still requires
+  measured surface, payload, battery, and steering calibration.
 
-## Tests (no pytest required)
+## Legacy smoke tests (no pytest required)
 
 From **car-x** root:
 
@@ -197,21 +277,27 @@ python -c "from cat_follow.state_machine import StateMachine, State, Event; sm=S
 python -c "from cat_follow.calibration import Calibration; c=Calibration(); assert c.get_cm_per_sec(30)==12.0; print('OK')"
 ```
 
-Or install pytest and run: `python -m pytest tests/ -v`. The current host
-baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
-`test_range_sensor.py`).
+Or install pytest and run: `python -m pytest tests -q`. The recorded current
+implementation baseline is **511 passing tests** (2026-07-26). This completes
+the host regression gate only; it is not evidence that the canonical target
+validation matrix or the changed native ROCK 4D hardware gates have passed.
 
 ## Next steps
 
-1. **Validate the C1 lidar** — Connect it over USB, install/verify the `/dev/rplidar` udev rule, launch `sllidar_ros2` at 460800 baud, and confirm `/scan`.
-2. **Complete ROCK 4D validation** — Run floor-drive and thermal tests and tune `LOST_THRESHOLD`, `DETECT_EVERY_K`, `APPROACH_TRACK_MARGIN_CM`, and calibration JSONs.
-3. **RKNN model** — Production uses the calibrated YOLOv8n COCO INT8 320×320
+1. **Implement the canonical target** — Migrate the FSM, stable-target
+   protocol/ACK transactions, `NavigationManager`, dual-sensor policy, durable
+   home, reverse phases, lifecycle manager, and recording/H.264 contract.
+2. **Complete ROCK 4D validation** — Run RF2O motion, yard mapping/Nav2,
+   floor-drive, reverse-envelope, geofence, dual-sensor, and thermal tests from
+   the canonical validation matrix.
+3. **RKNN model** — The current production candidate is the calibrated
+   YOLOv8n COCO INT8 320×320
    model `models/yolov8n_coco_320_rk3576_int8.rknn`. FP and the other
    n/s 320/640 variants remain available for timing and accuracy A/B. Point
    `CAT_FOLLOW_PERCEPTION_RKNN_MODEL_PATH` at the selected model. On the ROCK
    4D a missing model is a hard error (no CPU fallback). Decoding uses
-   `vision/yolo_postprocess.py` (9-tensor model-zoo layout); an accepted
-   `START_CHASE` requests immediate NPU warmup.
+   `vision/yolo_postprocess.py` (9-tensor model-zoo layout). Canonical
+   `START_CHASE` warmup/consumer behavior remains pending.
 
 ## 📝 Version History
 
@@ -246,8 +332,8 @@ baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
   frame the detector inferred on (frame-generation handoff) and fuses the
   post-update box, and vision now drives the FSM (`CAT_VISIBLE_STABLE` /
   `CAT_LOST`, stability keyed off tracker-frame generation, aged from genuine
-  observations). Nav2 is demoted to advisory (cap/bias) in `CHASE_A`; `GOTO`
-  still navigates. Ops: motion-causing web endpoints require
+  observations). In that legacy FSM, Nav2 was advisory during chase and owned
+  explicit goto navigation. Ops: motion-causing web endpoints require
   `CAT_FOLLOW_WEB_CONTROL_TOKEN` when set (stops always open), calibration motor
   tests are serialized by a hardware arbiter, the H.264 encoder-fail path no
   longer leaks client counters, and a faulty/stuck ultrasonic fails closed.
@@ -281,9 +367,9 @@ baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
 - **0.5.0** — Perception resource optimization + ROS 2 navigation integration.
   Added motion-gated detection with a perception phase FSM, lazy model load,
   boot warmup and idle unload (`malloc_trim` reclaim), adaptive image-processing threads and CPU
-  affinity, an optional hardware-scaled RKISP lores motion stream, decoupled
-  MJPEG (encode only with viewers, `simplejpeg` when available), and an
-  optional Rockchip MPP H.264 WebSocket stream. Added the ROS 2 Jazzy track:
+  affinity, an optional hardware-scaled RKISP lores motion stream, and
+  experimental monitoring encoders that predate and do not define the
+  canonical hardware-H.264-only target. Added the ROS 2 Jazzy track:
   `ros_ws/cat_follow_bringup` (C1 lidar, TF/URDF, slam_toolbox mapping +
   localization, Nav2 composed launch and embedded-tuned params), a
   `navigation.ros_bridge` + `odom_publisher`, a `--ros-nav` runtime flag, and
@@ -295,4 +381,8 @@ baseline is **376 passing tests** (includes `test_edge_ultrasonic.py` and
 - **0.3.0** — Established the standalone control runtime and prototype
   perception-thread integration.
 
-Design: see **DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md** and **DESIGN_CAT_FOLLOW_STATE_MACHINE.md**.
+Canonical target design:
+`docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+The older `DESIGN_CAT_FOLLOW_CLARIFICATIONS_AND_FILE_PLAN.md` and
+`DESIGN_CAT_FOLLOW_STATE_MACHINE.md` describe legacy implementation history,
+not current target requirements.

@@ -1,5 +1,11 @@
 # Design: Bbox–Distance Calibration Tool
 
+> **Legacy prototype tool.** Bbox-area distance calibration applies only to
+> historical `main_loop.py` behavior and is not a production safety or target
+> FSM distance source. The canonical target requires lidar plus ultrasonic and
+> uses the configurable `BRAKE_REVERSE` threshold defined in
+> `cat_follow/docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
 **Goal:** Let the user collect **(area_px, distance_cm)** pairs and write them into `calibration/bbox_distance.json` so `get_distance_cm_from_bbox_area()` is accurate for their camera and cat at **640×480**.
 
 ---

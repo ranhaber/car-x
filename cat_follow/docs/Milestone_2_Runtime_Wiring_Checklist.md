@@ -3,6 +3,12 @@
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)
 **Status:** Complete
 
+> **Historical milestone baseline.** This checklist records implementation of
+> the original V1 contract runtime. Its old FSM, timeout, and obstacle
+> semantics describe current migration history, not the canonical future
+> target in
+> `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
 ## 1. Goal
 Wire the contract-driven Milestone 1 modules (`SharedState`, `FSM`,
 `DecisionEngine`, `AsyncLogger`) into a runnable end-to-end control stack
@@ -108,8 +114,10 @@ Milestone 2 is complete when:
 - All Milestone 1 + Milestone 2 unit tests pass.
 - The existing prototype runtime still imports without errors.
 
-**Status:** All criteria met. 103 unit tests passing across both
-milestones (52 Milestone 1 + 51 Milestone 2).
+**Status:** All criteria met as of this milestone's completion (historical
+snapshot: 103 unit tests passing across both milestones — 52 Milestone 1 + 51
+Milestone 2 — at that time). The suite has grown substantially since; this
+count is not a current total.
 
 ## 6. Next Milestone Preview
 Milestone 3 will replace the no-op backends with real I/O:

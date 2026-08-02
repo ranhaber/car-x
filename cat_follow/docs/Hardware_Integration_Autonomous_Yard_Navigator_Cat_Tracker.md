@@ -1,25 +1,32 @@
 # Hardware Integration
-**Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)
-**Compute target:** Radxa ROCK 4D + SunFounder Robot HAT + PiCar-X chassis
-**Sensors:** Slamtec RPLidar C1 (USB), onboard camera (MIPI CSI), HC-SR04 ultrasonic; no IMU installed
-**Version:** 1.1
-**Status:** ROCK 4D and Radxa Camera 4K bring-up validated; event-driven ultrasonic on ROCK 4D; lidar, grayscale, and thermal tests pending
+**Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X chassis)
+**Production hardware:** Radxa ROCK 4D + Radxa 4K IMX415 + SunFounder Robot HAT
+**Required motion sensors:** Slamtec RPLidar C1 (USB) and HC-SR04 forward ultrasonic; no IMU installed
+**Version:** 2.0
+**Status:** ROCK 4D, IMX415, C1, Robot HAT, and ultrasonic bring-up facts recorded; canonical target integration remains pending
 
 ## 1. Purpose
-This document defines how PiCar-X hardware connects to the Radxa ROCK 4D for
-single-board operation (Option B). It covers pin mapping, power budgeting,
-peripheral placement, and bring-up order.
+This document records the verified hardware integration and pending target
+hardware-dependent work for the single-board Radxa ROCK 4D production system.
+It covers pin mapping, power budgeting, peripheral placement, and bring-up.
 
 Related software wiring is in
 `Software_Integration_Autonomous_Yard_Navigator_Cat_Tracker.md`.
 
-Architecture contracts remain in the PRD, HLD, and Interface Specification.
+The canonical target behavior is defined by
+`Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+Where older architecture documents conflict, the canonical target redesign
+wins. The only production camera is the Radxa 4K IMX415; the only production
+inference backend is RKNN; the only production odometry source is RF2O.
+There is no Raspberry Pi, alternate camera, TFLite, bicycle odometry, or
+dual-board operational fallback.
 
 ## 2. Platform Summary
 
 | Component | Role |
 |-----------|------|
 | **Radxa ROCK 4D** (RK3576) | Main compute: `cat_follow`, ROS 2, lidar, camera, Nav2 |
+| **Radxa Camera 4K (IMX415)** | Sole production onboard camera through RKISP |
 | **SunFounder Robot HAT V4** | Motor driver, servo PWM MCU, ADC, ultrasonic header, battery |
 | **PiCar-X chassis** | 2× rear hub motors, 3× servos, grayscale module, ultrasonic |
 | **RPLidar C1** | 360° 2D lidar for mapping and obstacle-aware navigation |
@@ -60,7 +67,7 @@ PWM and ADC do **not** use host GPIO directly. The onboard AT32F413 MCU
 Motor ports on the HAT (XH2.54) connect to rear hub motors separately from
 the 40-pin header.
 
-## 4. ROCK 4D 40-pin mapping (Option B target)
+## 4. ROCK 4D 40-pin mapping
 
 Physical pin positions match the Pi header. **Signal names differ.**
 
@@ -199,9 +206,8 @@ The overlay routes the sensor through
 The IMX415 was detected with chip ID `0x0000e0`, streamed 30 frames without
 errors, and produced a visible image on Armbian.
 
-The original PiCar-X OV5647 module is not used on the ROCK 4D. Its Pi ribbon
-and control-voltage requirements are not compatible with this validated
-31-pin IMX415 integration.
+No alternate onboard camera is supported. Production software and mechanical
+integration must target this validated 31-pin IMX415 path.
 
 ### 6.3 HC-SR04 acquisition (ROCK 4D production)
 
@@ -221,22 +227,19 @@ The worker thread `CatFollow-UltrasonicIRQ` pins to A53 core 3 and attempts
 `SCHED_FIFO` priority 70 (production currently runs affinity-only when RT is
 denied). See `Software_Integration_*.md` §4.7 for the full data path.
 
-## 7. Integration options
+## 7. Production integration
 
-### Option A — Dual board (lowest risk)
-```text
-ROCK 4D  → compute, ROS 2, lidar, cat_follow
-Raspberry Pi 4 → Robot HAT only (motors/servos)
-Link: UDP motor command channel
-```
-No `robot_hat` port required. Extra board and wiring.
+The supported production assembly is single-board:
 
-### Option B — Single board (this document)
 ```text
 ROCK 4D stacked on Robot HAT (or jumpered 40-pin signals)
-Port robot_hat → libgpiod + Radxa I2C
+Radxa 4K IMX415 → ROCK 4D 31-pin CSI
+RPLidar C1 → ROCK 4D USB
+HC-SR04 → Robot HAT D2/D3 → ROCK 4D libgpiod
 ```
-Best long-term if power and GPIO port succeed.
+
+The ROCK 4D `robot_hat` port, GPIO mapping, and I2C8 MCU connection are the
+production path. No second-board fallback is supported.
 
 ## 8. Hardware bring-up checklist
 
@@ -257,7 +260,8 @@ Best long-term if power and GPIO port succeed.
 - [x] Motor PWM P12/P13 spin wheels at low speed.
 
 ### Phase H4 — Sensors
-- [ ] C1 publishes scan on USB.
+- [x] C1 publishes `/scan` at approximately 10 Hz and reports healthy
+  (verified 2026-07-22).
 - [x] Radxa Camera 4K captures frames through RKISP at 30 FPS.
 - [ ] Grayscale A0–A2 read (if used).
 
@@ -280,12 +284,42 @@ The values are stored in `/opt/picar-x/picar-x.conf`.
 - Emergency stop must cut motion via `DecisionEngine` / `MotorInterface`
   regardless of ROS 2 state.
 - Detection and tracking must work without web UI (architecture rule).
-- Keep ultrasonic/dToF forward veto active even when Nav2 is running.
+- Both C1 lidar and forward ultrasonic must be mounted, healthy, and retained
+  as direct `DecisionEngine` safety inputs even when Nav2 is running.
 
-## 10. References
+## 10. Pending target hardware-dependent integration
+
+The following items are canonical target requirements, not claims about the
+current executable:
+
+- Validate an ultrasonic `sensor_msgs/Range` publication and transform through
+  the Nav2 local-costmap `RangeSensorLayer`. Costmap use does not replace the
+  direct dual-sensor safety inputs.
+- Validate that autonomous motion is rejected unless both C1 lidar and
+  HC-SR04 are fresh and valid, including the two-second normal-driving recovery
+  hold and immediate failure on sensor loss while reversing.
+- Validate `NavigationManager` against RF2O-only localization and the saved
+  yard map. Bicycle/wheel odometry must never be selected as a fallback.
+- Implement and verify IMX415 ready-inactive behavior using V4L2 `STREAMOFF`
+  (or an equivalent hardware pause), `STREAMON` revalidation, and no idle
+  capture busy loop under `PerceptionLifecycleManager`.
+- Provision hardware H.264 capacity for segmented Matroska (`.mkv`) recording,
+  independent of connected monitoring clients. If no hardware H.264 monitoring
+  path is available, the system provides no monitoring stream; software and
+  MJPEG fallbacks are prohibited.
+- Bench-test the canonical close-obstacle action triggered strictly below
+  15 cm: stop, center, settle 100 ms, reverse straight for 0.5 s at normalized
+  `-0.30`, stop, and recheck both sensors. The accepted no-rear-sensor risk and
+  maximum three attempts require explicit validation on the production car,
+  surface, payload, battery range, and steering calibration.
+- Validate the Protocol V1 target handoff and FSM behavior end to end; hardware
+  bring-up alone does not make those software pieces implemented.
+
+## 11. References
 - SunFounder Robot HAT V4: https://docs.sunfounder.com/projects/robot-hat-v4/en/stable/hardware_introduction.html
 - Radxa ROCK 4D GPIO: https://docs.radxa.com/en/rock4/rock4d/hardware-use/pin-gpio
 - Radxa ROCK 4D power: https://docs.radxa.com/en/rock4/rock4d/hardware-use/usb-type-c
 - Radxa product brief: https://dl.radxa.com/rock4/4d/docs/radxa_rock4d_product_brief.pdf
 - Repo: `picar-x/picarx/picarx.py`, `cat_follow/perception/edge_ultrasonic.py`, `robot-hat/robot_hat/pin.py`, `robot-hat/robot_hat/pwm.py`
-- Slamtec C1 SDK: `rplidar_sdk-master/` (repo root)
+- Slamtec C1 SDK: `../rplidar_sdk-master/` (sibling of the `car-x` repository;
+  local path: `C:\Users\rahaber\my_projects\rplidar_sdk-master`)

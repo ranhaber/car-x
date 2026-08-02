@@ -3,7 +3,7 @@
 **Project root:** `C:\Users\rahaber\my_projects\car-x`  
 **Summary date:** February 2025
 
-This repository combines three SunFounder libraries for the **PiCar-X** Raspberry Pi robot car: **picar-x** (car control), **vilib** (vision), and **robot-hat** (hardware abstraction). Together they support movement, sensors, camera, AI/LLM voice, and computer vision.
+This repository combines SunFounder **picar-x** (car control) and **robot-hat** (hardware abstraction) with the production **cat_follow** runtime (camera, RKNN detection, H.264 stream, FSM). The old SunFounder **vilib** vision library was removed; production vision no longer uses it.
 
 ---
 
@@ -11,8 +11,8 @@ This repository combines three SunFounder libraries for the **PiCar-X** Raspberr
 
 | Directory   | Role |
 |------------|------|
+| **cat_follow/** | Production autonomous cat-follow runtime and web UI. |
 | **picar-x/** | PiCar-X Python library and examples (car logic, servos, motors, grayscale, ultrasonic). |
-| **vilib/**   | Vision library (picamera2, OpenCV, detection, Flask MJPEG stream). |
 | **robot-hat/** | Robot HAT hardware library (GPIO, PWM, ADC, I2C, motors, servos, TTS, STT, LLM). |
 
 **File counts (approximate):** 124 Python, 62 .po (i18n), 33 .rst (docs), configs (.toml, .yaml), media (.png, .jpg, .wav, .mp3, .tflite), shell scripts, device-tree overlays (.dtbo).
@@ -37,7 +37,7 @@ This repository combines three SunFounder libraries for the **PiCar-X** Raspberr
 - **music.py, led.py** — Sound and LED helpers.
 - **tts.py, stt.py, voice_assistant.py, llm.py** — Voice/AI wrappers (build on robot_hat and external voice/LLM stacks).
 
-**Dependencies:** `robot_hat` (Pin, ADC, PWM, Servo, fileDB, Grayscale_Module, Ultrasonic, utils), `vilib` for vision examples.
+**Dependencies:** `robot_hat` (Pin, ADC, PWM, Servo, fileDB, Grayscale_Module, Ultrasonic, utils). Some SunFounder vision examples still import `vilib`, which is no longer vendored in this repo.
 
 ### 2.2 Examples (`picar-x/example/`)
 
@@ -56,38 +56,9 @@ This repository combines three SunFounder libraries for the **PiCar-X** Raspberr
 
 ---
 
-## 3. vilib — Vision library
+## 3. Vision (production)
 
-**Purpose:** Camera capture (picamera2), image processing, detection/classification, and optional Flask MJPEG/QR code web streaming.
-
-### 3.1 Core (`vilib/vilib/`)
-
-- **vilib.py**
-  - **Camera:** Picamera2, configurable size (default 640×480), vflip/hflip, RGB888 preview, shared buffer.
-  - **Pipeline:** Each frame is passed through: color detection → face → traffic sign → QR code → image classification → object detection → hands → pose. Results drawn on image; optional FPS overlay.
-  - **Flask app:** Routes `/`, `/mjpg`, `/mjpg.jpg`, `/mjpg.png`, `/qrcode`, `/qrcode.png` for live view and QR code; runs on host `0.0.0.0`, port 9000. Web display and QR display are toggles.
-  - **Paths:** Default pictures/videos under user home `Pictures/vilib/`, `Videos/vilib/`.
-
-- **Detection/classification modules:**
-  - **color_detection.py** — `color_detect_work()` (e.g. by color name).
-  - **face_detection.py** — `set_face_detection_model()`, `face_detect()`.
-  - **hands_detection.py** — `DetectHands()` (MediaPipe).
-  - **pose_detection.py** — `DetectPose()` (MediaPipe).
-  - **image_classification.py** — TFLite; `classify_image()`, `set_input_tensor()`, labels.
-  - **objects_detection.py** — TFLite object detection; `detect_objects()`, threshold, labels.
-  - **traffic_sign_detection.py** — `traffic_sign_detect()`, contour/area helpers.
-  - **qrcode_recognition.py** — `qrcode_recognize()`.
-  - **mediapipe_object_detection.py** — `MediapipeObjectDetection`.
-
-- **utils.py** — `run_command()`, `getIP()`, `check_machine_type()`, `load_labels()`.
-
-### 3.2 Examples (`vilib/examples/`)
-
-- **color_detect.py**, **face_detect.py**, **hands_detection.py**, **pose_detection.py**
-- **image_classification.py**, **objects_detection.py**, **traffic_sign_detect.py**
-- **qrcode_read.py**, **qrcode_making.py**
-- **display.py**, **controls.py**, **record_video.py**, **take_photo.py**
-- **hsv_threshold_analyzer.py**
+Production vision lives under **`cat_follow/`** (camera threads, RKNN YOLO, H.264 monitoring). The SunFounder `vilib/` tree was removed from this repository.
 
 ---
 

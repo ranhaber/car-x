@@ -83,7 +83,7 @@ def test_log_builds_event_envelope():
     assert event["event_id"] == "evt-000001"
     assert event["event_type"] == "decision"
     assert event["severity"] == "info"
-    assert event["state"] == "CHASE_A"
+    assert event["state"] == "GETTING_CLOSE"
     assert event["source"] == "DecisionEngine"
     assert event["data"] == {"speed": 0.5}
     assert isinstance(event["timestamp_ms"], int)

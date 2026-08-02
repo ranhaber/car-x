@@ -1,1019 +1,1435 @@
 # Interface and Data Contract Specification
-**Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
-**Based on:** PRD v1.1, HLD v1.1, Detailed Software Architecture v1.0  
-**Version:** 1.0  
-**Status:** Ready for Implementation
 
-## 1. Purpose
-This document defines the concrete message schemas, shared-state contracts, command semantics, timestamp rules, and synchronization rules used by the autonomous yard navigator.
+**Project:** Autonomous Yard Navigator and Cat Tracker  
+**Target hardware:** Radxa ROCK 4D with Radxa 4K IMX415 camera  
+**Document version:** 2.0  
+**Protocol version:** V1  
+**Status:** Approved target contract — **not implemented yet**  
+**Date:** 2026-07-26  
+**Canonical behavior authority:** `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`
 
-The goal is to prevent implementation drift between modules and between the overhead system and the PiCar-X runtime.
+## 1. Purpose and authority
 
-All coordinates and distances in this specification use centimeters (`cm`) unless explicitly documented otherwise.
+This document defines the concrete Protocol V1 wire schemas, shared-state contracts,
+command and mission-event semantics, `NavigationManager` goal-intent contracts,
+perception lifecycle status, geofence and sensor-health fields, telemetry, and
+synchronization rules for the autonomous yard navigator.
 
-## 2. Protocol Model
+It is the approved **target** interface contract. Nothing in this document claims
+that the current executable implements it. Section 18 lists known implementation
+gaps.
 
-### 2.1 Message Classes
-The production protocol uses separate message types:
-- `tracking`
-- `command`
-- `ack`
+For the behavior covered here, this document supersedes conflicting requirements in
+older drafts of this file and in other repository documents. When this document
+conflicts with `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`,
+the target redesign document wins.
 
-Future message types may be added with a schema version bump or backward-compatible extension.
+The following prior interface semantics are explicitly superseded and MUST NOT appear
+as normative requirements in new implementations:
 
-### 2.2 Reliability Model
-Tracking and command messages use different reliability semantics.
+- `tracking` message type and single-cat `cat` object without stable `target_id`;
+- `CHASE_A`, `TRACK_B`, and final-stop `BRAKE` FSM states;
+- fixed `10 cm` obstacle `FAILSAFE` as the close-obstacle policy;
+- immediate `700 ms` overhead-expired failsafe during chase;
+- bicycle/wheel odometry fallback;
+- additive or weighted camera/Nav2 steering;
+- software/MJPEG monitoring fallback;
+- predictive geofence path veto;
+- ACK that reports a destination state before the control loop has applied it.
 
-| Message Type | Frequency | ACK Required | Retry | Semantics |
-|---|---:|---|---|---|
-| `tracking` | ~10 Hz | No | No | lossy, latest-wins |
-| `command` | event-driven | Yes | Yes | reliable via ACK/retry |
-| `ack` | response | No | No | acknowledges received command packet |
+## 2. Normative language and units
 
-Non-command messages sent at 10 Hz do not wait for ACK and do not retry. They are inspected using sequence numbers and freshness rules only.
+`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative.
 
-Commands wait for ACK. If no ACK is received before the retry timeout, the sender retries the same command using the same `command_id` and a new packet `sequence`.
+### 2.1 Unit rules
 
-## 3. Common Message Envelope
-Every protocol message contains:
+| Domain | Unit | Notes |
+|---|---|---|
+| Overhead yard positions and perimeter geometry | centimeters (`cm`) | Calibrated yard frame |
+| Operator command geometry (`SET_HOME`, `GO_TO`) | centimeters (`cm`) | Yard frame; keys are `x_cm` / `y_cm` |
+| Overhead headings | radians | Non-authoritative for motion after startup |
+| Nav2 speed policy, caps, requests, navigation telemetry | physical meters per second (`m/s`) | Authoritative for navigation motion policy |
+| Direct reverse maneuver | normalized motor command + bounded duration | Sole specified direct normalized/time-bounded maneuver |
+| Applied drivetrain output to hardware | normalized `-1.0..1.0` | `MotorInterface` converts using calibrated mapping |
+| Durations and freshness | monotonic time | Safety freshness MUST NOT depend on synchronized wall clock |
+| ROS navigation-frame poses | meters and radians | Nav2 message requirement; converted once from `cm` at the navigation boundary |
 
-```json
-{
-  "type": "tracking | command | ack",
-  "schema_version": 1,
-  "sequence": 0,
-  "timestamp_ms": 0
-}
-```
+### 2.2 Freshness definition
 
-### 3.1 Common Fields
-- `type`: message type.
-- `schema_version`: integer schema version. V1 uses `1`.
-- `sequence`: monotonically increasing packet number from the sending side.
-- `timestamp_ms`: sender-side timestamp in milliseconds. This is for cross-device log correlation and latency analysis.
+“Fresh and valid” means within the configured age limit, structurally valid,
+finite, in range, and not faulted.
 
-### 3.2 Clock and Freshness Rules
-Overhead host and PiCar-X should use NTP/Chrony so `timestamp_ms` values can be compared during logs and post-run analysis.
+For every incoming message or sensor sample, the runtime records:
 
-Control logic must not depend on synchronized wall-clock time.
-
-For every incoming message, the PiCar-X runtime records:
-- `timestamp_ms`: producer/sender timestamp from the message.
+- producer timestamp when available (`*_at_ms`, `timestamp_ms`, or ROS header stamp);
 - `received_ms`: PiCar-X local monotonic receive timestamp.
 
-Freshness is computed using local monotonic time:
+Freshness is computed locally:
 
 ```text
 age_ms = now_monotonic_ms - received_ms
 ```
 
 Rules:
-- Use `timestamp_ms` for cross-device log correlation and latency debugging.
-- Use `received_ms` for freshness, timeout, and failsafe decisions.
-- Do not compute safety freshness from producer `timestamp_ms`.
-- If NTP/Chrony is unavailable or clocks drift, control behavior must remain safe because freshness uses monotonic receive time.
 
-### 3.3 Sequence Rules
-- Every message has a `sequence`.
-- Each sender owns its own independent sequence counter.
-- Sequence numbers are used for diagnostics, duplicate detection, out-of-order detection, and ACK correlation.
-- Tracking sequence gaps do not trigger retries.
-- Command retry packets use a new `sequence` but keep the same `command_id`.
+- Use producer timestamps for cross-device log correlation only.
+- Use `received_ms` for safety freshness, timeout, hold, and failsafe decisions.
+- If NTP/Chrony is unavailable or clocks drift, control behavior MUST remain safe
+  because freshness uses monotonic receive time.
 
-## 4. Step 1: Command, Tracking, and ACK Reliability Contract
-**Status:** Done
+## 3. Protocol V1 model
 
-### 4.1 Final Decision
-Use separate message types:
-- `tracking`
-- `command`
-- `ack`
+### 3.1 Message classes
 
-All messages include:
-- `type`
-- `schema_version`
-- `sequence`
-- `timestamp_ms`
+Protocol V1 uses separate message types:
 
-Commands additionally include:
-- `command_id`
-- `command`
+| Type | Purpose | ACK required | Retry |
+|---|---|---|---|
+| `overhead_observation` | Yard-level car and cat observations | No | No |
+| `command` | Operator/overhead mission commands | Yes | Yes |
+| `mission_event` | Reliable overhead mission events | Yes | Yes |
+| `ack` | Application result for command or mission event | No | No |
 
-ACKs include:
-- their own `sequence`
-- `ack_sequence`
-- `ack_type`
-- `command_id` when ACKing a command
-- `status`
-- current car `state`
-- `reason`
+There is no `tracking` message type in the target contract.
 
-### 4.2 Tracking Reliability
-Tracking messages are fast, lossy, latest-wins updates.
+### 3.2 Versioning
+
+Every protocol message includes:
+
+```json
+{
+  "protocol_version": 1
+}
+```
+
+Protocol remains **V1** because no upstream overhead implementation has been
+deployed. This redesign redefines V1 before first deployment. Backward compatibility
+with the repository's incomplete draft schema is not a requirement.
+
+### 3.3 Transport reliability
+
+#### 3.3.1 Lossy observations
+
+`overhead_observation` messages are fast, lossy, latest-wins updates.
 
 Rules:
-- No ACK.
-- No retry.
-- Duplicate tracking packets are ignored.
-- Out-of-order tracking packets are ignored.
-- Missing tracking packets are tolerated until freshness thresholds are exceeded.
-- Packet age `>300 ms` causes stale-warning behavior.
-- Packet age `>700 ms` causes overhead-expired failsafe behavior.
 
-### 4.3 Command Reliability
-Command messages are reliable command transactions.
+- No ACK and no retry.
+- Duplicate or regressive `observation_seq` values are ignored for control authority.
+- Missing packets are tolerated until freshness and invalid-retention rules apply.
+- The receiver stores the latest accepted observation per sender.
+
+Recommended nominal rate: `10 Hz`.
+
+#### 3.3.2 Reliable commands and mission events
+
+`command` and `mission_event` messages are reliable transactions.
 
 Rules:
-- Commands require ACK.
-- Sender retries command if ACK is not received.
-- Retry uses the same `command_id`.
-- Retry uses a new packet `sequence`.
-- Commands must be idempotent.
-- Receiving the same `command_id` more than once must not re-execute side effects.
-- Duplicate command retries receive an ACK with the original accepted/rejected result.
-- When the UDP transport has `CAT_FOLLOW_COMMS_TOKEN` configured, every command
-  datagram must include a matching top-level JSON `token`. Missing or invalid
-  tokens are dropped before command parsing and receive no ACK.
-- Tracking datagrams do not require this command token.
+
+- Sender retries until an ACK is received.
+- Retry reuses the same `command_id` or `event_id`.
+- Duplicate IDs return the stored committed result without re-executing side effects.
+- Deduplication results MUST be retained durably enough to prevent replay after a
+  process restart within the defined protocol retention window.
 
 Recommended retry defaults:
-- Retry timeout: `200 ms`
-- Max retries: `5`
 
-### 4.4 ACK Semantics
-ACKs always identify the exact packet received.
+| Name | Default |
+|---|---:|
+| `CAT_FOLLOW_COMMAND_ACK_TIMEOUT_MS` | `200` |
+| `CAT_FOLLOW_COMMAND_MAX_RETRIES` | `5` |
+| `CAT_FOLLOW_COMMAND_ID_CACHE_SIZE` | `100` |
 
-ACKs include:
-- `sequence`: ACK packet sequence from the ACK sender.
-- `ack_sequence`: sequence of the packet being acknowledged.
-- `ack_type`: type of packet being acknowledged.
-- `command_id`: included when ACKing a command.
-- `status`: `accepted` or `rejected`.
-- `state`: current car FSM state.
-- `reason`: machine-readable reason code.
-- `cause`: always present; `null` for accepted ACKs and a machine-readable cause for rejected ACKs.
+When UDP transport has `CAT_FOLLOW_COMMS_TOKEN` configured, every command and
+mission-event datagram MUST include a matching top-level JSON `token`. Missing or
+invalid tokens are dropped before parsing and receive no ACK. Observation datagrams
+do not require the command token.
 
-ACK status values are limited to:
-- `accepted`
-- `rejected`
+### 3.3.3 Transactional application
 
-`accepted` / `rejected` describe the command result, not whether the packet was the first send or a retry.
+All commands and mission events except emergency stop:
 
-### 4.5 ACK Example
-Command packet:
+1. are received and deduplicated by `command_id` or `event_id`;
+2. are queued for the control loop;
+3. are validated and applied atomically at a control-loop boundary;
+4. are ACKed only after application or rejection is committed;
+5. report the resulting FSM state and machine-readable reason.
 
-```json
-{
-  "type": "command",
-  "schema_version": 1,
-  "sequence": 503,
-  "timestamp_ms": 100200,
-  "command_id": "cmd-42",
-  "command": "stop_chase"
-}
-```
+An ACK MUST NOT claim a destination state before the control loop has applied it.
+Emergency stop remains synchronous and is not delayed for transactional mission
+processing.
 
-ACK packet:
+Every ACK MUST include `applied_control_seq`, the monotonic control-loop sequence
+number at which the result became committed.
+
+Duplicate command or event retries MUST return the stored result and the original
+`applied_control_seq`.
+
+## 4. Overhead observation schema
+
+### 4.1 Schema
 
 ```json
 {
-  "type": "ack",
-  "schema_version": 1,
-  "sequence": 9001,
-  "timestamp_ms": 100230,
-  "ack_sequence": 503,
-  "ack_type": "command",
-  "command_id": "cmd-42",
-  "status": "accepted",
-  "state": "IDLE",
-  "reason": "stop_chase_accepted",
-  "cause": null
-}
-```
-
-If packet `502` was handled but its ACK was lost, and retry packet `503` arrives with the same `command_id`, the car does not execute the command again. It ACKs packet `503` with the original result.
-
-## 5. Step 2: Tracking Message Schema
-**Status:** Done
-
-### 5.1 Final Decision
-Tracking messages carry overhead global observations only. They are sent at approximately 10 Hz and use lossy latest-wins semantics.
-
-`tracking` messages do not include `home`. Home position is mission-critical and must be set only by reliable commands such as `set_home` or `return_home`.
-
-### 5.2 Schema
-```json
-{
-  "type": "tracking",
-  "schema_version": 1,
-  "sequence": 1001,
-  "timestamp_ms": 123456789,
-  "frame_id": "yard",
+  "protocol_version": 1,
+  "type": "overhead_observation",
+  "observation_seq": 1842,
+  "observed_at_ms": 1785012345678,
+  "perimeter_id": "yard-v3",
+  "calibration_version": 7,
   "car": {
-    "x": 0.0,
-    "y": 0.0,
-    "heading": 0.0,
-    "heading_valid": false,
-    "confidence": 1.0
+    "x_cm": 412.4,
+    "y_cm": 226.8,
+    "yaw_rad": 1.12,
+    "confidence": 0.96
   },
-  "cat": {
-    "x": 0.0,
-    "y": 0.0,
-    "confidence": 1.0
-  }
-}
-```
-
-### 5.3 Field Rules
-- `frame_id`: coordinate frame name. V1 uses `yard`.
-- `car.x`, `car.y`: global car position in centimeters.
-- `cat.x`, `cat.y`: global cat position in centimeters.
-- `car.heading`: optional overhead heading observation in radians; non-authoritative.
-- `car.heading_valid`: whether overhead believes `car.heading` is usable.
-- `confidence`: binary confidence value in V1.
-
-### 5.4 Confidence Rules
-For V1, confidence is binary:
-- `1.0`: recognized by overhead camera and usable.
-- `0.0`: not recognized / unusable.
-
-`car` and `cat` objects are always required in every tracking packet.
-
-If overhead loses either target:
-- Keep the object present.
-- Set `confidence` to `0.0`.
-- Receiver must ignore that object's position for control.
-- Position fields may contain last known values or `0.0`, but they have no authority while confidence is `0.0`.
-
-If `car.confidence == 0.0`, then `car.heading_valid` must be `false`.
-
-### 5.5 Receiver Rules
-- Ignore duplicate or out-of-order `tracking` sequences.
-- Do not request retry for missing tracking packets.
-- Use latest valid packet only.
-- Treat object data with `confidence == 0.0` as unusable / weight zero.
-- Compute velocity locally from timestamped position updates if needed; velocity is not included in V1 tracking packets.
-
-## 6. Step 3: Command Message Schema
-**Status:** Done
-
-### 6.1 Final Decision
-Command messages are reliable, ACKed, retried messages. Commands are separate from the 10 Hz `tracking` stream.
-
-V1 commands:
-- `set_home`
-- `start_chase`
-- `stop_chase`
-- `return_home`
-- `go_to`
-- `emergency_stop`
-- `clear_failsafe`
-
-### 6.2 Base Schema
-```json
-{
-  "type": "command",
-  "schema_version": 1,
-  "sequence": 2001,
-  "timestamp_ms": 123456900,
-  "command_id": "cmd-0001",
-  "command": "start_chase",
-  "params": {}
-}
-```
-
-### 6.3 Command Fields
-- `command_id`: stable command transaction ID. Retries reuse the same `command_id`.
-- `command`: command name.
-- `params`: command-specific parameters. Use `{}` when no parameters are required.
-
-### 6.4 `set_home`
-Sets or updates the home position. `set_home` is allowed at any time.
-
-```json
-{
-  "type": "command",
-  "schema_version": 1,
-  "sequence": 2001,
-  "timestamp_ms": 123456900,
-  "command_id": "cmd-0001",
-  "command": "set_home",
-  "params": {
-    "home": {
-      "x": 0.0,
-      "y": 0.0,
-      "frame_id": "yard"
+  "cats": [
+    {
+      "target_id": "cat-17",
+      "x_cm": 531.0,
+      "y_cm": 301.2,
+      "confidence": 0.93,
+      "inside_perimeter": true
     }
+  ],
+  "selected_target_id": "cat-17"
+}
+```
+
+### 4.2 Field rules
+
+| Field | Required | Rules |
+|---|---|---|
+| `observation_seq` | Yes | Monotonic per overhead sender; used for dedup, invalidation, and event correlation |
+| `observed_at_ms` | Yes | Producer observation time for log correlation |
+| `perimeter_id` | Yes | Stable identifier for the cat perimeter definition |
+| `calibration_version` | Yes | Must match an accepted runtime calibration version |
+| `car.x_cm`, `car.y_cm` | Yes | Calibrated yard position in centimeters |
+| `car.yaw_rad` | Yes | Non-authoritative after startup localization acceptance |
+| `car.confidence` | Yes | Must be `>= CAT_FOLLOW_OVERHEAD_MIN_CONFIDENCE` to be valid |
+| `cats[]` | Yes | MAY be empty; each cat MUST have stable `target_id` |
+| `cats[].target_id` | Yes | Stable identity; never inferred from array position |
+| `cats[].inside_perimeter` | Yes | Cat-perimeter membership; separate from car geofence |
+| `selected_target_id` | Yes when a chase target is selected | Names the overhead-selected target; null only when no target is selected |
+
+Rules:
+
+- Every cat MUST have a stable `target_id`.
+- The selected target is named by `selected_target_id`, never by array position.
+- Overhead owns yard-level observations, selected `target_id`, and declaration that
+  the selected cat left its perimeter.
+- Cat exit is declared only by the reliable `PRIMARY_CAT_LEFT_PERIMETER` mission
+  event and MUST NOT be inferred from the car geofence.
+- If `car.confidence` is below threshold, the car observation is invalid.
+- If the active chase `target_id` is absent from `cats[]`, or its confidence is below
+  threshold, that target observation is invalid.
+- A fresh-but-invalid observation uses the same policy as stale overhead data.
+
+### 4.3 Receiver rules
+
+- Ignore duplicate or regressive `observation_seq` values for authority updates.
+- Do not request retry for missing observation packets.
+- Retain the latest structurally valid packet and its receive metadata.
+- Compute yard distances and perimeter checks only from valid observations.
+- During `GETTING_CLOSE` or `SEARCH`, invalid or stale overhead triggers
+  last-valid-goal retention for at most `CAT_FOLLOW_OVERHEAD_INVALID_MAX_SEC`.
+- During `CHASE`, overhead loss has no fixed timeout while the associated local
+  track and all chase permissions remain valid.
+
+## 5. Command schema
+
+### 5.1 Envelope
+
+```json
+{
+  "protocol_version": 1,
+  "type": "command",
+  "command_id": "cmd-9f24",
+  "issued_at_ms": 1785012346000,
+  "name": "START_CHASE",
+  "args": {}
+}
+```
+
+Field rules:
+
+- `command_id`: stable transaction ID; retries reuse it.
+- `issued_at_ms`: sender timestamp for log correlation.
+- `name`: uppercase command name from Section 5.2.
+- `args`: command-specific parameters; use `{}` when none are required.
+
+Target-scoped commands MUST carry `target_id` in `args`. Commands with no target
+semantics omit it.
+
+### 5.2 Command names
+
+| Name | Target scoped | Purpose |
+|---|---|---|
+| `SET_HOME` | No | Persist a durable versioned home record |
+| `START_CHASE` | Yes | Begin overhead-guided pursuit of `target_id` |
+| `STOP_CHASE` | SHOULD carry expected `target_id` | Stop active chase and enter handoff/post-roll `IDLE` |
+| `GO_TO` | No | Navigate to an explicit Nav2 destination |
+| `RETURN_HOME` | No | Navigate to frozen mission home |
+| `CLEAR_FAILSAFE` | No | Leave latched failsafe after cause-specific clearance |
+| `EMERGENCY_STOP` | No | Synchronous zero-motion failsafe; not transactional |
+
+`STOP_CHASE` MUST be rejected as `WRONG_TARGET` when `args.target_id` names a
+different active chase target than the FSM context.
+
+### 5.3 `SET_HOME`
+
+```json
+{
+  "protocol_version": 1,
+  "type": "command",
+  "command_id": "cmd-home-01",
+  "issued_at_ms": 1785012346000,
+  "name": "SET_HOME",
+  "args": {}
+}
+```
+
+With no `home` argument the current localized pose becomes home. An explicit
+pose uses the yard frame in centimeters:
+
+```json
+"args": {
+  "home": {"x_cm": 100.0, "y_cm": 200.0, "yaw_rad": 0.0, "frame_id": "yard"}
+}
+```
+
+Acceptance rules:
+
+- Accepted only in `HOME` or `IDLE`.
+- Requires valid ROS localization, map, transforms, yard/ROS calibration, and car
+  inside the car geofence.
+- Requires the car to be stopped.
+- Requires durable persistence to succeed before ACK.
+- Rejected while a mission is active if it would mutate the frozen home version.
+
+The persisted home record MUST include at least:
+
+- `home_version`
+- `checksum`
+- `calibration_version`
+- `map_id`
+- `frame_id`
+- `x`, `y` (yard centimeters) and `x_m`, `y_m`, `yaw_rad` (Nav2 metric pose)
+- `persisted_at_ms`
+
+### 5.4 `START_CHASE`
+
+```json
+{
+  "protocol_version": 1,
+  "type": "command",
+  "command_id": "cmd-9f24",
+  "issued_at_ms": 1785012346000,
+  "name": "START_CHASE",
+  "args": {
+    "target_id": "cat-17"
   }
 }
 ```
 
 Acceptance rules:
-- Accept if `home.x`, `home.y`, and `home.frame_id` are valid.
-- Reject if coordinates are missing, invalid, or outside the known yard frame.
-- `home.x` and `home.y` are centimeters in the `yard` frame.
 
-### 6.5 `start_chase`
-Starts cat chase.
+- Accepted only from `HOME` or `IDLE`.
+- Requires valid durable home.
+- Requires nonempty `target_id`.
+- Requires fresh valid overhead car observation and fresh valid overhead cat
+  observation for the same `target_id`.
+- Requires valid localization/map/calibration and car inside geofence.
+- Requires healthy `NavigationManager`.
+- Requires fresh valid lidar and ultrasonic.
+- Requires chaseable target inside configured cat perimeter.
+- On acceptance: freeze home version, request chase recording, enter `GETTING_CLOSE`.
+- Onboard perception or recording MAY be unavailable at acceptance if
+  overhead-only pursuit remains safe; mission starts degraded and reports unavailable
+  facilities.
 
-```json
-{
-  "type": "command",
-  "schema_version": 1,
-  "sequence": 2002,
-  "timestamp_ms": 123457000,
-  "command_id": "cmd-0002",
-  "command": "start_chase",
-  "params": {}
-}
-```
+A new `START_CHASE(new_target_id)` received during handoff `IDLE` MUST identify the
+intended new target and enter `GETTING_CLOSE`.
 
-Acceptance rules:
-- Accept only after the car has received valid current tracking data for both car and cat.
-- `car.confidence` must be `1.0`.
-- `cat.confidence` must be `1.0`.
-- Reject if car position is unknown.
-- Reject if cat position is unknown.
-- Reject if the latest tracking packet is stale or expired.
-
-The overhead system may already be sending tracking packets before `start_chase`. The car only ACKs `start_chase` as `accepted` after both positions are valid.
-
-### 6.6 `stop_chase`
-Stops the car and stops cat chase/tracking behavior. It does not return home.
+### 5.5 `STOP_CHASE`
 
 ```json
 {
+  "protocol_version": 1,
   "type": "command",
-  "schema_version": 1,
-  "sequence": 2003,
-  "timestamp_ms": 123457100,
-  "command_id": "cmd-0003",
-  "command": "stop_chase",
-  "params": {}
-}
-```
-
-Acceptance rules:
-- Accept unless the car is in an unrecoverable failsafe condition.
-- On acceptance, stop motors, disable chase behavior, stop cat tracking behavior, and transition to `IDLE`.
-
-### 6.7 `return_home`
-Returns the car to home. `return_home` must include home coordinates for brownout/restart robustness.
-
-```json
-{
-  "type": "command",
-  "schema_version": 1,
-  "sequence": 2004,
-  "timestamp_ms": 123457200,
-  "command_id": "cmd-0004",
-  "command": "return_home",
-  "params": {
-    "home": {
-      "x": 0.0,
-      "y": 0.0,
-      "frame_id": "yard"
-    }
+  "command_id": "cmd-stop-01",
+  "issued_at_ms": 1785012350000,
+  "name": "STOP_CHASE",
+  "args": {
+    "target_id": "cat-17"
   }
 }
 ```
 
 Acceptance rules:
-- Accept if home coordinates are valid.
-- Reject if home coordinates are missing, invalid, or outside the known yard frame.
-- On acceptance, transition toward `RETURN_HOME`.
-- Transition to `HOME` only after return-home completes successfully.
-- `home.x` and `home.y` are centimeters in the `yard` frame.
 
-### 6.8 `go_to`
-Moves the car to a specified yard coordinate.
+- From `GETTING_CLOSE`, `SEARCH`, or `CHASE`: stop immediately, cancel Nav2, enter
+  `IDLE`, retain recording for `CAT_FOLLOW_RECORDING_POSTROLL_SEC`.
+- From `BRAKE_REVERSE`: accepted only when saved objective is chase; stop reverse,
+  cancel Nav2, enter `IDLE`, start same post-roll.
+- From `HOME` or `IDLE`: idempotent success with zero motion; cancel pending handoff;
+  existing post-roll ends at its deadline.
+- From `GOTO`, `RETURN_HOME`, or `FAILSAFE`: reject with `INVALID_STATE`.
+
+### 5.6 `GO_TO`
 
 ```json
 {
+  "protocol_version": 1,
   "type": "command",
-  "schema_version": 1,
-  "sequence": 2005,
-  "timestamp_ms": 123457300,
-  "command_id": "cmd-0005",
-  "command": "go_to",
-  "params": {
+  "command_id": "cmd-a103",
+  "issued_at_ms": 1785012350000,
+  "name": "GO_TO",
+  "args": {
     "target": {
-      "x": 0.0,
-      "y": 0.0,
+      "x_cm": 210.0,
+      "y_cm": -80.0,
+      "yaw_rad": 0.0,
       "frame_id": "yard"
-    }
+    },
+    "request_yolo": false,
+    "request_recording": true
   }
 }
 ```
 
-Acceptance rules:
-- Accept if target coordinates are valid and safety state allows motion.
-- Reject if target is missing, invalid, outside the known yard frame, or motion is unsafe.
-- `target.x` and `target.y` are centimeters in the `yard` frame.
+The destination is centimeters in the yard frame. `NavigationManager` performs
+the single conversion to Nav2 meters. `x` / `y` without the `_cm` suffix are
+accepted from older senders and carry the same centimeter units.
 
-### 6.9 `emergency_stop`
-Immediately stops the car and enters `FAILSAFE`.
+Acceptance rules:
+
+- Accepted only from `HOME` or `IDLE`; any other state is rejected with
+  `invalid_state` rather than acknowledged as accepted.
+- Requires a finite destination, localization, geofence, `NavigationManager`,
+  lidar, and ultrasonic validation.
+- `request_yolo` and `request_recording` are independent booleans; neither is
+  implicitly enabled by `GO_TO`.
+- Monitoring streaming remains client-driven and is not implied by this command.
+
+### 5.7 `RETURN_HOME`
 
 ```json
 {
+  "protocol_version": 1,
   "type": "command",
-  "schema_version": 1,
-  "sequence": 2006,
-  "timestamp_ms": 123457400,
-  "command_id": "cmd-0006",
-  "command": "emergency_stop",
-  "params": {}
+  "command_id": "cmd-ret-01",
+  "issued_at_ms": 1785012355000,
+  "name": "RETURN_HOME",
+  "args": {}
 }
 ```
 
-### 6.10 `clear_failsafe`
-Allows the car to leave `FAILSAFE` when operator confirmation and system safety checks allow it.
+Acceptance rules:
+
+- In `HOME` within completion tolerance: idempotent success.
+- From `IDLE`, any chase state, or `GOTO`: immediate stop/cancel then `RETURN_HOME`
+  after safety validation.
+- In `RETURN_HOME`: idempotent success; retain correlated goal.
+- In `BRAKE_REVERSE`: stop reverse, cancel saved objective, set `RETURN_HOME`, and
+  re-evaluate clearance before motion.
+- In `FAILSAFE`: reject.
+- If safe return cannot be established: enter `FAILSAFE`; do not remain motion-capable.
+
+Home coordinates are read from the frozen durable home record; the command does not
+carry inline home geometry.
+
+### 5.8 `CLEAR_FAILSAFE`
 
 ```json
 {
+  "protocol_version": 1,
   "type": "command",
-  "schema_version": 1,
-  "sequence": 2007,
-  "timestamp_ms": 123457500,
-  "command_id": "cmd-0007",
-  "command": "clear_failsafe",
-  "params": {
+  "command_id": "cmd-clr-01",
+  "issued_at_ms": 1785012360000,
+  "name": "CLEAR_FAILSAFE",
+  "args": {
     "operator_confirmed": true
   }
 }
 ```
 
-Acceptance rules:
-- Accept only if `operator_confirmed` is `true` and safety checks pass.
-- Reject otherwise.
+Acceptance requires explicit operator confirmation, cause-specific clearance for
+every latched cause, stopped motor feedback, healthy control loop and watchdog,
+fresh valid lidar and ultrasonic, and valid motion-inhibition output.
 
-### 6.11 Rejection Cause
-When a command ACK has `status: "rejected"`, the ACK must include `cause`.
+Acceptance enters clean `IDLE`, cancels/discards Nav2 goals, handoff context, and
+interrupted objectives. It does not restart a mission, detector, recording, or stream.
+
+The reverse attempt count does not reset merely because `CLEAR_FAILSAFE` was accepted.
+
+### 5.9 `EMERGENCY_STOP`
 
 ```json
 {
-  "type": "ack",
-  "schema_version": 1,
-  "sequence": 9002,
-  "timestamp_ms": 123457530,
-  "ack_sequence": 2002,
-  "ack_type": "command",
-  "command_id": "cmd-0002",
-  "status": "rejected",
-  "state": "IDLE",
-  "reason": "start_chase_rejected",
-  "cause": "cat_position_invalid"
+  "protocol_version": 1,
+  "type": "command",
+  "command_id": "cmd-estop-01",
+  "issued_at_ms": 1785012365000,
+  "name": "EMERGENCY_STOP",
+  "args": {}
 }
 ```
 
-Recommended V1 rejection causes:
-- `car_position_invalid`
-- `cat_position_invalid`
-- `tracking_stale`
-- `home_missing`
-- `home_invalid`
-- `target_invalid`
-- `motion_unsafe`
-- `failsafe_active`
-- `operator_confirmation_required`
-- `invalid_command`
-- `invalid_params`
+Rules:
 
-For accepted ACKs, `cause` must be present with value `null`.
+- Processed synchronously outside the transactional queue.
+- Commands zero motion immediately, cancels Nav2 and reverse output, enters `FAILSAFE`,
+  and latches cause.
+- ACK MAY be emitted after the synchronous stop is committed but MUST NOT wait for
+  the next full control-loop transaction boundary.
 
-## 7. Step 4: ACK Schema and Retry Behavior
-**Status:** Done
+### 5.10 Rejection reasons
 
-### 7.1 Final Decision
-ACK messages acknowledge reliable command packets. Tracking packets do not receive ACKs.
+Rejected command ACKs MUST use `applied: false`, retain the actual state, and include
+a specific `reason`.
 
-ACKs always reference:
-- the exact received packet sequence
-- the command transaction ID when ACKing a command
-- the command result
-- the current car state
+Recommended rejection reasons:
 
-### 7.2 Schema
+- `WRONG_TARGET`
+- `STALE_OBSERVATION`
+- `DUPLICATE_SUPERSEDED`
+- `INVALID_STATE`
+- `HOME_INVALID`
+- `HOME_PERSIST_FAILED`
+- `TARGET_INVALID`
+- `CALIBRATION_MISMATCH`
+- `GEOFENCE_INVALID`
+- `LOCALIZATION_INVALID`
+- `SAFETY_HEALTH_INVALID`
+- `NAVIGATION_UNAVAILABLE`
+- `OPERATOR_CONFIRMATION_REQUIRED`
+- `FAILSAFE_ACTIVE`
+- `INVALID_COMMAND`
+- `INVALID_PARAMS`
+
+## 6. Reliable mission-event schema
+
+### 6.1 Envelope
+
+Only the overhead system may declare:
+
+```text
+PRIMARY_CAT_LEFT_PERIMETER(target_id)
+```
+
 ```json
 {
-  "type": "ack",
-  "schema_version": 1,
-  "sequence": 9001,
-  "timestamp_ms": 123457530,
-  "ack_sequence": 2002,
-  "ack_type": "command",
-  "command_id": "cmd-0002",
-  "status": "accepted",
-  "state": "CHASE_A",
-  "reason": "start_chase_accepted",
-  "cause": null
+  "protocol_version": 1,
+  "type": "mission_event",
+  "event_id": "evt-31bd",
+  "mission_id": "mission-204",
+  "issued_at_ms": 1785012399000,
+  "name": "PRIMARY_CAT_LEFT_PERIMETER",
+  "target_id": "cat-17",
+  "perimeter_id": "yard-v3",
+  "observation_seq": 1901
 }
 ```
 
-### 7.3 Field Rules
-- `sequence`: ACK packet's own sequence.
-- `ack_sequence`: exact received packet sequence being acknowledged.
-- `ack_type`: message type being acknowledged. V1 uses `command`.
-- `command_id`: required when `ack_type == "command"`.
-- `status`: command result. Must be `accepted` or `rejected`.
-- `state`: current FSM state after command processing.
-- `reason`: machine-readable result reason.
-- `cause`: always present.
-  - `null` when `status == "accepted"`.
-  - machine-readable cause string when `status == "rejected"`.
+Mandatory fields: `event_id`, `target_id`, `perimeter_id`, `observation_seq`.
 
-### 7.4 Accepted ACK Example
+### 6.2 Matching rules
+
+A matching event is one whose:
+
+- `target_id` equals the active chase target;
+- `event_id` is new for the current mission;
+- `observation_seq` is not regressive for the current mission context.
+
+Wrong-target, duplicate, regressive-sequence, and stale events are logged and ACKed
+as rejected; they do not change state.
+
+Local camera visibility never overrides a valid matching event.
+
+### 6.3 Applied behavior
+
+A matching event in `GETTING_CLOSE`, `SEARCH`, `CHASE`, or a `BRAKE_REVERSE` whose
+saved objective is chase:
+
+1. commands immediate zero motion;
+2. cancels Nav2/reverse;
+3. enters `IDLE`;
+4. starts `CAT_FOLLOW_HANDOFF_WAIT_SEC` handoff wait and recording post-roll.
+
+During handoff:
+
+- valid `START_CHASE(new_target_id)` enters `GETTING_CLOSE`;
+- the exited target cannot be restarted from the stale event/observation;
+- explicit `RETURN_HOME` enters `RETURN_HOME`;
+- timeout enters `RETURN_HOME` if safe return is possible, otherwise `FAILSAFE`.
+
+The car does not promote a local secondary track. Overhead selects and names the
+next target.
+
+## 7. ACK schema
+
+### 7.1 Schema
+
 ```json
 {
+  "protocol_version": 1,
   "type": "ack",
-  "schema_version": 1,
-  "sequence": 9001,
-  "timestamp_ms": 123457530,
-  "ack_sequence": 2002,
-  "ack_type": "command",
-  "command_id": "cmd-0002",
-  "status": "accepted",
-  "state": "CHASE_A",
-  "reason": "start_chase_accepted",
-  "cause": null
+  "message_id": "evt-31bd",
+  "message_type": "mission_event",
+  "applied": true,
+  "resulting_state": "IDLE",
+  "reason": "PRIMARY_TARGET_EXIT_HANDOFF",
+  "applied_control_seq": 88214
 }
 ```
 
-### 7.5 Rejected ACK Example
+Field rules:
+
+| Field | Rules |
+|---|---|
+| `message_id` | `command_id` or `event_id` being acknowledged |
+| `message_type` | `command` or `mission_event` |
+| `applied` | `true` only after committed application or committed rejection |
+| `resulting_state` | Actual FSM state after commit |
+| `reason` | Machine-readable applied or rejection reason |
+| `applied_control_seq` | Monotonic control-loop sequence at commit time |
+
+Rejected ACKs MUST use `applied: false`, retain the actual state, and include a
+specific reason such as `WRONG_TARGET`, `STALE_OBSERVATION`,
+`DUPLICATE_SUPERSEDED`, `INVALID_STATE`, `HOME_INVALID`, or
+`SAFETY_HEALTH_INVALID`.
+
+Accepted command example:
+
 ```json
 {
+  "protocol_version": 1,
   "type": "ack",
-  "schema_version": 1,
-  "sequence": 9002,
-  "timestamp_ms": 123457730,
-  "ack_sequence": 2003,
-  "ack_type": "command",
-  "command_id": "cmd-0003",
-  "status": "rejected",
-  "state": "IDLE",
-  "reason": "start_chase_rejected",
-  "cause": "cat_position_invalid"
+  "message_id": "cmd-9f24",
+  "message_type": "command",
+  "applied": true,
+  "resulting_state": "GETTING_CLOSE",
+  "reason": "START_CHASE_ACCEPTED",
+  "applied_control_seq": 88210
 }
 ```
 
-### 7.6 Retry Behavior
-Overhead sender behavior:
-- Send command.
-- Wait `200 ms` for ACK.
-- If no ACK arrives, retry the command.
-- Retry uses the same `command_id`.
-- Retry uses a new packet `sequence`.
-- Retry up to `5` times.
-- If still no ACK, mark the car command channel unhealthy.
-- Do not assume the command was not executed after max retries; require operator/system decision before sending a conflicting command.
+Duplicate retry example:
 
-Car receiver behavior:
-- If command is new, process it once, store the command result, and send ACK.
-- If the same `command_id` is received again, do not re-execute side effects.
-- For duplicate command retries, send ACK for the newly received packet's `ack_sequence`.
-- Duplicate retries reuse the original command result (`accepted` or `rejected`), `reason`, and `cause`.
-
-### 7.7 ACK Scope
-For V1:
-- ACKs are required for `command` messages only.
-- ACKs are not sent for `tracking` messages.
-- ACK messages themselves are not ACKed.
-
-## 8. Step 5: SharedState Schema
-**Status:** Done
-
-### 8.1 Finalized Decisions
-- `decision` is included in `SharedState`.
-- Only `DecisionEngine` writes `decision`.
-- UI, telemetry, tests, and `MotorInterface` may read `decision`.
-- `DecisionEngine` must not use the previous `decision` group as input to future decisions.
-- All coordinate and distance fields use centimeters (`cm`).
-- `distance_cm` uses centimeters.
-- `decision.speed` and `decision.steering` are normalized values.
-- `navigation.speed_limit` is normalized `0.0..1.0`.
-- `obstacle_severity` is normalized `0.0..1.0`.
-- `vision.x_offset_norm` uses `-1.0` for left, `0.0` for centered, and `1.0` for right.
-- `home.fresh` does not expire; `home.set` determines whether home is usable.
-
-### 8.2 Normalized Motion Fields
-- `decision.speed`: normalized drive request.
-  - `-1.0`: full reverse
-  - `0.0`: stop/no throttle
-  - `1.0`: full forward
-- `decision.steering`: normalized steering request.
-  - `-1.0`: full left
-  - `0.0`: centered
-  - `1.0`: full right
-
-`MotorInterface` converts normalized values to hardware-specific PWM/servo commands.
-
-Additional normalized fields:
-- `navigation.speed_limit`: `0.0` means no motion allowed, `1.0` means no navigation-imposed speed reduction.
-- `range.obstacle_severity`: `0.0` means no obstacle risk, `1.0` means maximum/critical obstacle risk.
-- `vision.x_offset_norm`: `-1.0` means cat is at/near left edge, `0.0` means centered, `1.0` means at/near right edge.
-
-Home validity:
-- `home.fresh` does not expire.
-- `home.set == true` means a home position is available.
-- `home` remains valid until replaced by another accepted `set_home` or `return_home` command.
-
-### 8.3 Schema
 ```json
 {
-  "overhead": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": false,
-    "authority": "CommsManager",
-    "sequence": 0,
-    "frame_id": "yard",
-    "car": {
-      "x": 0.0,
-      "y": 0.0,
-      "heading": 0.0,
-      "heading_valid": false,
-      "confidence": 0.0
-    },
-    "cat": {
-      "x": 0.0,
-      "y": 0.0,
-      "confidence": 0.0
-    }
-  },
-  "home": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
+  "protocol_version": 1,
+  "type": "ack",
+  "message_id": "cmd-9f24",
+  "message_type": "command",
+  "applied": true,
+  "resulting_state": "GETTING_CLOSE",
+  "reason": "START_CHASE_ACCEPTED",
+  "applied_control_seq": 88210
+}
+```
+
+The duplicate retry returns the original committed result and the original
+`applied_control_seq`; it does not re-execute side effects.
+
+## 8. Canonical FSM contract summary
+
+Detailed transition behavior is defined in the target redesign document. This
+section defines the interface-visible state/event vocabulary and matrix summary.
+
+### 8.1 States
+
+| State | Interface meaning |
+|---|---|
+| `HOME` | Stopped at durable home within completion tolerance |
+| `IDLE` | Stopped, ready for command, or handoff wait |
+| `GETTING_CLOSE` | Overhead/Nav2 pursuit; onboard detector not required |
+| `SEARCH` | Slow acquisition near target while verifying local lock |
+| `CHASE` | Local-track pursuit inside Nav2 safety/path constraints |
+| `BRAKE_REVERSE` | Bounded close-obstacle recovery with saved objective |
+| `GOTO` | Explicit Nav2 destination with optional YOLO/recording |
+| `RETURN_HOME` | Navigate to frozen mission home |
+| `FAILSAFE` | Latched zero-motion safety state |
+
+There is no “arrived at cat” or mission-success state. Close proximity to a tracked
+cat uses the same `BRAKE_REVERSE` policy as any close obstacle.
+
+Superseded states that MUST NOT appear in new interfaces or telemetry:
+
+- `CHASE_A`
+- `TRACK_B`
+- `BRAKE`
+
+### 8.2 State groups
+
+- Chase states: `GETTING_CLOSE`, `SEARCH`, `CHASE`
+- Normal autonomous driving states: `GETTING_CLOSE`, `SEARCH`, `CHASE`, `GOTO`,
+  `RETURN_HOME`
+- Stationary states: `HOME`, `IDLE`, `FAILSAFE`
+
+### 8.3 Required mission context exposed to protocol consumers
+
+The runtime MUST expose enough mission context in shared state and telemetry to
+reconstruct:
+
+- current state and state-entry monotonic time;
+- command ID and mission ID;
+- active objective type;
+- active `target_id`, or null;
+- frozen home record and `home_version`;
+- active overhead `observation_seq` and timestamp;
+- local track ID and association evidence;
+- `NavigationManager` goal intent ID and action correlation;
+- sensor-health hold start and reason;
+- overhead-invalid retention start and last valid moving-target goal;
+- SEARCH timeout stage and observation-waypoint status;
+- handoff wait deadline and recording post-roll deadline;
+- `BRAKE_REVERSE` saved objective, phase, attempt count, and clearance-reset timer;
+- requested and active perception consumers;
+- latched failsafe causes.
+
+An active mission freezes the durable home version at mission acceptance. Updating
+home while a mission is active is forbidden.
+
+### 8.4 Global safety events
+
+From every state, each of the following enters `FAILSAFE` immediately:
+
+- emergency stop;
+- confirmed crossing of configured car geofence;
+- motor/control fatal error;
+- control-loop watchdog expiration.
+
+In any normal autonomous driving state, if either required lidar or ultrasonic source
+becomes stale, invalid, or faulted:
+
+1. command zero motion immediately;
+2. retain current FSM state and objective;
+3. start `CAT_FOLLOW_SENSOR_RECOVERY_SEC` recovery timer;
+4. resume only if both sources become fresh and valid within the interval and all
+   other permissions remain valid;
+5. enter `FAILSAFE` if the timer expires.
+
+During `BRAKE_REVERSE`, loss of either required source enters `FAILSAFE` immediately.
+
+`HOME` and `IDLE` remain stopped and report degraded health without automatic failsafe
+escalation from sensor staleness alone. Later motion commands MUST be rejected until
+both sensors are healthy.
+
+### 8.5 Command and mission-event matrix summary
+
+“Reject” means no state or objective mutation and an ACK with a reason. “Same” means
+successful idempotent application unless noted.
+
+| Current state | `SET_HOME` | `START_CHASE` | `STOP_CHASE` | `GO_TO` | `RETURN_HOME` | Matching primary-left event | `CLEAR_FAILSAFE` |
+|---|---|---|---|---|---|---|---|
+| `HOME` | Same after durable update | `GETTING_CLOSE` | Same | `GOTO` | Same if within tolerance | Reject/no active target | Reject |
+| `IDLE` | Same after durable update | `GETTING_CLOSE` | Same; cancel handoff | `GOTO` | `RETURN_HOME` | Reject/no active target | Reject |
+| `GETTING_CLOSE` | Reject | Reject | `IDLE` | Reject | `RETURN_HOME` | `IDLE` handoff | Reject |
+| `SEARCH` | Reject | Reject | `IDLE` | Reject | `RETURN_HOME` | `IDLE` handoff | Reject |
+| `CHASE` | Reject | Reject | `IDLE` | Reject | `RETURN_HOME` | `IDLE` handoff | Reject |
+| `BRAKE_REVERSE` | Reject | Reject | `IDLE` only if saved chase; else reject | Reject | Stop, then `RETURN_HOME` | `IDLE` only if matching saved chase; else reject | Reject |
+| `GOTO` | Reject | Reject | Reject | Reject | `RETURN_HOME` | Reject/no active target | Reject |
+| `RETURN_HOME` | Reject | Reject | Reject | Reject | Same | Reject/no active target | Reject |
+| `FAILSAFE` | Reject | Reject | Reject | Reject | Reject | Reject | `IDLE` if all clearance checks pass |
+
+Every accepted motion command remains subject to Section 5 validation rules.
+
+### 8.6 Autonomous transition summary
+
+| From | Condition | To |
+|---|---|---|
+| `GETTING_CLOSE` | Valid target distance `<= CAT_FOLLOW_SEARCH_ENTRY_DISTANCE_CM` | `SEARCH` |
+| `SEARCH` | Three consecutive unambiguous associated observations | `CHASE` |
+| `SEARCH` | First SEARCH interval expires without lock | `SEARCH` with one observation waypoint |
+| `SEARCH` | Second SEARCH interval expires without lock | `RETURN_HOME` or `FAILSAFE` |
+| `CHASE` | Local track lost and fresh valid overhead distance `<= 200 cm` | `SEARCH` |
+| `CHASE` | Local track lost and fresh valid overhead distance `> 200 cm` | `GETTING_CLOSE` |
+| `CHASE` | Local track lost while overhead unavailable | `RETURN_HOME` or `FAILSAFE` |
+| `GETTING_CLOSE` or `SEARCH` | Overhead recovers with different `target_id` | `IDLE` |
+| `GETTING_CLOSE` or `SEARCH` | Overhead invalid-retention timer expires | `RETURN_HOME` or `FAILSAFE` |
+| Any normal driving state | Close trigger from either required sensor | `BRAKE_REVERSE` |
+| `BRAKE_REVERSE` | RECHECK clear and saved objective remains valid | Saved state |
+| `BRAKE_REVERSE` | RECHECK blocked and attempts remain | `BRAKE_REVERSE` |
+| `BRAKE_REVERSE` | Blocked with attempts exhausted | `FAILSAFE` |
+| `GOTO` | Correlated completion accepted | `IDLE` |
+| `RETURN_HOME` | Correlated completion accepted | `HOME` |
+| `IDLE` handoff | Handoff timer expires | `RETURN_HOME` or `FAILSAFE` |
+
+A two-hop `CHASE -> GETTING_CLOSE -> SEARCH` sequence on track loss is forbidden.
+
+## 9. NavigationManager goal intents and results
+
+`NavigationManager` owns Nav2 `NavigateToPose` clients, yard-to-navigation-frame
+transforms, moving-goal refresh, cancel/preemption, action correlation, path
+viability, safe steering envelope publication, retries, and completion qualification.
+
+### 9.1 Goal intent schema
+
+Shared-state and telemetry expose each submitted goal intent as:
+
+```json
+{
+  "goal_intent_id": "gi-0042",
+  "objective_type": "GETTING_CLOSE",
+  "target_id": "cat-17",
+  "frame_id": "map",
+  "x_m": 2.10,
+  "y_m": -0.80,
+  "yaw_rad": 0.00,
+  "moving_goal": true,
+  "requested_at_ms": 1785012400000,
+  "action_goal_id": "nav2-goal-991",
+  "refresh_count": 3,
+  "last_refresh_ms": 1785012402500,
+  "expected_replacement": false
+}
+```
+
+Allowed `objective_type` values:
+
+- `GETTING_CLOSE`
+- `SEARCH`
+- `SEARCH_OBSERVATION`
+- `CHASE`
+- `GOTO`
+- `RETURN_HOME`
+
+Rules:
+
+- Moving cat goals default to at most `CAT_FOLLOW_NAV_MOVING_GOAL_MAX_HZ`.
+- Normal refresh requires at least `CAT_FOLLOW_NAV_MOVING_GOAL_MIN_DISPLACEMENT_CM`
+  displacement since the last submitted goal.
+- Safety cancellation is immediate and bypasses rate limiting.
+- Replacing a moving goal intentionally is neutral: cancellation/result from the
+  replaced goal MUST NOT count as failure.
+- Late action results with the wrong goal intent or correlation ID MUST be ignored
+  and logged.
+
+### 9.2 Navigation result schema
+
+```json
+{
+  "goal_intent_id": "gi-0042",
+  "action_goal_id": "nav2-goal-991",
+  "status": "SUCCEEDED",
+  "result_code": 4,
+  "terminal": true,
+  "failure_class": null,
+  "completed_at_ms": 1785012500000,
+  "pose_qualified": true,
+  "dwell_qualified": true
+}
+```
+
+Allowed terminal `status` values:
+
+- `SUCCEEDED`
+- `ABORTED`
+- `CANCELED`
+- `UNKNOWN`
+
+Failure classes for retries and exhaustion reporting:
+
+- `PLANNER_FAILURE`
+- `CONTROLLER_FAILURE`
+- `NO_PROGRESS`
+- `PATH_BLOCKED`
+- `LOCALIZATION_LOST`
+- `PREEMPTED`
+- `CORRELATION_MISMATCH`
+
+Exhausted failure outcomes:
+
+- `GOTO -> IDLE`
+- `GETTING_CLOSE`, `SEARCH`, or `CHASE -> RETURN_HOME` if safe, otherwise `FAILSAFE`
+- `RETURN_HOME -> FAILSAFE`
+
+Nav2 BackUp MUST remain disabled.
+
+### 9.3 Path viability and safe steering envelope
+
+`NavigationManager` publishes:
+
+```json
+{
+  "path_viable": true,
+  "safe_steering_min": -0.35,
+  "safe_steering_max": 0.35,
+  "speed_cap_mps": 0.25,
+  "no_progress": false,
+  "dead_end": false
+}
+```
+
+`DecisionEngine` applies camera pursuit by clamping the camera steering request into
+the published safe envelope. Camera and Nav2 steering MUST NOT be added or combined
+by weighted sum.
+
+Applied speed policy:
+
+```text
+applied_speed_mps = min(
+    pursuit_speed_request_mps,
+    nav2_speed_cap_mps,
+    alignment_speed_cap_mps,
+    obstacle_speed_cap_mps,
+    thermal_speed_cap_mps
+)
+```
+
+### 9.4 Completion contract
+
+`GOTO` and `RETURN_HOME` complete only when:
+
+1. the correlated Nav2 result is `SUCCEEDED`;
+2. a fresh authoritative local pose is within `CAT_FOLLOW_NAV_COMPLETION_XY_CM` XY and
+   `CAT_FOLLOW_NAV_COMPLETION_YAW_RAD` yaw of the destination;
+3. both tolerances remain satisfied continuously for
+   `CAT_FOLLOW_NAV_COMPLETION_DWELL_SEC`.
+
+An action result alone is insufficient.
+
+## 10. Geofence contract
+
+Two separate concepts MUST remain distinct in protocol, shared state, and telemetry:
+
+| Concept | Owner | Meaning |
+|---|---|---|
+| Car geofence | Local runtime | Inner safe polygon for the localized `base_link` center |
+| Cat perimeter | Overhead system | Boundary used to declare cat exit via mission event |
+
+Car geofence rules:
+
+- Crossing the configured car geofence boundary is an immediate `FAILSAFE`.
+- There is no predictive path veto based solely on a planned path approaching or
+  crossing the polygon.
+- Loss of sufficient localization to determine containment is a health failure, not
+  proof of remaining inside.
+
+Shared-state geofence group:
+
+```json
+{
+  "car_geofence_id": "yard-inner-v1",
+  "car_inside": true,
+  "car_distance_to_boundary_cm": 84.2,
+  "localization_valid_for_containment": true,
+  "breach_confirmed": false,
+  "breach_at_ms": null
+}
+```
+
+Cat perimeter status comes from overhead observations and mission events, not from the
+car geofence.
+
+## 11. Dual lidar and ultrasonic health contract
+
+Both lidar and ultrasonic are required for autonomous motion and remain direct
+`DecisionEngine` safety inputs even when integrated with Nav2.
+
+Shared state MUST expose independent health for each source:
+
+```json
+{
+  "lidar": {
     "fresh": true,
-    "authority": "CommsManager",
-    "set": false,
-    "x": 0.0,
-    "y": 0.0,
-    "frame_id": "yard",
-    "source_command_id": null
+    "valid": true,
+    "faulted": false,
+    "distance_cm": 42.0,
+    "stale_ms": 120,
+    "backend": "rplidar_c1"
   },
-  "vision": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": false,
-    "authority": "VisionTracker",
-    "cat_visible": false,
-    "cat_visible_stable": false,
-    "x_offset_norm": 0.0,
-    "confidence": 0.0,
-    "last_seen_ms": 0
-  },
-  "range": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": false,
-    "authority": "RangeSafety",
-    "backend": "ultrasonic | lidar_c1 | tmf8829",
-    "distance_cm": null,
-    "confidence": 0.0,
-    "obstacle_detected": false,
-    "obstacle_critical": false,
-    "obstacle_severity": 0.0,
-    "zone": null
-  },
-  "navigation": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": false,
-    "authority": "Navigation",
-    "heading": 0.0,
-    "heading_valid": false,
-    "speed_limit": 0.0,
-    "path_correction": 0.0,
-    "no_progress": false,
-    "dead_end": false
-  },
-  "system": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
+  "ultrasonic": {
     "fresh": true,
-    "authority": "Runtime",
-    "thermal_c": null,
-    "thermal_state": "unknown | normal | warning | speed_limited | critical",
-    "battery_voltage": null,
-    "brownout_detected": false,
-    "threads": {
-      "comms_alive": false,
-      "vision_alive": false,
-      "range_alive": false,
-      "navigation_alive": false,
-      "control_alive": false
-    }
+    "valid": true,
+    "faulted": false,
+    "distance_cm": 118.0,
+    "stale_ms": 80,
+    "frame_id": "ultrasonic_link",
+    "costmap_layer_enabled": true
   },
-  "fsm": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": true,
-    "authority": "FSM",
-    "state": "IDLE",
-    "previous_state": null,
-    "last_transition_ms": 0,
-    "last_transition_reason": "init",
-    "last_rejected_transition": null
+  "required_for_motion": true,
+  "hold_active": false,
+  "hold_started_ms": null,
+  "hold_reason": null,
+  "recovery_deadline_ms": null
+}
+```
+
+Rules:
+
+- Either source stale, invalid, or faulted in a driving state starts a hold with
+  zero motion and preserves objective until `CAT_FOLLOW_SENSOR_RECOVERY_SEC`.
+- Recovery requires both sources fresh and valid.
+- Either source unhealthy during `BRAKE_REVERSE` enters `FAILSAFE` immediately.
+- Ultrasonic MUST be published as `sensor_msgs/Range` with validated topic, frame,
+  radiation type, field of view, min/max range, finite range value, timestamp, and
+  transform into the local costmap frame.
+- The local costmap MUST integrate ultrasonic through a validated `RangeSensorLayer`
+  when `CAT_FOLLOW_NAV_ULTRASONIC_COSTMAP=1`.
+- Disabling the costmap layer for diagnosis MUST NOT disable ultrasonic direct safety.
+
+Close-obstacle policy:
+
+- Fresh valid reading strictly below `CAT_FOLLOW_BRAKE_REVERSE_TRIGGER_CM` enters
+  `BRAKE_REVERSE`.
+- There is no `10 cm` immediate `FAILSAFE` close-obstacle rule in the target contract.
+
+## 12. Perception, recording, and stream lifecycle
+
+### 12.1 Ownership
+
+`PerceptionLifecycleManager` owns named consumers and reference counts:
+
+- `detector`
+- `recording`
+- `stream`
+
+Consumers are independent. Detector and recording never depend on stream clients.
+Stream reference count is the actual connected-client count.
+
+Mission policy overrides legacy PhaseMachine in `SEARCH`, `CHASE`, and a `GOTO` with
+`request_yolo=true`.
+
+### 12.2 Lifecycle status schema
+
+```json
+{
+  "detector": {
+    "requested": true,
+    "active": true,
+    "consumer_refcount": 1,
+    "reason": "SEARCH_REQUIRED"
   },
-  "command": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": true,
-    "authority": "CommsManager",
-    "last_command_id": null,
-    "last_command": null,
-    "last_status": null,
-    "last_reason": null,
-    "last_cause": null
+  "recording": {
+    "requested": true,
+    "active": true,
+    "consumer_refcount": 1,
+    "segment_path": "/var/lib/cat_follow/recordings/20260726-001.mkv",
+    "postroll_deadline_ms": null,
+    "degraded_reason": null
   },
-  "decision": {
-    "timestamp_ms": 0,
-    "received_ms": 0,
-    "fresh": true,
-    "authority": "DecisionEngine",
-    "requested_state": "IDLE",
-    "speed": 0.0,
-    "steering": 0.0,
-    "brake": false,
-    "reason": "init",
-    "active_constraints": []
+  "stream": {
+    "requested_clients": 1,
+    "active_clients": 1,
+    "encoder_ready": true,
+    "forced_off": false,
+    "degraded_reason": null
+  },
+  "camera": {
+    "hardware_state": "active",
+    "streamoff_capable": true,
+    "last_revalidation_ms": 1785012400000,
+    "fatal_fault": false
   }
 }
 ```
 
-## 9. Step 6: DecisionEngine Input/Output Dataclasses
-**Status:** Done
+Allowed `camera.hardware_state` values:
 
-### 9.1 Final Decision
-`DecisionEngine` reads one immutable snapshot each control tick and emits one decision output.
+- `closed`
+- `ready_inactive`
+- `active`
+- `faulted`
 
-`decision` from `SharedState` is not included in `DecisionInput`. This prevents feedback loops from previous decisions.
+Lifecycle table:
 
-`DecisionOutput` does not include `cause`. Decision explanations use `reason` and `active_constraints`. Command rejection details remain in ACK `cause`.
+| FSM state | Detector | Recording | Stream | Camera policy |
+|---|---|---|---|---|
+| `HOME` | Forced off | Forced off | Forced off | Ready-inactive/closed |
+| `IDLE` | Off | Post-roll/handoff only | Actual clients unless forced off | Active only with a consumer |
+| `GETTING_CLOSE` | Off unless diagnostic policy | Chase mission request | Actual clients | Active if recording/stream need frames |
+| `SEARCH` | Required on | Chase mission request | Actual clients | Active |
+| `CHASE` | Required on | Chase mission request | Actual clients | Active |
+| `BRAKE_REVERSE` | Inherit saved objective unless camera failed | Inherit saved request | Actual clients | Based on references |
+| `GOTO` | Exactly `request_yolo` | Exactly `request_recording` | Actual clients | Active if any consumer |
+| `RETURN_HOME` | Off | Retain active mission/post-roll request | Actual clients | Active if recording/stream need frames |
+| `FAILSAFE` | Forced off | Forced off | Forced off | Ready-inactive/closed |
 
-`DecisionOutput` includes optional target debug fields:
-- `target_x`
-- `target_y`
-- `target_source`
+Recording rules:
 
-Target fields are for observability, telemetry, UI, and tests. They do not create additional control authority.
+- segmented, crash-tolerant Matroska via hardware H.264 encoder;
+- quota and minimum free-space reserve enforced;
+- oldest finalized segments deleted first;
+- active segment never deleted as quota cleanup;
+- low-space stop leaves mission running;
+- automatic resume while still requested after health/space recovery;
+- chase recording post-roll lasts `CAT_FOLLOW_RECORDING_POSTROLL_SEC`.
 
-### 9.2 DecisionInput
+Monitoring stream rules:
+
+- H.264 hardware encoding only;
+- runs only while at least one actual client is connected and FSM does not force it off;
+- no MJPEG or software-encoding fallback;
+- recording encoder is independent from monitoring encoder/client rule.
+
+Recording, encoder, storage, or monitoring-stream failure causes no FSM transition and
+no motion veto. It produces degraded telemetry only.
+
+## 13. Durable home contract
+
+Home is not carried in lossy overhead observations. It is a durable, versioned,
+calibration/map-associated record.
+
+```json
+{
+  "home_version": 4,
+  "checksum": "sha256:ab12...",
+  "calibration_version": 7,
+  "map_id": "yard-map-v3",
+  "frame_id": "map",
+  "x_m": 0.00,
+  "y_m": 0.00,
+  "yaw_rad": 0.00,
+  "persisted_at_ms": 1785012000000,
+  "source_command_id": "cmd-home-01",
+  "frozen_for_mission": true,
+  "mission_home_version": 4
+}
+```
+
+Rules:
+
+- `SET_HOME` succeeds only after durable commit.
+- Active missions freeze `mission_home_version` at acceptance.
+- `RETURN_HOME` uses the frozen mission home, not a newly edited home record.
+- Persistence failure is command rejection, not in-memory success.
+
+## 14. Physical m/s versus normalized reverse
+
+Nav2 policies, caps, requests, and navigation telemetry use physical `m/s`.
+
+Conversion to the PiCar-X normalized motor command uses a calibrated approximate
+mapping derived from `speed_time_distance` measurements. Calibration MUST cover the
+production surface, payload, representative battery range, and forward speed range.
+
+`BRAKE_REVERSE` is the sole specified direct normalized/time-bounded maneuver:
+
+- settle: `CAT_FOLLOW_BRAKE_REVERSE_SETTLE_MS`
+- reverse command: `CAT_FOLLOW_BRAKE_REVERSE_NORMALIZED`
+- reverse duration: `CAT_FOLLOW_BRAKE_REVERSE_DURATION_SEC`
+- steering centered during settle and reverse
+
+Decision and telemetry MUST record at least:
+
+- requested physical speed in `m/s`;
+- all applied physical speed caps;
+- requested steering and Nav2 safe envelope;
+- final applied normalized drive command;
+- final applied steering command;
+- mapping/calibration version;
+- whether the command came from Nav2 policy or direct reverse;
+- every zero-motion veto reason.
+
+## 15. SharedState contract
+
+`SharedState` is the only cross-thread runtime data contract. Each group has exactly
+one authoritative writer.
+
+### 15.1 Group ownership
+
+| Group | Authoritative writer |
+|---|---|
+| `overhead` | `CommsManager` |
+| `home` | Home persistence service / command commit path |
+| `mission` | FSM / control loop |
+| `vision` | Detector / tracker |
+| `lidar` | Lidar adapter |
+| `ultrasonic` | Ultrasonic adapter |
+| `sensor_health` | `DecisionEngine` or safety aggregator |
+| `navigation` | `NavigationManager` |
+| `geofence` | Localization / safety aggregator |
+| `perception_lifecycle` | `PerceptionLifecycleManager` |
+| `recording` | Recording service |
+| `stream` | Web stream / H.264 route owner |
+| `system` | Runtime / health monitor |
+| `fsm` | FSM |
+| `command` | Command handler |
+| `decision` | `DecisionEngine` |
+
+Rules:
+
+- Only the authoritative writer may update its group.
+- `DecisionEngine` is the sole drivetrain decision authority.
+- No camera, detector, communications component, Nav2 adapter, or web route writes
+  motor or steering commands directly.
+- `DecisionEngine` reads one coherent snapshot per control tick and MUST NOT use the
+  previous `decision` group as input to future decisions.
+
+### 15.2 Target SharedState schema
+
+```json
+{
+  "overhead": {
+    "received_ms": 0,
+    "fresh": false,
+    "observation_seq": 0,
+    "observed_at_ms": 0,
+    "perimeter_id": null,
+    "calibration_version": null,
+    "selected_target_id": null,
+    "invalid": true,
+    "retention_deadline_ms": null,
+    "car": {
+      "x_cm": 0.0,
+      "y_cm": 0.0,
+      "yaw_rad": 0.0,
+      "confidence": 0.0
+    },
+    "cats": []
+  },
+  "home": {
+    "valid": false,
+    "home_version": null,
+    "checksum": null,
+    "calibration_version": null,
+    "map_id": null,
+    "frame_id": "map",
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "yaw_rad": 0.0,
+    "persisted_at_ms": null,
+    "source_command_id": null
+  },
+  "mission": {
+    "mission_id": null,
+    "objective_type": null,
+    "target_id": null,
+    "home_version_frozen": null,
+    "handoff_deadline_ms": null,
+    "recording_postroll_deadline_ms": null,
+    "search_stage": 0,
+    "association_count": 0,
+    "local_track_id": null
+  },
+  "vision": {
+    "received_ms": 0,
+    "fresh": false,
+    "track_id": null,
+    "associated_target_id": null,
+    "bearing_rad": null,
+    "confidence": 0.0,
+    "ambiguous": false
+  },
+  "lidar": {
+    "received_ms": 0,
+    "fresh": false,
+    "valid": false,
+    "faulted": false,
+    "distance_cm": null
+  },
+  "ultrasonic": {
+    "received_ms": 0,
+    "fresh": false,
+    "valid": false,
+    "faulted": false,
+    "distance_cm": null,
+    "frame_id": null
+  },
+  "sensor_health": {
+    "required_for_motion": true,
+    "hold_active": false,
+    "hold_started_ms": null,
+    "hold_reason": null,
+    "recovery_deadline_ms": null
+  },
+  "navigation": {
+    "received_ms": 0,
+    "fresh": false,
+    "goal_intent": null,
+    "last_result": null,
+    "path_viable": false,
+    "safe_steering_min": 0.0,
+    "safe_steering_max": 0.0,
+    "speed_cap_mps": 0.0,
+    "no_progress": false,
+    "dead_end": false
+  },
+  "geofence": {
+    "car_geofence_id": null,
+    "car_inside": null,
+    "car_distance_to_boundary_cm": null,
+    "localization_valid_for_containment": false,
+    "breach_confirmed": false
+  },
+  "perception_lifecycle": {
+    "detector": {},
+    "recording": {},
+    "stream": {},
+    "camera": {}
+  },
+  "system": {
+    "thermal_state": "unknown",
+    "control_loop_seq": 0,
+    "control_rate_hz": 0.0,
+    "watchdog_ok": true,
+    "threads": {}
+  },
+  "fsm": {
+    "state": "IDLE",
+    "previous_state": null,
+    "state_entered_ms": 0,
+    "saved_objective": null,
+    "brake_reverse_phase": null,
+    "brake_reverse_attempts": 0,
+    "latched_failsafe_causes": []
+  },
+  "command": {
+    "last_command_id": null,
+    "last_message_type": null,
+    "last_applied": null,
+    "last_reason": null,
+    "last_applied_control_seq": null
+  },
+  "decision": {
+    "requested_state": "IDLE",
+    "requested_speed_mps": 0.0,
+    "applied_speed_mps": 0.0,
+    "speed_caps_mps": [],
+    "requested_steering": 0.0,
+    "safe_steering_min": 0.0,
+    "safe_steering_max": 0.0,
+    "applied_steering": 0.0,
+    "applied_drive_normalized": 0.0,
+    "command_source": "none",
+    "zero_motion_vetoes": [],
+    "reason": "init"
+  }
+}
+```
+
+### 15.3 DecisionEngine dataclasses
+
+`DecisionInput` is built from one immutable snapshot and excludes the previous
+`decision` group:
+
 ```python
 @dataclass(frozen=True)
 class DecisionInput:
     now_ms: int
     overhead: OverheadState
     home: HomeState
+    mission: MissionState
     vision: VisionState
-    range: RangeState
+    lidar: LidarState
+    ultrasonic: UltrasonicState
+    sensor_health: SensorHealthState
     navigation: NavigationState
+    geofence: GeofenceState
+    perception_lifecycle: PerceptionLifecycleState
     system: SystemState
     fsm: FSMSnapshot
     command: CommandState
 ```
 
-`FSMSnapshot` is the dataclass that wraps the `fsm` shared-state group. It is named distinctly from the `FsmState` enum to avoid case-only collisions in code.
-
-Rules:
-- `DecisionInput` is immutable for the duration of a control tick.
-- It is built from a coherent `SharedState` snapshot.
-- It must not include previous `decision` output.
-
-### 9.3 DecisionOutput
 ```python
 @dataclass(frozen=True)
 class DecisionOutput:
     timestamp_ms: int
     requested_state: str
-    speed: float
-    steering: float
-    brake: bool
+    requested_speed_mps: float
+    applied_speed_mps: float
+    speed_caps_mps: list[str]
+    requested_steering: float
+    safe_steering_min: float
+    safe_steering_max: float
+    applied_steering: float
+    applied_drive_normalized: float
+    command_source: str
+    zero_motion_vetoes: list[str]
     reason: str
-    active_constraints: list[str]
-    target_x: float | None = None
-    target_y: float | None = None
-    target_source: str | None = None
     rejected_transition: bool = False
 ```
 
-### 9.4 Field Rules
-- `requested_state`: requested FSM state.
-- `speed`: normalized `-1.0..1.0`.
-- `steering`: normalized `-1.0..1.0`.
-- `brake`: hard stop / braking request.
-- `reason`: machine-readable decision reason.
-- `active_constraints`: list of active limiters, fallbacks, or vetoes.
-- `target_x`, `target_y`: optional debug target coordinates in centimeters.
-- `target_source`: optional target source identifier.
-- `rejected_transition`: set when FSM rejects a requested transition.
-
 Allowed `requested_state` values:
+
 - `HOME`
 - `IDLE`
-- `CHASE_A`
-- `TRACK_B`
-- `BRAKE`
+- `GETTING_CLOSE`
+- `SEARCH`
+- `CHASE`
+- `BRAKE_REVERSE`
 - `GOTO`
 - `RETURN_HOME`
 - `FAILSAFE`
 
-Allowed `target_source` values:
-- `cat_global`
-- `cat_local`
-- `home`
-- `go_to`
+Allowed `command_source` values:
+
+- `nav2_policy`
+- `direct_reverse`
+- `zero_motion`
 - `none`
 
-### 9.5 Example Active Constraints
-- `overhead_stale`
-- `obstacle_veto`
-- `thermal_speed_limit`
-- `camera_lost`
-- `range_stale`
-- `navigation_stale`
-- `home_missing`
-- `tracking_invalid`
-- `failsafe_active`
+## 16. Telemetry contract
 
-### 9.6 Example Output
-```json
-{
-  "timestamp_ms": 123458000,
-  "requested_state": "CHASE_A",
-  "speed": 0.5,
-  "steering": 0.2,
-  "brake": false,
-  "reason": "global_chase",
-  "active_constraints": ["navigation_constraint"],
-  "target_x": 230.0,
-  "target_y": 410.0,
-  "target_source": "cat_global",
-  "rejected_transition": false
-}
-```
+Telemetry is structured JSON Lines (`JSONL`). Each line is one event object.
 
-## 10. Step 7: FSM States, Events, Transition Rules, and Reason Codes
-**Status:** Done
+Rules:
 
-### 10.1 Final Decision
-`SEARCH` is not part of the V1 FSM. `start_chase` is accepted only after both car and cat tracking are valid, so the car can transition directly to `CHASE_A`.
+- logging uses a bounded async queue;
+- low-priority events may be dropped if the queue is full;
+- safety, failsafe, command, mission-event, transition, and control-sequence events
+  are high priority and SHOULD be preserved whenever possible;
+- systemd journal may receive human-readable service logs, but replay/tuning uses
+  JSONL telemetry.
 
-`GOTO` is a separate state for the `go_to` command. It is distinct from `RETURN_HOME`.
-
-Obstacle distance `<10 cm` is not a `BRAKE` condition. It is a safety condition that transitions to `FAILSAFE` with reason `obstacle_too_close`.
-
-### 10.2 States
-- `HOME`: car is at home position after successful return-home.
-- `IDLE`: stopped, safe, not chasing, not necessarily at home.
-- `CHASE_A`: global overhead-guided chase.
-- `TRACK_B`: local camera-guided chase.
-- `BRAKE`: final dToF-based cat stopping phase.
-- `GOTO`: navigating to a supplied coordinate.
-- `RETURN_HOME`: navigating to supplied home coordinates.
-- `FAILSAFE`: emergency stop / unrecoverable safety state.
-
-### 10.3 Events
-- `start_chase_accepted`
-- `stop_chase_accepted`
-- `return_home_accepted`
-- `go_to_accepted`
-- `emergency_stop_accepted`
-- `clear_failsafe_accepted`
-- `cat_visible_stable`
-- `cat_lost`
-- `final_approach_ready`
-- `brake_aborted_cat_moved`
-- `go_to_complete`
-- `return_home_complete`
-- `failsafe_triggered`
-- `obstacle_too_close`
-- `transition_rejected`
-
-### 10.4 Transition Rules
-| From | To | Trigger |
-|---|---|---|
-| `HOME` | `CHASE_A` | `start_chase_accepted` |
-| `IDLE` | `CHASE_A` | `start_chase_accepted` |
-| `CHASE_A` | `TRACK_B` | `cat_visible_stable` |
-| `TRACK_B` | `CHASE_A` | `cat_lost` |
-| `TRACK_B` | `BRAKE` | `final_approach_ready` |
-| `BRAKE` | `TRACK_B` | `brake_aborted_cat_moved` |
-| `HOME` | `GOTO` | `go_to_accepted` |
-| `IDLE` | `GOTO` | `go_to_accepted` |
-| `GOTO` | `IDLE` | `go_to_complete` |
-| any chase state | `IDLE` | `stop_chase_accepted` |
-| any non-failsafe state | `RETURN_HOME` | `return_home_accepted` |
-| `RETURN_HOME` | `HOME` | `return_home_complete` |
-| any state | `FAILSAFE` | `obstacle_too_close` |
-| any state | `FAILSAFE` | `failsafe_triggered` |
-| `FAILSAFE` | `IDLE` | `clear_failsafe_accepted` |
-
-Any transition not listed above is rejected by the FSM.
-
-### 10.5 Chase State Set
-The chase state set is:
-- `CHASE_A`
-- `TRACK_B`
-- `BRAKE`
-
-`stop_chase_accepted` from any chase state transitions to `IDLE`.
-
-### 10.6 Reason Codes
-Recommended V1 reason codes:
-- `start_chase_accepted`
-- `start_chase_rejected`
-- `global_chase`
-- `local_track`
-- `final_approach`
-- `brake_complete`
-- `brake_aborted_cat_moved`
-- `cat_lost_fallback`
-- `stop_chase_accepted`
-- `return_home_accepted`
-- `return_home_complete`
-- `go_to_accepted`
-- `go_to_complete`
-- `obstacle_too_close`
-- `obstacle_veto`
-- `overhead_stale`
-- `overhead_expired`
-- `camera_lost`
-- `tracking_invalid`
-- `home_missing`
-- `failsafe_triggered`
-- `clear_failsafe_accepted`
-- `transition_rejected`
-
-### 10.7 Rejected Transition Behavior
-When a transition is rejected:
-- FSM records `last_rejected_transition`.
-- `DecisionOutput.rejected_transition` is set to `true`.
-- Telemetry logs the rejected transition.
-- Motor output must hold the current safe command or safe-stop.
-- Rejected transitions must never produce raw or stale motor output.
-
-## 11. Step 8: Telemetry Event Schema
-**Status:** Done
-
-### 11.1 Final Decision
-Telemetry is written as structured JSON Lines (`JSONL`). Each line is one event object.
-
-Telemetry must be safe for real-time operation:
-- logging uses a bounded async queue
-- low-priority events may be dropped if the queue is full
-- safety, failsafe, command, and transition events are high priority and should be preserved whenever possible
-
-Systemd journal may receive human-readable service logs, but replay/tuning uses JSONL telemetry.
-
-### 11.2 Common Event Envelope
-Every telemetry event uses this envelope:
+### 16.1 Common event envelope
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "event_id": "evt-000001",
-  "event_type": "decision",
+  "event_type": "state_transition",
   "timestamp_ms": 123458000,
   "monotonic_ms": 987654321,
-  "state": "CHASE_A",
-  "source": "DecisionEngine",
+  "state": "GETTING_CLOSE",
+  "source": "FSM",
   "severity": "info",
+  "applied_control_seq": 88210,
   "data": {}
 }
 ```
 
-Field rules:
-- `schema_version`: telemetry schema version. V1 uses `1`.
-- `event_id`: unique event ID generated by the car runtime.
-- `event_type`: event category.
-- `timestamp_ms`: wall/sender timestamp when available.
-- `monotonic_ms`: local monotonic timestamp; required for ordering.
-- `state`: current FSM state at event time.
-- `source`: module that emitted the event.
-- `severity`: `debug`, `info`, `warning`, `error`, or `critical`.
-- `data`: event-specific payload.
+`monotonic_ms` is authoritative for ordering inside PiCar-X telemetry.
 
-`monotonic_ms` is the authoritative ordering and elapsed-time field inside PiCar-X telemetry. `timestamp_ms` is used for cross-device correlation with overhead logs.
+### 16.2 Required event types
 
-### 11.3 Required Event Types
-V1 telemetry event types:
 - `state_transition`
 - `transition_rejected`
 - `decision`
 - `command_received`
+- `command_applied`
 - `command_ack`
-- `tracking_received`
-- `tracking_stale`
+- `mission_event_received`
+- `mission_event_applied`
+- `mission_event_ack`
+- `overhead_observation_received`
+- `overhead_invalid`
 - `vision_update`
-- `range_update`
-- `obstacle_veto`
+- `lidar_update`
+- `ultrasonic_update`
+- `sensor_health_hold`
+- `sensor_health_failsafe`
+- `navigation_goal`
+- `navigation_result`
+- `geofence`
+- `perception_lifecycle`
+- `recording`
+- `stream`
+- `brake_reverse_phase`
 - `failsafe`
 - `thermal`
 - `thread_health`
 - `motor_command`
+- `control_tick`
 
-### 11.4 `state_transition`
+### 16.3 Example events
+
+`state_transition`:
+
 ```json
 {
   "event_type": "state_transition",
@@ -1021,589 +1437,248 @@ V1 telemetry event types:
   "severity": "info",
   "data": {
     "from_state": "IDLE",
-    "to_state": "CHASE_A",
-    "reason": "start_chase_accepted"
+    "to_state": "GETTING_CLOSE",
+    "reason": "START_CHASE_ACCEPTED",
+    "target_id": "cat-17",
+    "home_version_frozen": 4
   }
 }
 ```
 
-### 11.5 `transition_rejected`
+`mission_event_applied`:
+
 ```json
 {
-  "event_type": "transition_rejected",
-  "source": "FSM",
-  "severity": "warning",
+  "event_type": "mission_event_applied",
+  "source": "CommsManager",
+  "severity": "info",
   "data": {
-    "from_state": "IDLE",
-    "to_state": "BRAKE",
-    "reason": "transition_rejected",
-    "cause": "invalid_transition"
+    "event_id": "evt-31bd",
+    "name": "PRIMARY_CAT_LEFT_PERIMETER",
+    "target_id": "cat-17",
+    "applied": true,
+    "resulting_state": "IDLE",
+    "reason": "PRIMARY_TARGET_EXIT_HANDOFF"
   }
 }
 ```
 
-### 11.6 `decision`
+`decision`:
+
 ```json
 {
   "event_type": "decision",
   "source": "DecisionEngine",
   "severity": "debug",
   "data": {
-    "requested_state": "CHASE_A",
-    "speed": 0.5,
-    "steering": 0.2,
-    "brake": false,
-    "reason": "global_chase",
-    "active_constraints": ["navigation_constraint"],
-    "target_x": 230.0,
-    "target_y": 410.0,
-    "target_source": "cat_global"
+    "requested_state": "CHASE",
+    "requested_speed_mps": 0.22,
+    "applied_speed_mps": 0.18,
+    "speed_caps_mps": ["nav2_speed_cap", "alignment_speed_cap"],
+    "requested_steering": 0.31,
+    "safe_steering_min": -0.35,
+    "safe_steering_max": 0.35,
+    "applied_steering": 0.31,
+    "applied_drive_normalized": 0.36,
+    "command_source": "nav2_policy",
+    "zero_motion_vetoes": []
   }
 }
 ```
 
-### 11.7 `command_received`
+`navigation_goal`:
+
 ```json
 {
-  "event_type": "command_received",
-  "source": "CommsManager",
+  "event_type": "navigation_goal",
+  "source": "NavigationManager",
   "severity": "info",
   "data": {
-    "sequence": 2002,
-    "command_id": "cmd-0002",
-    "command": "start_chase"
+    "goal_intent_id": "gi-0042",
+    "objective_type": "GETTING_CLOSE",
+    "target_id": "cat-17",
+    "moving_goal": true,
+    "action_goal_id": "nav2-goal-991"
   }
 }
 ```
 
-### 11.8 `command_ack`
-```json
-{
-  "event_type": "command_ack",
-  "source": "CommsManager",
-  "severity": "info",
-  "data": {
-    "ack_sequence": 2002,
-    "command_id": "cmd-0002",
-    "status": "accepted",
-    "reason": "start_chase_accepted",
-    "cause": null
-  }
-}
-```
+Every transition, hold, retry, consumer reference, goal correlation, and applied
+command MUST be reconstructable from telemetry.
 
-### 11.9 `tracking_received`
-```json
-{
-  "event_type": "tracking_received",
-  "source": "CommsManager",
-  "severity": "debug",
-  "data": {
-    "sequence": 1001,
-    "packet_age_ms": 35,
-    "car_confidence": 1.0,
-    "cat_confidence": 1.0
-  }
-}
-```
+## 17. Target configuration defaults
 
-### 11.10 `tracking_stale`
-```json
-{
-  "event_type": "tracking_stale",
-  "source": "CommsManager",
-  "severity": "warning",
-  "data": {
-    "packet_age_ms": 350,
-    "threshold_ms": 300,
-    "reason": "overhead_stale"
-  }
-}
-```
+Environment names MUST use the `CAT_FOLLOW_*` namespace.
 
-### 11.11 `vision_update`
-```json
-{
-  "event_type": "vision_update",
-  "source": "VisionTracker",
-  "severity": "debug",
-  "data": {
-    "cat_visible": true,
-    "cat_visible_stable": true,
-    "x_offset_norm": -0.15,
-    "confidence": 1.0
-  }
-}
-```
+| Configuration | Default | Meaning |
+|---|---:|---|
+| `CAT_FOLLOW_SEARCH_ENTRY_DISTANCE_CM` | `200` | Enter SEARCH at or below this valid overhead distance |
+| `CAT_FOLLOW_SEARCH_SPEED_CAP_MPS` | `0.10` | SEARCH and retained-goal speed cap |
+| `CAT_FOLLOW_SEARCH_LOCK_OBSERVATIONS` | `3` | Consecutive unambiguous associated observations |
+| `CAT_FOLLOW_SEARCH_INTERVAL_SEC` | `10` | Each of the two SEARCH intervals |
+| `CAT_FOLLOW_LOCAL_TRACK_STALE_MS` | `350` | Local track expiration threshold |
+| `CAT_FOLLOW_OVERHEAD_INVALID_MAX_SEC` | `10` | Last valid goal retention in GETTING_CLOSE/SEARCH |
+| `CAT_FOLLOW_SENSOR_RECOVERY_SEC` | `2` | Required-sensor zero-motion recovery interval |
+| `CAT_FOLLOW_HANDOFF_WAIT_SEC` | `10` | IDLE wait after primary target exit |
+| `CAT_FOLLOW_RECORDING_POSTROLL_SEC` | `10` | Recording post-roll after chase stop/exit |
+| `CAT_FOLLOW_NAV_MOVING_GOAL_MAX_HZ` | `2` | Maximum moving-target goal submission rate |
+| `CAT_FOLLOW_NAV_MOVING_GOAL_MIN_DISPLACEMENT_CM` | `25` | Minimum displacement for a normal refresh |
+| `CAT_FOLLOW_NAV_COMPLETION_XY_CM` | `20` | Local-pose XY completion tolerance |
+| `CAT_FOLLOW_NAV_COMPLETION_YAW_RAD` | `0.3` | Local-pose yaw completion tolerance |
+| `CAT_FOLLOW_NAV_COMPLETION_DWELL_SEC` | `1` | Continuous in-tolerance dwell |
+| `CAT_FOLLOW_BRAKE_REVERSE_TRIGGER_CM` | `15` | Trigger on fresh valid reading strictly below this |
+| `CAT_FOLLOW_BRAKE_REVERSE_SETTLE_MS` | `100` | Centered, stopped settle before reverse |
+| `CAT_FOLLOW_BRAKE_REVERSE_DURATION_SEC` | `0.5` | Bounded reverse duration |
+| `CAT_FOLLOW_BRAKE_REVERSE_NORMALIZED` | `-0.30` | Direct normalized reverse command |
+| `CAT_FOLLOW_BRAKE_REVERSE_MAX_ATTEMPTS` | `3` | Maximum actual reverse phases before failsafe |
+| `CAT_FOLLOW_BRAKE_REVERSE_RESET_CM` | `20` | Both sources must be strictly above this to reset |
+| `CAT_FOLLOW_BRAKE_REVERSE_RESET_SEC` | `2` | Continuous dual-source clearance duration |
+| `CAT_FOLLOW_NAV_ULTRASONIC_COSTMAP` | `1` | Enable validated RangeSensorLayer integration |
+| `CAT_FOLLOW_NAV2_BACKUP_ENABLED` | `0` | Nav2 BackUp disabled and MUST remain disabled |
+| `CAT_FOLLOW_COMMAND_ACK_TIMEOUT_MS` | `200` | Command/event retry timeout |
+| `CAT_FOLLOW_COMMAND_MAX_RETRIES` | `5` | Max command/event retries |
+| `CAT_FOLLOW_COMMAND_ID_CACHE_SIZE` | `100` | Processed command/event cache size |
+| `CAT_FOLLOW_OVERHEAD_MIN_CONFIDENCE` | deployment-calibrated | Minimum valid car/cat confidence |
+| `CAT_FOLLOW_ASSOCIATION_BEARING_GATE_RAD` | deployment-calibrated | Base uncertainty gate for SEARCH association |
+| `CAT_FOLLOW_RECORDING_QUOTA_BYTES` | deployment-required | Maximum retained finalized recording bytes |
+| `CAT_FOLLOW_RECORDING_MIN_FREE_BYTES` | deployment-required | Free-space reserve below which recording stops |
 
-### 11.12 `range_update`
-```json
-{
-  "event_type": "range_update",
-  "source": "RangeSafety",
-  "severity": "debug",
-  "data": {
-    "backend": "lidar_c1",
-    "distance_cm": 42.0,
-    "confidence": 1.0,
-    "obstacle_detected": true,
-    "obstacle_critical": false,
-    "obstacle_severity": 0.4
-  }
-}
-```
+Input freshness limits for lidar, ultrasonic, localization, overhead, and motor
+feedback MUST also be explicit deployment configuration validated against measured
+publication rates. No component may silently substitute a different timeout.
 
-### 11.13 `obstacle_veto`
-```json
-{
-  "event_type": "obstacle_veto",
-  "source": "RangeSafety",
-  "severity": "warning",
-  "data": {
-    "distance_cm": 8.0,
-    "obstacle_severity": 1.0,
-    "reason": "obstacle_too_close"
-  }
-}
-```
+Superseded constants that MUST NOT be used as normative target behavior:
 
-### 11.14 `failsafe`
-```json
-{
-  "event_type": "failsafe",
-  "source": "SafetySupervisor",
-  "severity": "critical",
-  "data": {
-    "reason": "obstacle_too_close",
-    "previous_state": "TRACK_B",
-    "motor_command": "emergency_stop"
-  }
-}
-```
+- `OVERHEAD_STALE_FAILSAFE_MS = 700`
+- `OBSTACLE_TOO_CLOSE_CM = 10`
+- `CAMERA_LOSS_FALLBACK_MS`-driven `TRACK_B -> CHASE_A` fallback
+- bicycle/wheel odometry fallback constants
 
-### 11.15 `thermal`
-```json
-{
-  "event_type": "thermal",
-  "source": "Runtime",
-  "severity": "warning",
-  "data": {
-    "thermal_c": 80.5,
-    "thermal_state": "speed_limited",
-    "reason": "thermal_speed_limit"
-  }
-}
-```
+## 18. Current implementation gaps
 
-### 11.16 `thread_health`
-```json
-{
-  "event_type": "thread_health",
-  "source": "Runtime",
-  "severity": "warning",
-  "data": {
-    "thread": "CatFollow-Vision",
-    "alive": false,
-    "last_seen_ms": 123457000,
-    "reason": "thread_stale"
-  }
-}
-```
+The current repository does **not** implement this target contract. Known gaps
+include:
 
-### 11.17 `motor_command`
-```json
-{
-  "event_type": "motor_command",
-  "source": "MotorInterface",
-  "severity": "debug",
-  "data": {
-    "speed": 0.4,
-    "steering": -0.2,
-    "brake": false,
-    "reason": "global_chase"
-  }
-}
-```
+1. **Resolved.** `cat_follow/control/types.py` and `cat_follow/control/fsm.py`
+   implement the canonical states (`GETTING_CLOSE`, `SEARCH`, `CHASE`,
+   `BRAKE_REVERSE`, `GOTO`, `RETURN_HOME`, `FAILSAFE`, `HOME`, `IDLE`) and this
+   `FSM` is the live control authority instantiated in `cat_follow/runtime/app.py`.
+   `CHASE_A`, `TRACK_B`, and `BRAKE` remain only as backward-compatible wire
+   aliases for legacy V1 integrations (`FsmState._missing_`), not as the
+   internal state representation. Full transition-table parity against this
+   document's section 10 has not been independently re-audited.
+2. **Resolved.** `DecisionEngine.close_obstacle_trigger_cm`
+   (`cat_follow/control/decision_engine.py`) uses
+   `max(target_config.brake_reverse_trigger_cm, safety_config.obstacle_too_close_cm)`
+   (15 cm target threshold vs. the 10 cm operator-facing floor, whichever is more
+   conservative) and triggers the recoverable `BRAKE_REVERSE` FSM state via
+   `FsmEvent.BRAKE_REVERSE_TRIGGERED`; a routine close-obstacle event no longer
+   latches `FAILSAFE`.
+3. Current chase overhead expiry uses an approximately 700 ms failsafe rather than
+   state-specific retained-goal, local-track, and return behavior.
+4. The ROS navigation bridge lacks the required complete `NavigationManager`
+   moving-goal output, refresh, cancel, correlation, and completion behavior.
+5. **Partially resolved.** `DecisionEngine._navigation_drive_output` implements the
+   non-additive fusion: in `CHASE` the camera request is clamped to the Nav2
+   `safe_steering_min`/`safe_steering_max` envelope (never summed with
+   `path_correction`), an inverted envelope stops the car, and speed is the
+   minimum of the planner limit and every applied cap. The producer side of that
+   envelope still depends on the `NavigationManager` work in gap 4.
+6. The camera prototype is effectively always active rather than managed by named
+   consumers, reference counts, and STREAMOFF/STREAMON readiness.
+7. Detector activation is primarily PhaseMachine/motion-gated rather than
+   mission-policy-required in SEARCH/CHASE and requested GOTO.
+8. Hardware H.264 segmented Matroska recording, storage quota, reserve, crash
+   recovery, post-roll, and degraded retry are not implemented.
+9. The protocol lacks stable `target_id` on overhead cats/selection and chase
+   commands.
+10. The reliable ACKed `mission_event` envelope and
+    `PRIMARY_CAT_LEFT_PERIMETER` transaction do not exist.
+11. `PerceptionLifecycleManager` and the specified `NavigationManager` do not exist
+    as target ownership boundaries.
+12. Durable versioned home, active-mission home freezing, and transactional
+    `SET_HOME` acceptance are incomplete or absent.
+13. Startup overhead pose seeding/validation followed by local authoritative
+    localization is not implemented as specified.
+14. Ultrasonic is not fully published/validated as `sensor_msgs/Range` and
+    integrated through a validated local-costmap `RangeSensorLayer`.
+15. **Resolved.** `DecisionEngine.tick` holds zero motion while either required
+    sensor is unhealthy in a normal driving state, escalates to `FAILSAFE` once
+    the hold exceeds `CAT_FOLLOW_SENSOR_RECOVERY_SEC`, reports
+    `sensor_health_degraded` without motion in stationary `HOME`/`IDLE`, and
+    enters `FAILSAFE` immediately when either source is unhealthy during
+    `BRAKE_REVERSE`.
+16. Current completion does not require correlated Nav2 success plus fresh local
+    pose tolerance for one second.
+17. Current thermal, handoff, target-identity, SEARCH association/timeout, and
+    direct CHASE-loss transitions are incomplete.
+18. Existing documents and code may still claim bicycle odometry fallback, final
+    `BRAKE`, MJPEG/software fallback, predictive geofence veto, or blanket inherited
+    timing. Those claims are superseded by this target contract.
 
-### 11.18 Severity Rules
-- `debug`: high-volume diagnostics, may be dropped first.
-- `info`: normal state/command events.
-- `warning`: degraded behavior, stale data, veto conditions.
-- `error`: recoverable runtime errors.
-- `critical`: failsafe and emergency-stop events.
+These are migration gaps, not permission to partially reinterpret the target.
 
-High-priority events:
-- `state_transition`
-- `transition_rejected`
-- `command_received`
-- `command_ack`
-- `obstacle_veto`
-- `failsafe`
+## 19. Thread synchronization rules
 
-These should be preserved ahead of `debug` telemetry when the queue is under pressure.
-
-If a telemetry sink fails after events have been dequeued, the failed batch is
-placed in a bounded retry buffer and retried before newer events. Overflow
-evicts the lowest-severity records first; CRITICAL failsafe/emergency-stop
-records are the last to be discarded.
-
-## 12. Step 9: Thread Synchronization Rules
-**Status:** Done
-
-### 12.1 Final Decision
 `SharedState` is the only cross-thread data contract for runtime state.
 
-Each `SharedState` group has exactly one authoritative writer. Readers may consume snapshots but must not mutate state groups they do not own.
-
-### 12.2 Writer Ownership
-| SharedState Group | Authoritative Writer |
-|---|---|
-| `overhead` | `CommsManager` |
-| `home` | `CommsManager` |
-| `vision` | `VisionTracker` |
-| `range` | `RangeSafety` |
-| `navigation` | `Navigation` |
-| `system` | `Runtime` / health monitor |
-| `fsm` | `FSM` |
-| `command` | `CommsManager` / command handler |
-| `decision` | `DecisionEngine` |
-
 Rules:
-- Only the authoritative writer may update its group.
-- Cross-group writes are forbidden unless explicitly listed above.
-- `DecisionEngine` may request FSM transitions, but only `FSM` writes `fsm`.
-- `DecisionEngine` writes `decision`, but does not directly mutate sensor/input groups.
 
-### 12.3 Snapshot Read Rules
-The control loop must read a coherent snapshot once per tick.
-
-Rules:
-- `DecisionEngine` reads one `SharedState` snapshot at the start of a control tick.
-- That snapshot is immutable for the duration of the tick.
-- `DecisionEngine` must not read individual groups again mid-tick.
-- `DecisionEngine` input excludes the previous `decision` group.
-- `MotorInterface` consumes the validated `decision` output, not raw perception state.
-
-### 12.4 Update Atomicity
-Writers must publish complete group updates atomically.
-
-Rules:
-- No partial group updates are visible to readers.
-- Metadata and payload update together.
-- `timestamp_ms`, `received_ms`, `fresh`, `authority`, and payload fields must describe the same sample/update.
-- If a group update fails validation, the previous valid group value remains active and an error/warning telemetry event is emitted.
-
-### 12.5 Locking Policy
-Implementation may use per-group locks, copy-on-write snapshots, or immutable dataclass replacement.
-
-Required behavior:
-- Writers hold locks only long enough to replace one group.
-- Readers must not hold locks while running control logic.
-- No thread may hold multiple group locks at once unless a later implementation doc defines a lock ordering rule.
-- Avoid calling external I/O, camera APIs, motor APIs, or telemetry flushing while holding a state lock.
+- each group has exactly one authoritative writer;
+- writers publish complete group updates atomically;
+- the control loop reads one coherent snapshot once per tick;
+- readers MUST NOT hold locks while running control logic;
+- command and mission-event deduplication caches MUST survive at least the max retry
+  window;
+- telemetry MUST NOT block the control loop;
+- shutdown coordinates safe stop before process exit.
 
 Recommended implementation:
-- Use per-group immutable dataclass instances.
-- Writer builds a new group object outside the lock.
-- Writer acquires the group lock and swaps the object.
-- Snapshot reader briefly acquires locks or a snapshot lock, copies references, then releases locks before running decisions.
 
-### 12.6 Freshness Calculation
-Freshness is computed by the reader or shared-state helper using PiCar-X local monotonic time:
+- per-group immutable dataclass instances;
+- writer builds a new group object outside the lock;
+- writer acquires the group lock and swaps the object;
+- snapshot reader copies references under brief lock acquisition before decisions.
 
-```text
-age_ms = now_monotonic_ms - received_ms
-```
+## 20. Coordinate conventions
 
-Rules:
-- Do not compute safety freshness from producer `timestamp_ms`.
-- `timestamp_ms` is for log correlation and latency analysis.
-- `received_ms` is authoritative for timeout/failsafe decisions.
-- `fresh` may be stored for convenience, but it must be recomputed or validated against current monotonic time when consumed.
+### 20.1 Yard frame
 
-### 12.7 Command Idempotency Cache
-The command handler must keep a bounded cache of processed command results keyed by `command_id`.
+Overhead yard positions use a calibrated yard frame:
 
-Rules:
-- Duplicate command retries must not re-execute side effects.
-- Duplicate command retries must send ACK for the newly received `ack_sequence`.
-- Duplicate command retries reuse the original `status`, `reason`, and `cause`.
-- Cache entries may expire after a safe retention window, but the window must be longer than the max command retry window.
+- units: centimeters;
+- origin: fixed overhead-calibrated yard origin;
+- `+X`: right in the yard;
+- `+Y`: forward in the yard;
+- coordinates are planar ground-plane coordinates.
 
-V1 retention:
-- Keep the latest `100` command IDs.
-- When the cache exceeds `100` entries, remove the oldest entry.
+The origin MUST NOT move during a run. Calibration changes produce a new
+`calibration_version`.
 
-### 12.8 Telemetry Queue Synchronization
-Telemetry must not block control.
+### 20.2 Navigation frame
 
-Rules:
-- Telemetry uses a bounded async queue.
-- Producers enqueue event objects without blocking the control loop.
-- If queue is full, drop lower-priority `debug` events before high-priority events.
-- `critical` failsafe events should be preserved whenever possible.
-- Telemetry writer thread owns file I/O.
+Nav2 destinations, localization, and completion tolerances use the configured ROS
+navigation frame, default `map`, in meters and radians.
 
-### 12.9 Shutdown Rules
-Shutdown must be coordinated through a shared stop event or lifecycle controller.
+Yard-to-navigation-frame transforms MUST be explicit and versioned. Overhead yard
+coordinates MUST NOT be treated as ROS navigation-frame coordinates without
+calibration.
+
+## 21. Control timing contract
+
+The control loop target rate remains `50 Hz` with a `20 ms` period and a minimum
+degraded rate of `20 Hz`.
 
 Rules:
-- Control thread commands safe stop before process exit.
-- Worker threads exit without holding state locks.
-- Telemetry thread flushes high-priority events if possible.
-- Motor output must be stopped before process termination completes.
 
-## 13. Step 10: Enums and Constants Appendix
-**Status:** Done
+- commands and mission events are applied at control-loop boundaries;
+- ACK commit occurs after application or rejection at that boundary;
+- emergency stop remains synchronous;
+- control-loop watchdog expiration enters `FAILSAFE`;
+- telemetry enqueue MUST NOT run file I/O inside the control tick.
 
-### 13.1 Message Types
-- `tracking`
-- `command`
-- `ack`
+Control timing telemetry SHOULD include:
 
-### 13.2 Command Names
-- `set_home`
-- `start_chase`
-- `stop_chase`
-- `return_home`
-- `go_to`
-- `emergency_stop`
-- `clear_failsafe`
-
-### 13.3 ACK Statuses
-- `accepted`
-- `rejected`
-
-### 13.4 ACK Types
-- `command`
-
-### 13.5 FSM States
-- `HOME`
-- `IDLE`
-- `CHASE_A`
-- `TRACK_B`
-- `BRAKE`
-- `GOTO`
-- `RETURN_HOME`
-- `FAILSAFE`
-
-### 13.6 FSM Events
-- `start_chase_accepted`
-- `stop_chase_accepted`
-- `return_home_accepted`
-- `go_to_accepted`
-- `emergency_stop_accepted`
-- `clear_failsafe_accepted`
-- `cat_visible_stable`
-- `cat_lost`
-- `final_approach_ready`
-- `brake_aborted_cat_moved`
-- `go_to_complete`
-- `return_home_complete`
-- `failsafe_triggered`
-- `obstacle_too_close`
-- `transition_rejected`
-
-### 13.7 Command Rejection Causes
-- `car_position_invalid`
-- `cat_position_invalid`
-- `tracking_stale`
-- `home_missing`
-- `home_invalid`
-- `target_invalid`
-- `motion_unsafe`
-- `failsafe_active`
-- `operator_confirmation_required`
-- `invalid_command`
-- `invalid_params`
-
-### 13.8 Decision Reason Codes
-- `start_chase_accepted`
-- `start_chase_rejected`
-- `global_chase`
-- `local_track`
-- `final_approach`
-- `brake_complete`
-- `brake_aborted_cat_moved`
-- `cat_lost_fallback`
-- `stop_chase_accepted`
-- `return_home_accepted`
-- `return_home_complete`
-- `go_to_accepted`
-- `go_to_complete`
-- `obstacle_too_close`
-- `obstacle_veto`
-- `overhead_stale`
-- `overhead_expired`
-- `camera_lost`
-- `tracking_invalid`
-- `home_missing`
-- `failsafe_triggered`
-- `clear_failsafe_accepted`
-- `transition_rejected`
-
-### 13.9 Target Sources
-- `cat_global`
-- `cat_local`
-- `home`
-- `go_to`
-- `none`
-
-### 13.10 Range Backends
-- `ultrasonic`
-- `lidar_c1`
-- `tmf8829` (on hold; retained for backward compatibility, not used in the current build)
-
-### 13.11 Thermal States
-- `unknown`
-- `normal`
-- `warning`
-- `speed_limited`
-- `critical`
-
-### 13.12 Telemetry Event Types
-- `state_transition`
-- `transition_rejected`
-- `decision`
-- `command_received`
-- `command_ack`
-- `tracking_received`
-- `tracking_stale`
-- `vision_update`
-- `range_update`
-- `obstacle_veto`
-- `failsafe`
-- `thermal`
-- `thread_health`
-- `motor_command`
-
-### 13.13 Telemetry Severities
-- `debug`
-- `info`
-- `warning`
-- `error`
-- `critical`
-
-### 13.14 Numeric Constants
-| Name | Value | Notes |
-|---|---:|---|
-| `TRACKING_RATE_HZ` | `10` | Nominal overhead tracking rate |
-| `OVERHEAD_STALE_WARNING_MS` | `300` | Reduce speed to safe crawl |
-| `OVERHEAD_STALE_FAILSAFE_MS` | `700` | Enter `FAILSAFE` |
-| `CAMERA_LOSS_FALLBACK_MS` | `350` | `TRACK_B -> CHASE_A` |
-| `VISION_STALE_MS` | `350` | Local visual observation expires |
-| `RANGE_STALE_MS` | `500` | `RangeAdapter` / `DecisionEngine` authority TTL for `SharedState.range`. Separate from hardware cache staleness (`CAT_FOLLOW_ULTRASONIC_STALE_AFTER_S=0.250` in the edge worker). Production ROCK 4D path: `edge_ultrasonic.py` → `range_sensor.set_reader()` → `RangeAdapter`. |
-| `LIDAR_STALE_MS` | `500` | Lidar observation expires |
-| `NAVIGATION_STALE_MS` | `500` | Navigation constraints expire |
-| `CMD_VEL_STALE_MS` | `500` | Planner drive terms are cleared |
-| `NO_PROGRESS_RECOVERY_MS` | `2000` | Trigger recovery behavior |
-| `RECOVERY_FAILSAFE_MS` | `5000` | Escalate to `FAILSAFE` |
-| `OBSTACLE_TOO_CLOSE_CM` | `10` | Immediate `FAILSAFE` |
-| `COMMAND_ACK_TIMEOUT_MS` | `200` | Retry command if no ACK |
-| `COMMAND_MAX_RETRIES` | `5` | Mark command channel unhealthy after this |
-| `COMMAND_ID_CACHE_SIZE` | `100` | Latest processed command IDs |
-| `THERMAL_WARNING_C` | `75` | Log thermal warning |
-| `THERMAL_SPEED_LIMIT_C` | `80` | Limit chase speed |
-| `THERMAL_CRITICAL_C` | `85` | Return-home or failsafe |
-| `CONTROL_TARGET_RATE_HZ` | `50` | Target control loop rate |
-| `CONTROL_TARGET_PERIOD_MS` | `20` | Target control loop period |
-| `CONTROL_MIN_DEGRADED_RATE_HZ` | `20` | Below this, reduce speed or stop |
-| `CONTROL_OVERRUN_MS` | `20` | One tick exceeded target budget |
-| `CONTROL_CONSECUTIVE_OVERRUN_LIMIT` | `3` | Emergency-stop and latch `FAILSAFE` |
-| `CONTROL_CRITICAL_OVERRUN_MS` | `100` | Emergency-stop, latch `FAILSAFE`, critical telemetry |
-
-### 13.15 Normalized Ranges
-| Field | Range | Meaning |
-|---|---|---|
-| `decision.speed` | `-1.0..1.0` | reverse to forward |
-| `decision.steering` | `-1.0..1.0` | left to right |
-| `vision.x_offset_norm` | `-1.0..1.0` | left edge to right edge |
-| `navigation.speed_limit` | `0.0..1.0` | blocked to unrestricted |
-| `range.obstacle_severity` | `0.0..1.0` | no risk to critical |
-| `confidence` | `0.0 or 1.0` | V1 binary unusable/usable |
-
-## 14. Coordinate Convention Contract
-**Status:** Done
-
-### 14.1 Yard Frame
-All global positions use the `yard` coordinate frame.
-
-V1 convention:
-- Origin: fixed overhead-calibrated yard origin.
-- Recommended physical origin: bottom-left yard corner from the overhead/operator view.
-- Units: centimeters (`cm`).
-- `+X`: right in the yard.
-- `+Y`: forward in the yard.
-- Coordinates are planar ground-plane coordinates.
-
-The origin must not move during a run. If overhead calibration changes, the runtime must treat that as a new coordinate frame/configuration.
-
-### 14.2 Heading Convention
-Heading fields use radians.
-
-V1 convention:
-- `heading = 0` points along `+X`.
-- Positive heading rotates counter-clockwise toward `+Y`.
-- Heading is normalized to `[-pi, pi)`.
-- Overhead `car.heading` is optional and non-authoritative.
-- `Navigation` owns authoritative car-local heading (`theta`).
-
-Examples:
-- `0 rad`: facing `+X`.
-- `pi / 2 rad`: facing `+Y`.
-- `pi rad` or `-pi rad`: facing `-X`.
-- `-pi / 2 rad`: facing `-Y`.
-
-### 14.3 Coordinate Consumers
-All modules must use this same convention:
-- `CommsManager`
-- `DecisionEngine`
-- `Navigation`
-- `MotorInterface`
-- telemetry/replay tools
-- web UI visualization
-- validation tests
-
-Any coordinate transform from camera pixels, local camera frame, dToF zone frame, or motor/robot frame must explicitly convert into this convention before publishing to `SharedState`.
-
-## 15. Control Timing Contract
-**Status:** Done
-
-### 15.1 Control Loop Rate
-The `CatFollow-Control` thread runs the `DecisionEngine` and FSM validation.
-
-V1 timing:
-- Target rate: `50 Hz`.
-- Target period: `20 ms`.
-- Minimum degraded rate: `20 Hz`.
-- Timing is measured with PiCar-X local monotonic time.
-
-### 15.2 Per-Tick Budget
-| Operation | Budget |
-|---|---:|
-| Snapshot acquire | `<1 ms` |
-| Freshness evaluation | `<1 ms` |
-| `DecisionEngine` | `<5 ms` |
-| FSM validation | `<1 ms` |
-| Motor command write | `<2 ms` |
-| Telemetry enqueue | `<1 ms` |
-| Total control tick | `<20 ms` |
-
-Telemetry file I/O must not run inside the control tick. It is handled by the async telemetry thread.
-
-### 15.3 Tick Overrun Behavior
-An overrun occurs when one control tick exceeds `20 ms`.
-
-Rules:
-- Single overrun: emit `control_tick_overrun` telemetry with measured duration.
-- `3` consecutive overruns: emergency-stop, latch `FAILSAFE`, and emit critical telemetry.
-- Any tick over `100 ms`: emergency-stop, latch `FAILSAFE`, and emit critical telemetry.
-- Any unhandled control-tick exception: emergency-stop and latch `FAILSAFE`.
-- Once latched, later healthy ticks must not re-drive; only an accepted operator
-  `clear_failsafe` command may leave `FAILSAFE`.
-
-### 15.4 Timing Telemetry
-Control timing telemetry should include:
 - `tick_duration_ms`
 - `snapshot_ms`
 - `decision_ms`
@@ -1612,34 +1687,71 @@ Control timing telemetry should include:
 - `telemetry_enqueue_ms`
 - `overrun_count`
 - `control_rate_hz`
+- `applied_control_seq`
 
-### 15.5 Missed Tick Safety
-If the control loop cannot run at or above the minimum degraded rate (`20 Hz`), the system must reduce speed or stop.
+## 22. Enums and constants appendix
 
-Safety rule:
-- stale control output must not continue driving indefinitely.
-- if fresh decisions cannot be produced, `MotorInterface` must receive a safe stop or emergency stop depending on current safety state.
+### 22.1 Protocol message types
 
-## 16. Final Consistency Pass
-**Status:** Done
+- `overhead_observation`
+- `command`
+- `mission_event`
+- `ack`
 
-A consistency scan was performed across:
-- PRD
-- HLD
-- Detailed Software Architecture
-- Validation Matrix
-- System Architecture
-- Interface and Data Contract Specification
+### 22.2 Command names
 
-Verified:
-- `SEARCH` is not part of the V1 FSM.
-- `GOTO` is included where `go_to` is supported.
-- `stop_chase` transitions chase behavior to `IDLE`, not `RETURN_HOME`.
-- `return_home` transitions to `RETURN_HOME` and then `HOME` after completion.
-- Coordinates and distances use centimeters (`cm`).
-- Coordinate convention is fixed: `yard` frame, `+X` right, `+Y` forward, heading `0` along `+X`, positive CCW, radians normalized to `[-pi, pi)`.
-- Control timing contract is defined: 50 Hz target, 20 ms tick budget, overrun behavior, and timing telemetry.
-- ACK status values are only `accepted` and `rejected`.
-- Tracking messages are latest-wins and do not use ACK/retry.
-- Command messages use ACK/retry with stable `command_id`.
-- Freshness and failsafe timing use PiCar-X local monotonic receive time.
+- `SET_HOME`
+- `START_CHASE`
+- `STOP_CHASE`
+- `GO_TO`
+- `RETURN_HOME`
+- `CLEAR_FAILSAFE`
+- `EMERGENCY_STOP`
+
+### 22.3 Mission event names
+
+- `PRIMARY_CAT_LEFT_PERIMETER`
+
+### 22.4 FSM states
+
+- `HOME`
+- `IDLE`
+- `GETTING_CLOSE`
+- `SEARCH`
+- `CHASE`
+- `BRAKE_REVERSE`
+- `GOTO`
+- `RETURN_HOME`
+- `FAILSAFE`
+
+### 22.5 Navigation objective types
+
+- `GETTING_CLOSE`
+- `SEARCH`
+- `SEARCH_OBSERVATION`
+- `CHASE`
+- `GOTO`
+- `RETURN_HOME`
+
+### 22.6 Perception camera hardware states
+
+- `closed`
+- `ready_inactive`
+- `active`
+- `faulted`
+
+### 22.7 Thermal states
+
+- `unknown`
+- `normal`
+- `warning`
+- `speed_limited`
+- `critical`
+
+### 22.8 Telemetry severities
+
+- `debug`
+- `info`
+- `warning`
+- `error`
+- `critical`

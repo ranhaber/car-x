@@ -16,3 +16,4 @@ def _enable_bench_control_auth_by_default(monkeypatch):
     """
 
     monkeypatch.setenv(BENCH_AUTH_ENV, "1")
+    monkeypatch.setenv("CAT_FOLLOW_WEB_REQUIRE_H264", "0")

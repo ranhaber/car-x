@@ -1,5 +1,13 @@
 # Software Architecture: Memory Allocation, Shared Memory, and Parallel Processes
 
+> **Legacy prototype document.** This Raspberry Pi/TFLite design is retained
+> only as historical context for the prototype. Production uses the Radxa ROCK
+> 4D, Radxa 4K IMX415 camera, native NV12 frame leases, and RKNN-only inference.
+> The canonical future architecture is
+> `cat_follow/docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`;
+> current frame ownership is documented in
+> `cat_follow/docs/Frame_Ring_Ownership_Audit.md`.
+
 This document defines a **software architecture** for the cat-follow system with:
 
 1. **Pre-allocated memory** at application start (no per-frame alloc in hot paths).
@@ -71,7 +79,7 @@ Use a small **struct** or **NumPy array** (e.g. shape `(2, 5)` for two bboxes + 
 ### 2.3 Odometry and State Machine State
 
 - **Odometry:** (x, y, heading) = 3 floats. Pre-allocate one struct; odometry thread (or main) updates in place.
-- **State machine:** current state (enum/int), target_xy (2 floats), last_bbox (4 floats). Pre-allocate; main thread updates.
+- **State machine:** current state (enum/int), target_xy_cm (2 floats), last_bbox (4 floats). Pre-allocate; main thread updates.
 
 ### 2.4 Queues and Small Buffers
 
@@ -104,7 +112,7 @@ If detector runs in another **process**, use `multiprocessing.shared_memory.Shar
   - `frame_for_detector`: NumPy array (pre-allocated). Main or camera thread copies from `frame_latest` every K frames; detector reads. One lock or atomic “dirty” flag.
   - `bbox_tracker`, `bbox_detector`: 4 float + 1 int each. Writers (tracker, detector) write; main reads. Use one lock for all bbox/valid fields or one lock per bbox.
   - `odometry_xyh`: 3 float. Main or dedicated thread updates; main reads.
-  - `state`, `target_xy`, `last_bbox`: main only.
+  - `state`, `target_xy_cm`, `last_bbox`: main only.
   - `stop_requested`, `cat_location`: set by command poll; main reads and clears.
 
 **Minimize locking:** Use a single **pipeline lock** per “slot” (e.g. lock for “current frame”, lock for “bboxes”) and keep critical sections short (copy pointer or swap index, not heavy work inside lock).

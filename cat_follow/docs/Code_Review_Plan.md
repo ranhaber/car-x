@@ -4,6 +4,10 @@ Use this checklist for every code review in this repository. Review the requeste
 diff (branch, pull request, or uncommitted changes); review the whole repository
 only when explicitly requested.
 
+This document is the review checklist and invariant source. It is not a design
+for an automated review platform. If another review prompt conflicts with this
+file, this file wins.
+
 ## Deliverable
 
 Report findings first, sorted by severity, with:
@@ -18,9 +22,76 @@ Do not change code unless the user separately asks for fixes.
 Bugbot may be used as a high-confidence seed, but it does not replace this
 review.
 
+When a finding depends on incomplete context (dynamic Python call path, missing
+runtime evidence, or unread callee), say so in the finding rather than stating
+it as established fact.
+
+## Scope and context discipline
+
+Prefer the smallest context that still supports a trustworthy review. The
+preferred pack builder is `python tools/ai_review/build_pack.py` (see
+`tools/ai_review/README.md` and `.cursor/skills/ai-code-review`).
+
+1. Changed symbols (functions, methods, classes, ROS callbacks, publishers,
+   subscribers, timers, services), not entire untouched files.
+2. The minimal dependency slice around those symbols: callers, callees, shared
+   globals/buffers, locks, ROS interfaces, and nearby contracts.
+3. Relevant standing invariants and architecture docs named below.
+4. Source beyond that slice only when the slice is insufficient.
+
+Do not re-read the whole repository, whole subsystems, or long prior review
+chats by default. Prefer durable artifacts (this plan, ADRs, ownership audits,
+interface contracts) over conversational memory.
+
+## Semantic change gating
+
+Classify the change before deep review.
+
+Shallow review is enough when the diff is only:
+
+- comments or documentation with no behavior claim change
+- formatting / import reordering
+- pure renames with no semantic change
+- type-hint-only improvements
+- logging/message-text changes that cannot affect control flow
+
+Deep review is required when the diff touches any of:
+
+- lock acquisition, lock ordering, or shared mutable state
+- new threads, timers, callbacks, or changed callback/loop rates
+- frame ring, buffer ownership, queues, pool sizes, or zero-copy handoff
+- ROS topics, message types, QoS, TF, or launch composition
+- motor, servo, emergency-stop, FSM, or safety precedence paths
+- RKNN/NPU preprocess, tensor shapes, model lifecycle, or camera formats
+- HTTP/UDP mutation auth, validation, or config live-apply behavior
+
+For shallow changes, still skim for accidental behavior edits; then stop.
+For deep changes, apply the architecture passes and C1–C12 checks that the
+touched risk areas make relevant. Do not spend equal depth on unrelated lenses.
+
+## Standing invariants
+
+These are human rules. Do not assume the code alone encodes them.
+
+- Detection and tracking must work headlessly without Flask or a video client.
+- Unexpected control, motor, sequence, sensor, camera, NPU, or ROS failure must
+  not leave motion active.
+- Emergency stop and safety precedence override navigation and follow behavior.
+- Do not hold locks across camera, inference, network, ROS, or disk I/O.
+- Production perception frame-ring ownership follows
+  `cat_follow/docs/Frame_Ring_Ownership_Audit.md`.
+- Camera / NPU input contracts (resolution, format, ownership) must stay
+  consistent across producer and consumer; do not silently change shapes or
+  pixel formats on hot paths.
+- Motor and servo commands stay within safe limits and documented units.
+- Control and perception hot loops must not take unbounded blocking work.
+- Mutating HTTP and UDP operations require authentication.
+- Repository-local development secrets must never be published.
+
 ## Cross-cutting checks
 
-Apply every check below to every relevant file and pipeline.
+Apply each check below when the change makes it relevant. After pipeline and
+risk-focused review, do a final C1–C12 sweep for gaps on the touched surface.
 
 ### C1 — Concurrency
 
@@ -122,6 +193,9 @@ Apply every check below to every relevant file and pipeline.
 
 ## Architecture passes
 
+Run the passes that the change actually touches. Skip untouched passes after a
+quick confirmation that the diff does not reach them.
+
 ### 1. Process and service topology
 
 Map service entry points, threads, process boundaries, hardware owners,
@@ -130,7 +204,7 @@ uses the intended runtime.
 
 ### 2. Pipelines
 
-Review each complete producer-to-consumer pipeline:
+Review each complete producer-to-consumer pipeline affected by the change:
 
 1. Camera, motion gate, detector, post-processing, and publish.
 2. Multi-target association, prediction, roles, and primary-track publish.
@@ -172,11 +246,12 @@ hardware ownership, graceful degradation, and startup/shutdown behavior.
 
 ## Review order
 
-1. Existing high-confidence findings and safety/control paths.
-2. Shared-state and concurrency boundaries.
-3. Tracking and movement sequences.
-4. ROS2/navigation and range fusion.
-5. Vision/detection and memory/CPU behavior.
-6. UI, IPC, configuration, security, and validation.
-7. Dedicated C1–C12 sweep to catch subjects missed in pipeline reviews.
-8. Test coverage gaps and consolidated severity-sorted report.
+1. Classify semantic risk (shallow vs deep) and identify touched symbols.
+2. Existing high-confidence findings and safety/control paths.
+3. Shared-state and concurrency boundaries in the dependency slice.
+4. Tracking and movement sequences, if touched.
+5. ROS2/navigation and range fusion, if touched.
+6. Vision/detection and memory/CPU behavior, if touched.
+7. UI, IPC, configuration, security, and validation, if touched.
+8. Relevant C1–C12 sweep on the touched surface.
+9. Test coverage gaps and consolidated severity-sorted report.

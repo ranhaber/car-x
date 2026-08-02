@@ -2,6 +2,12 @@
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)  
 **Status:** Ready for Implementation
 
+> **Historical milestone baseline.** This checklist records the first
+> contract-runtime implementation and intentionally retains its original
+> `CHASE_A`/`TRACK_B`/`BRAKE` terminology. It is not the canonical future FSM.
+> New work follows
+> `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
 ## 1. Goal
 Build the contract-driven runtime foundation without breaking the current prototype behavior.
 

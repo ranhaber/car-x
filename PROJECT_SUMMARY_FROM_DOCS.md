@@ -115,7 +115,7 @@ Total ~1.8 MB + small structs; TFLite interpreter and input buffer created once.
 ### 3.6 Web UI integration
 
 - **Stream:** Flask generator reads `frame_latest` (and `bbox_tracker`) under lock, draws rectangle and state text on a local copy, resizes to user-selected resolution (640x480 / 320x240 / 160x120), encodes to JPEG, yields as MJPEG at **10 FPS**; no per-frame alloc (reuse one encode buffer). Built-in stub for H.264 later.
-- **Commands:** "Send target (x,y)" -> POST /api/target `{"x": float, "y": float}` (meters) -> `set_cat_location(x, y)` under lock. "Stop" -> POST /api/stop -> `set_stop_command()` under lock. Event-driven (like ISR): Flask handler fires immediately on request.
+- **Commands:** "Send target (x,y)" -> POST /api/target `{"x_cm": float, "y_cm": float}` (centimeters) -> `set_cat_location_cm(x_cm, y_cm)` under lock. "Stop" -> POST /api/stop -> `set_stop_command()` under lock. Event-driven (like ISR): Flask handler fires immediately on request.
 - **Status:** GET /api/status every 1 s -> JSON: `{ state, odometry, tracker_fps, stream_fps, app_version, cpu_percent, ram_percent, cpu_temp }`.
 - **Calibration tab:** GET /api/calibration -> JSON; POST /api/calibration -> validate + write files + reload. `Calibration.to_dict()` and `Calibration.update_from_dict(data)` added when we build this tab.
 
@@ -132,7 +132,7 @@ Total ~1.8 MB + small structs; TFLite interpreter and input buffer created once.
 - **Cat tracker** - OpenCV (e.g. KCF); every frame; 30 FPS; re-init from detector.
 - **Distance to cat** — From ultrasonic via `range_sensor` (production: edge worker + `RangeAdapter`; legacy: `Picarx.get_distance()` polling) or bbox calibration in `main_loop`.
 - **Motion** - go_to_xy, center_cat (steer + drive to center bbox, camera straight), search_arc, stop; uses calibration limits.
-- **Commands** - set_cat_location(x,y) in meters, stop; protected by lock; polled by main (sources: Web UI, file, MQTT, etc.).
+- **Commands** - set_cat_location_cm(x_cm, y_cm) in centimeters, stop; protected by lock; polled by main (sources: Web UI, file, MQTT, etc.).
 - **Web UI** - See section 4.6 for finalized design.
 
 ### 4.2 Data flow
@@ -197,7 +197,7 @@ tests/                # test_*.py per module and integration
 | Element | Details |
 |---------|---------|
 | **Live stream** | MJPEG at 10 FPS; shows rectangle around tracked cat (from bbox_tracker); state name as text overlay; stream continues until user navigates away. |
-| **Send target** | Two text fields: X (meters), Y (meters) + "Send" button. POST /api/target `{"x": 1.5, "y": 0.8}`. |
+| **Send target** | Two text fields: X (cm), Y (cm) + "Send" button. POST /api/target `{"x_cm": 150.0, "y_cm": 80.0}`. |
 | **Stop** | Button. POST /api/stop. Car goes to IDLE. |
 | **Status bar** | Updated every 1 s via GET /api/status: current state, odometry (x,y,heading), **tracker FPS**, **stream FPS**, **app version**, **CPU %**, **RAM %**, **CPU temp**. |
 | **Resolution selector** | Dropdown: 640x480 / 320x240 / 160x120. Changes stream resolution on the fly. |
@@ -216,7 +216,7 @@ tests/                # test_*.py per module and integration
 | `/` | GET | Main tab HTML |
 | `/calibration` | GET | Calibration tab HTML |
 | `/stream` | GET | MJPEG stream (multipart) |
-| `/api/target` | POST | Send cat_location(x, y) in meters |
+| `/api/target` | POST | Send cat_location(x_cm, y_cm) in centimeters |
 | `/api/stop` | POST | Send stop command |
 | `/api/status` | GET | JSON: state, odometry, tracker FPS, stream FPS, app version, CPU %, RAM %, CPU temp |
 | `/api/calibration` | GET | JSON: current calibration values |
@@ -315,7 +315,7 @@ tests/                # test_*.py per module and integration
 |------|------------|-------------|
 | 9.1 | **Flask app + main tab HTML** (Alpine.js): stream `<img>`, target fields (X/Y meters), Send + Stop buttons, status bar, resolution dropdown. | Browser: open main tab; see layout. |
 | 9.2 | **MJPEG stream** at 10 FPS: read frame + bbox under lock; draw rectangle + state text; resize to selected resolution; encode JPEG; yield. Stub for H.264. | Browser: see live stream; with stub bbox see rectangle. |
-| 9.3 | **POST /api/target:** receive {x,y} meters; call set_cat_location under lock. | POST with curl or test; assert command queue receives. |
+| 9.3 | **POST /api/target:** receive {x_cm,y_cm} centimeters; call set_cat_location_cm under lock. | POST with curl or test; assert command queue receives. |
 | 9.4 | **POST /api/stop:** call set_stop_command under lock. | POST; assert state -> IDLE. |
 | 9.5 | **GET /api/status:** return state, odometry, tracker FPS, stream FPS, app version, CPU %, RAM %, CPU temp. | GET; assert JSON with all fields. |
 | 9.6 | **POST /api/stream/resolution:** change stream resolution (640x480 / 320x240 / 160x120). | Change; assert stream uses new size. |

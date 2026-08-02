@@ -1,7 +1,7 @@
 # Frame Ring Ownership Audit
 
-**Status:** Ring leases, native RKISP NV12 ring, and direct NV12→RGB RKNN input implemented and board-tested
-**Date:** 2026-07-24
+**Status:** NumPy ring path implemented; native DMA-BUF path and H.264 ownership repairs deployed and validated on ROCK 4D (2026-07-26)
+**Date:** 2026-07-26
 **Scope:** Production perception frame sharing in `cat_follow` vs `picarx_cat tracker` (Cat Dome)
 
 This document consolidates three architecture audits:
@@ -20,22 +20,83 @@ Detection and tracking **must remain independent of the web UI** (see workspace 
 |--------|-------------|-------------------------------|
 | Ring size | 4 slots, 640×480 NV12 (~450 KiB/slot) | 3 slots, 4K NV12 (~12 MB/slot) |
 | Handoff | **Refcounted leases** + per-slot generation | **Zero-copy views** + generation guards |
-| Readers | Detector, MJPEG, H264 (multi-thread) | Single Proc consumer on ring |
+| Readers | Detector, H264 (multi-thread) | Single Proc consumer on ring |
 | Tear safety | Refcount pins + per-slot odd/even generation | Per-slot `_ring_gen` odd/even + `_ring_slot_changed` |
-| Detector path | Lease → packed 320×320 NV12 crop → RGB tensor → RKNN | Proc holds ring view; AI uses separate crop pool |
+| Detector path | Lease → RGA/CPU 320×320 crop → RGB RKNN | Proc holds ring view; AI uses separate crop pool |
 | Recommended target | **Refcounted ring leases + per-slot generation** | Adapt picarx gen/tear + explicit multi-reader safety |
 
-car-x now pins ring slots across detector and stream reads. The camera never
-reuses the latest or a pinned slot and drops capture frames when all slots are
-busy. The detector's former ~921 KB `snapshot_detector_frame` copy and legacy
-`frame_for_detector` allocation are removed.
+The NumPy path pins ring slots across detector and stream reads. The camera
+never reuses the latest or a pinned slot and drops capture frames when all
+slots are busy. The detector's former ~921 KB `snapshot_detector_frame` copy
+and legacy `frame_for_detector` allocation are removed.
 
 The OpenCV V4L2 backend now requests unconverted bytes and packs the validated
 `/dev/video11` 640×480 NV12 source directly into the ring. Motion uses the
-zero-copy Y-plane view; RKNN converts only a packed 320×320 crop. MJPEG
-converts at its optional viewer boundary; H.264 feeds leased NV12 directly to
-MPP and copies only when wrapping the synchronous GStreamer input buffer. An
+zero-copy Y-plane view; RKNN consumes a paired 320×320 crop. The selectable
+native DMA-BUF path performs the center-bottom NV12→RGB crop in RGA and imports
+the crop fd into RKNN. H.264 imports a leased camera DMA-BUF directly into MPP;
+the web UI draws bounding boxes client-side over WebCodecs-decoded video. An
 `mppjpegdec` stage is not applicable to this raw RKISP source.
+
+---
+
+## 0. Vision zero-copy options (A / B / C)
+
+The last deployed/validated production baseline is **Option A**. **Option B**
+is now selectable with `CAT_FOLLOW_PERCEPTION_ZEROCOPY=dmabuf` and has been
+deployed/revalidated on the ROCK 4D. The older Python probe maps the camera
+buffer and therefore does not by itself prove fd-to-fd operation.
+
+| | **C — CPU crop + RGB RKNN** | **A — RGA crop + RGB RKNN (production)** | **B — dmabuf Cam→RGA→NPU** |
+|--|--|--|--|
+| Capture | CPU-mapped NV12 `Cam[0..3]` ring | Same ring | V4L2/GStreamer **dmabuf fds** (no CPU map of full frames) |
+| Crop | CPU `extract_nv12_crop()` | Hardware RGA into paired `Crop[0..3]` (CPU fallback if RGA absent) | Hardware RGA fd→fd |
+| NPU input | RGB NumPy tensor | Same | RGB RKNN from crop **dmabuf fd** |
+| Color convert | CPU NV12→RGB | CPU NV12→RGB after RGA crop | RGA NV12→RGB fd→fd |
+| Complexity | Lowest | Medium | Highest; `io-mode=4` rejected for CPU ring packing today |
+| Risk | Low | Medium | High (fd lifetime, RKNN fd import) |
+| When | RGA unavailable interim | **Ship now** | Only after standalone B test is fully green |
+
+**Promotion gate for B:** compare at least one frame (normally 60 same captured
+frames) with `scripts/compare_zerocopy_vs_numpy.py`; aggregate detection-count
+delta must be **0** and median top-box IoU must be **≥0.90** when comparable
+boxes exist. Also require ≥30 consecutive DMA-BUF frames, zero steady-state and
+lifecycle fd growth, and concurrent detector/H.264 soak without QBUF failure,
+starvation, or torn ownership. Until those board gates pass, production keeps
+the last validated NumPy NV12 path.
+
+The RGB-model fd proof passed 30 consecutive frames with no fd growth on
+2026-07-25. Detection parity and concurrent H.264 stress remain open before
+Option B can replace the production ring. That result predates the current
+native ownership/crop/ABI repairs and is historical evidence, not validation of
+the changed library.
+
+### 0.1 Implemented repair contracts (host-verified, board-pending)
+
+- Camera readiness in DMA-BUF mode is reported only after one startup
+  `dequeue -> RGA/RKNN infer -> QBUF` self-test succeeds.
+- Native camera buffers, mappings, exported fds, RGA imports, DMA-heap crop,
+  RKNN memory, and context use RAII cleanup. Per-buffer queued/dequeued state
+  and ownership locks serialize infer/copy/requeue; Python session close is
+  camera-owner-thread-only and waits for borrowed calls.
+- The C ABI and `ctypes` declarations are synchronized for model
+  load/unload/status, detection copy-out, crop offsets, and frame metadata.
+  Crop geometry is validated as positive, in-bounds, even-sized/even-origin,
+  and equal to RKNN input dimensions.
+- Idle unload releases **RKNN/model resources only**. V4L2 streaming, camera
+  DMA-BUFs, RGA imports, and the crop DMA-BUF stay alive; reload failure is
+  fatal rather than a silent empty-detection mode.
+- With DMA-BUF capture and motion gating enabled, `/dev/video12` (or another
+  real lores/luma source) is a deployment requirement. A DMA-BUF fd is not
+  motion evidence. If lores is unavailable, disable motion gating explicitly;
+  do not treat every fd-only frame as motion.
+- Monitoring admits exactly one WebSocket viewer/encoder owner. A second
+  viewer is rejected. At most one camera lease may wait on MPP, and polling
+  drains delayed access units even when no newer camera frame arrives.
+- Web UI, TLS, H.264 route/encoder, and authentication configuration failures
+  degrade monitoring/control-plane availability without stopping the headless
+  camera/detector/tracker/control core. Mutating routes fail closed when the
+  production tokens are incomplete; stop and emergency-stop remain open.
 
 ---
 
@@ -46,8 +107,9 @@ MPP and copies only when wrapping the synchronous GStreamer input buffer. An
 [`cat_follow/memory/pool.py`](../memory/pool.py):
 
 - `FRAME_RING_N = 4`, shape `(4, 720, 640)` uint8 packed NV12
+- `CROP_RING_N = 4`, shape `(4, 480, 320)` uint8 packed NV12 (320×320 crops)
 - `frame_for_detector` has been removed
-- Static frame RAM: ~1.8 MiB (4 ring slots)
+- Static frame RAM: ~1.8 MiB capture + ~0.6 MiB crop pool
 
 ### 1.2 Synchronization
 
@@ -79,18 +141,17 @@ flowchart LR
   subgraph detector [DetectorThread]
     SNAP[acquire_latest_frame lease]
     MOT[Y-plane motion gating]
-    RKNN[320 NV12 crop direct to RGB RKNN tensor]
-    SNAP --> MOT --> RKNN
+    CROP[RGA or CPU crop to Crop_i]
+    RKNN[RGB RKNN tensor]
+    SNAP --> MOT --> CROP --> RKNN
   end
-  subgraph stream [Optional MJPEG/H264]
-    GL[lease and NV12 to BGR]
-    ENC[JPEG or H264 encode]
-    GL --> ENC
+  subgraph stream [H264 only]
+    ENC[lease NV12 to mpph264enc]
   end
   WB --> ring
   PUB --> ring
   ring -->|pinned view| SNAP
-  ring -->|pinned view| GL
+  ring -->|pinned view| ENC
 ```
 
 **Tracker** ([`cat_follow/threads/tracker.py`](../threads/tracker.py)) does not read frames — only detector outputs matched by `_detector_frame_gen`.
@@ -103,9 +164,8 @@ flowchart LR
 |-------|------|-------------------|-------|
 | Camera → ring | ~30 FPS | 1× 450 KiB `copyto` | `cap.read()` owns its buffer; no full-frame color conversion at 640×480 |
 | Detector | `DETECT_FPS` (default 5) | 0× full-frame | Copies packed 320×320 Y+UV crop; no intermediate BGR image |
-| RKNN preprocess | On detect ticks | 0× full 640×480 | NV12→RGB directly into 320×320 `_input_buf`; no letterbox |
-| MJPEG client | ~10 FPS | 1× NV12→BGR display | Required only while a viewer requests overlays/JPEG |
-| H264 client | ~15 FPS | 1× packed NV12 `tobytes` | Direct `format=NV12` appsrc; no color conversion |
+| RKNN preprocess | On detect ticks | 0× full 640×480 | Packed 320×320 NV12 into `_input_buf`; no CPU RGB convert |
+| H264 client | ~15 FPS | 1× packed NV12 `tobytes` | Direct `format=NV12` appsrc; overlays drawn in browser |
 
 **Headless production (no stream):** one 450 KiB OpenCV staging → ring copy per
 camera frame; no full-frame BGR conversion and no detector full-frame copy.
@@ -129,7 +189,7 @@ Copy-out readers avoid this because each consumer owns its `dst` after the locke
 
 | Risk | Location | Notes |
 |------|----------|-------|
-| Unlocked `get_write_buffer()` | `shared_state.py` | OK with single camera writer; breaks if second writer added |
+| Unlocked `get_write_buffer()` | `memory/shared_state.py` | OK with single camera writer; breaks if second writer added |
 | OpenCV `cap.read()` + resize alloc | `threads/camera.py` | Per-frame alloc outside pool discipline |
 | OpenCV capture staging | `threads/camera.py` | `cap.read()` still owns one raw NV12 buffer before the ring pack |
 
@@ -184,7 +244,7 @@ H264, recording, and AI **do not** hold ring pointers across slow work:
 4. **Separate validity flags** — e.g. `_ring_full_frame_valid` for IDLE 4K-skip (adapt as motion-only lores gating on 1 GB boards)
 5. **NV12 + fd RGA capture** — future MPP path on RK3576; not required for current OpenCV BGR pipeline
 
-**Do not port blindly:** picarx assumes **one ring consumer** (Proc). car-x has **multiple independent reader threads** (detector + MJPEG + H264).
+**Do not port blindly:** picarx assumes **one ring consumer** (Proc). car-x has **multiple independent reader threads** (detector + H264). The legacy MJPEG reader has been removed; there is no MJPEG/software fallback.
 
 ---
 
@@ -199,7 +259,7 @@ Each slot: `{generation, refcount}`. Camera publishes into a write slot; readers
 | Path | Behavior |
 |------|----------|
 | camera → detector | Hold lease through RKNN infer; **zero full-frame copy** |
-| camera → MJPEG/H264 | Non-blocking `try_acquire_latest()`; skip tick if busy (latest-wins) |
+| camera → H264 | Non-blocking `SharedState.acquire_latest_frame()`; skip tick if busy (latest-wins) |
 | inject | Mutate camera staging only; never inject into slot with `refcount > 0` |
 | lag | Camera drops frames when all slots leased; readers never see torn data |
 
@@ -222,9 +282,8 @@ Readers always `copyto` under lock.
 
 ### 3.4 Verdict
 
-**Refcounted leases + per-slot generation** is implemented for detector,
-MJPEG, and H.264. `get_frame_latest(dst)` remains as a compatibility copy-out
-escape hatch.
+**Refcounted leases + per-slot generation** is implemented for detector and
+H.264. `get_frame_latest(dst)` remains as a compatibility copy-out escape hatch.
 
 ---
 
@@ -238,7 +297,7 @@ These constraints revise the earlier “unavoidable” list:
 |----------|-------------|
 | Capture = OpenCV V4L2 raw NV12 into ring slot | Keeps one `cap.read()` staging buffer and one packed ring write; optional GStreamer mmap CPU pack remains fallback |
 | Camera locked at **640×480** | **No capture resize** — perception frame size equals camera size |
-| Native **NV12** ring (picarx-style) | Motion stays on Y; AI converts its crop directly to RGB; BGR remains only at inject/MJPEG boundaries |
+| Native **NV12** ring (picarx-style) | Motion stays on Y; AI feeds NV12 crop to RKNN; BGR only at inject boundaries |
 | Detector input = **center-bottom 320×320 crop** from 640×480 | **No letterbox/resize** — same rule as picarx `AI_CROP_SIZE == RKNN_INPUT_SIZE` |
 | Overlays = client Canvas + JSON (picarx-style) | No server-side pixel burn-in on ring for live UI |
 | Inject = copy-before-paste / writer-owned only | Never mutate a leased ring slot |
@@ -248,7 +307,7 @@ These constraints revise the earlier “unavoidable” list:
 | Copy / convert | How picarx handles it | Notes for car-x |
 |----------------|----------------------|-----------------|
 | OpenCV capture → ring NV12 pack | `cap.read()` + `np.copyto(..., ring_slot)` | Implemented baseline; optional GStreamer mmap CPU pack (`io-mode=2`) is fallback only. |
-| NV12 crop → RGB (AI path) | `extract_nv12_crop` + `COLOR_YUV2RGB_NV12` | Writes directly into preallocated RKNN `_input_buf`; no intermediate BGR allocation |
+| NV12 crop → RKNN (AI path) | RGA or `extract_nv12_crop` into `Crop[i]` | Packed NV12 into preallocated RKNN `_input_buf`; no RGB conversion |
 | `rknn.inference(inputs=[buf])` | Prealloc `_input_buf`; **output** pool only | Input still CPU NumPy → NPU map; not solved as dmabuf zero-copy |
 | H.264 boundary | Direct NV12 `Gst.Buffer.new_wrapped(tobytes())` | Implemented; synchronous bytes ownership permits lease release after submit |
 | Inject | `frame.copy()` / NV12→BGR then paste; lores ROI paste into scratch | Writer-owned / Proc-owned copies only |
@@ -260,8 +319,8 @@ These constraints revise the earlier “unavoidable” list:
 |----------------------|------------------|
 | Capture resize 640×480 | Camera is already 640×480 |
 | Full-frame letterbox to 320×320 | Center-bottom crop, scale=1.0 |
-| Full-frame NV12→BGR every frame | Keep NV12 on ring; convert the AI crop directly to RGB and use BGR only for inject/MJPEG/snapshot |
-| MJPEG overlay scratch mutating detector input | Prefer H.264 + client overlay JSON (picarx); if MJPEG kept, draw on private buf |
+| Full-frame NV12→BGR every frame | Keep NV12 on ring; feed NV12 crop to RKNN; BGR only for inject/snapshot |
+| Server-side stream overlays | H.264 + client overlay JSON (WebCodecs canvas) |
 | Detector `snapshot_detector_frame` full copy | Ring lease / crop extract instead |
 | Software full-frame lores when RGA fd available | Hardware lores Y-plane view (picarx) |
 
@@ -283,12 +342,16 @@ Incremental phases and current status:
 
 | Phase | Scope | Key files | Outcome |
 |-------|-------|-----------|---------|
-| **0 — Instrument** | Counters only | `shared_state.py`, metrics | Pending board metrics |
-| **1 — Gen counter** | Per-slot odd/even generation | `shared_state.py` | **Implemented** |
-| **2 — Refcount wired** | Camera skips pinned/latest slots | `pool.py`, `shared_state.py` | **Implemented** |
+| **0 — Instrument** | Counters only | `memory/shared_state.py`, metrics | Pending board metrics |
+| **1 — Gen counter** | Per-slot odd/even generation | `memory/shared_state.py` | **Implemented** |
+| **2 — Refcount wired** | Camera skips pinned/latest slots | `memory/pool.py`, `memory/shared_state.py` | **Implemented** |
 | **3 — Detector lease** | Lease through RKNN; center-bottom 320×320 crop | `threads/detector.py` | **Implemented** |
-| **4 — Stream leases** | MJPEG/H264 leases | `routes_streaming.py`, `routes_h264.py` | **Implemented** |
-| **5 — Native RKISP NV12** | Raw `/dev/video11` NV12 → NV12 ring | camera/pool/detector/stream | **Implemented and board smoke-tested** |
+| **4 — Stream leases** | H264 leases | `routes_h264.py`, `h264_encoder.py` | **Implemented**; one viewer, one pending camera lease, delayed-AU polling |
+| **8 — Crop pool + RGA** | `Cam[i]→Crop[i]` paired buffers | `memory/pool.py`, `vision/rga_crop.py`, `threads/detector.py` | **Implemented** |
+| **9 — RKNN input** | RGB model + RGA/CPU NV12→RGB input | `vision/rga_crop.py`, `vision/rknn_backend.py` | **Implemented**; packed-NV12 model claim rejected by Toolkit calibration |
+| **10 — H264-only UI** | WebCodecs decode + canvas overlays | `web_ui/templates/main.html`, `web_ui/app.py` | **Implemented** |
+| **11 — dmabuf B test** | Native session + parity gate | `native/zerocopy`, `compare_zerocopy_vs_numpy.py` | **Implemented; changed native code is not yet deployed/validated on board** |
+| **5 — Native RKISP NV12** | Raw `/dev/video11` NV12 → DMA-BUF leases | camera/shared state/detector/stream | **Implemented on host; current native revision needs ROCK 4D validation** |
 | **6 — Lores gen coupling** | Pair lores gen with main gen; ROI inject patch | shared state/inject | Pending |
 | **7 — Retire legacy** | Remove `frame_for_detector`, stale APIs | pool/tests | **Implemented** |
 
@@ -296,10 +359,12 @@ Incremental phases and current status:
 
 - **Camera:** `try_get_write_buffer()` → staging/inject → `publish_latest_from_write()`; drop when full
 - **Detector:** one `acquire_latest_frame()` per tick when needed; hold through motion fallback + RKNN + publish; `release()` in `finally`
-- **MJPEG/H264:** `acquire_latest_frame()` per encode tick; skip when `None`
+- **H264:** sole admitted viewer acquires one latest lease per encode tick;
+  DMA-BUF ownership transfers to MPP until matching output PTS, additional
+  pending frames drop, and `poll()` drains delayed AUs without a new frame
 - **Tracker:** unchanged — reacts to `_detector_detections_gen` changes only
 
-### 5.1 Native NV12 roadmap ([Assess MPP NV12 port](688ed57d-eb40-4d5f-b804-65b14d8c2aa3))
+### 5.1 Native NV12 capture roadmap ([Assess MPP NV12 port](688ed57d-eb40-4d5f-b804-65b14d8c2aa3))
 
 **Do not use picarx `mppjpegdec` for car-x.** RKISP `/dev/video11` already delivers raw 640×480 NV12; picarx MPP decode targets USB MJPEG 4K.
 
@@ -307,9 +372,65 @@ Incremental phases and current status:
 |-------|-------|-------|
 | **3 — NV12 ring + crop-at-detect** | NV12 pool `(4,720,640)`; stop full-frame BGR convert; 320×320 crop → RGB tensor → RKNN | **Implemented and validated** with production venv OpenCV |
 | **4 — GStreamer capture fallback** | Optional `v4l2src io-mode=2` (mmap CPU pack); feature flag `CAT_FOLLOW_CAMERA_CAPTURE_BACKEND=gst_nv12` | Implemented; canonical 460,800-byte sample validated via `extract_dup`. `io-mode=4` (fd-only dmabuf export) is rejected for CPU ring packing because Python map/VideoInfo crashed the allocator on this board. |
-| **5 — HW lores / NV12 H.264** | Direct NV12 MPP input implemented; RKISP lores self-path (`/dev/video12`) remains | `mpph264enc` is absent on the board; encoder remains optional. Prefer lores device over RGA at 640×480. |
+| **5 — HW lores / NV12 H.264** | Direct NV12 MPP input implemented; RKISP lores self-path (`/dev/video12`) remains | `mpph264enc` is absent on the board. Current optional streaming therefore remains unavailable on that path. Under the canonical target, this also means no monitoring stream and degraded no-recording operation until a hardware H.264 encoder is provisioned; there is no software/MJPEG target fallback. Prefer the lores device over RGA at 640×480. |
 
-**Model:** same `.rknn`; change preprocess/postprocess offsets (crop origin, not letterbox).
+**Model input correction (2026-07-25):** the YOLO ONNX tensor is RGB
+`[1,3,H,W]`. RKNN Toolkit2 2.3.2 may export an FP artifact when
+`input_size_list=[1,H*3/2,W,1]` is supplied, but INT8 calibration rejects the
+packed NV12 arrays and still requires the original RGB tensor. Therefore this
+is not a valid native-NV12 model conversion. The supported zero-copy path uses
+RGA to convert NV12→RGB directly between DMA-BUFs before RKNN fd import.
+
+### 5.3 Standalone dmabuf validation (Option B)
+
+Run on the ROCK 4D only (not linked to `main_loop` / Flask):
+
+#### Capture-only Python probe
+
+```bash
+python3 scripts/validate_dmabuf_rga_rknn.py \
+  --device /dev/video11 --frames 30 \
+  --model models/yolov8n_coco_320_rk3576_int8.rknn
+```
+
+Emits JSON: `status` (`pass` | `partial` | `fail`), `rga_ms`, `npu_ms`, `detections`.
+`partial` means dmabuf capture + RGA succeeded but RKNN fd import is unavailable.
+This probe maps the GStreamer buffer to NumPy and is not the Option B promotion
+gate, even if it reports `status=pass`.
+
+#### Native fd-to-fd proof
+
+Build on the board after installing `librga` development headers and the RKNN
+2.3.2 `rknn_api.h`:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra \
+  scripts/validate_dmabuf_rga_rknn_fd.cpp \
+  -o scripts/validate_dmabuf_rga_rknn_fd -lrga -lrknnrt
+
+sudo systemctl stop cat-follow.service
+scripts/validate_dmabuf_rga_rknn_fd \
+  /dev/video11 models/yolov8n_coco_320_rk3576_int8.rknn 30
+sudo systemctl start cat-follow.service
+```
+
+This path exports V4L2 capture buffers with `VIDIOC_EXPBUF`, imports the camera
+fd into RGA, writes the center-bottom crop into a DMA-heap fd, and imports that
+same crop fd with `rknn_create_mem_from_fd`. The crop fd has RKNN-required
+virtual-address metadata but no CPU pixel access.
+
+Historical ROCK 4D result on 2026-07-25 (before the current native
+RAII/crop/ABI/lifecycle repairs):
+
+```json
+{"status":"pass","path":"v4l2-expbuf->rga-fd->rknn-fd","camera_cpu_mapped":false,"crop_va_mapped":true,"crop_cpu_access":false,"frames_ok":30,"rga_ms_p50":0.363705,"npu_ms_p50":6.52327,"fd_delta":0,"input_size_with_stride":307200,"input_format":"rgb"}
+```
+
+This proved fd-to-fd transport with RGA NV12→RGB conversion for that revision
+and provisioned RGB model. It does **not** validate the currently changed
+native library. Do **not** replace the last validated NumPy capture path until
+the current code is deployed and the parity, lifecycle/fd, QBUF, and concurrent
+H.264 stress gates are green on the ROCK 4D.
 
 ### 5.2 ROCK 4D validation (2026-07-23)
 
@@ -339,6 +460,10 @@ M4f **DETECT_FPS=30 + ROS2 soak** remains a separate validation item
 
 ## 6. Tests
 
+Host regression status: `python -m pytest tests -q` completed with **511
+passing** on 2026-07-26. These tests cover contracts and mocks; they do not
+exercise ROCK 4D V4L2, RGA, RKNN fd import, MPP, or device permissions.
+
 | Test | File | Status |
 |------|------|--------|
 | Slot pinned until release | `tests/test_shared_state.py::test_frame_lease_pins_slot_until_release` | Implemented |
@@ -351,8 +476,21 @@ M4f **DETECT_FPS=30 + ROS2 soak** remains a separate validation item
 | Center-bottom crop BGR golden equivalence | `tests/test_nv12_utils.py::test_center_bottom_crop_bgr_matches_full_frame_slice` | Implemented |
 | Direct NV12→RGB equivalence/reuse | `tests/test_nv12_utils.py::test_nv12_to_rgb_matches_bgr_channel_swap_and_reuses_destination` | Implemented |
 | Chroma alignment regression on odd crops | `tests/test_nv12_utils.py::test_align_nv12_crop_required_before_odd_region_extract` | Implemented |
+| Native ABI declarations and model lifecycle | `tests/test_zerocopy_model_lifecycle.py`, native-source contract tests | Host pass |
+| H.264 one-viewer, lease cap, delayed AU polling | H.264 route/encoder tests | Host pass |
+| Option A/B parity thresholds | `tests/test_compare_zerocopy_parity.py` | Host pass (threshold logic only) |
 
-**Still useful later:** concurrent detector + stream lease stress under board load and real `/dev/video11` color/chroma validation.
+**ROCK 4D temporary-build evidence (2026-07-26):** native compilation and ABI
+symbol load passed; 10 RGA/RKNN frames completed with steady fd delta 0; native
+model unload/reload passed; 10 same-input parity frames had count delta 0;
+repeat-session lifecycle fd delta was 0 (the first RKNN/RGA initialization
+retained two process-global descriptors); and DMA-BUF MPP produced 30/30 H.264
+access units. The service was restored active after validation.
+
+**Board gates still Pending:** deploy the repaired revision, exercise scenes
+with comparable detections for the IoU gate, run long fd/QBUF and concurrent
+detector/stream soak, validate `/dev/video12` motion gating, inject camera
+faults, and prove secure-context browser playback.
 
 ---
 

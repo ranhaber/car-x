@@ -1,6 +1,8 @@
 # Cat Detection, Recognition, and Tracking on Raspberry Pi 4 (4 GB)
 
-This document explains your options for **cat detection**, **cat recognition**, and **tracking a running cat** when using a **Raspberry Pi 4 Model B with 4 GB RAM** (e.g. on PiCar-X with the OV5647 camera and vilib/picar-x stack).
+This document explains your options for **cat detection**, **cat recognition**, and **tracking a running cat** when using a **Raspberry Pi 4 Model B with 4 GB RAM** (e.g. on PiCar-X with the OV5647 camera and the older vilib/picar-x stack).
+
+> **Note:** `vilib/` was removed from the `car-x` repo. Production ROCK 4D vision uses `cat_follow` + RKNN, not vilib. Sections below that mention in-repo `vilib/` paths are historical.
 
 ---
 
@@ -18,7 +20,7 @@ This document explains your options for **cat detection**, **cat recognition**, 
 
 ## 1.1 Use existing vilib object detection (COCO, class “cat”)
 
-**What you have:** In your car-x repo, **vilib** already has TFLite object detection with **COCO labels**. In `vilib/workspace/coco_labels.txt`, **class id 16 is “cat”**.
+**What you had (historical):** The SunFounder **vilib** package ships TFLite object detection with **COCO labels** (class id 16 is “cat”). That tree is no longer vendored under `car-x`; clone SunFounder’s vilib separately if you need these Pi 4 demos.
 
 - **API:** `Vilib.object_detect_switch(True)`, optionally `Vilib.object_detect_set_model(path)` and `Vilib.object_detect_set_labels(path)`. Default model is `/opt/vilib/detect.tflite`, default labels are COCO.
 - **Output:** List of detections; each has `class_id`, `bounding_box`, `score`, and `class_name`. Filter where `class_name == "cat"` (or `class_id == 16`).

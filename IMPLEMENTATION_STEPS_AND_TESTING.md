@@ -121,7 +121,7 @@ or
 
 - **Integration test** in `tests/test_main_loop_shared_state.py` (or extend existing main_loop test):
   1. Use stub threads (Step 3) and run main loop in a thread for a few seconds.
-  2. From test thread, call `set_cat_location(10, 10)` (or inject command however you do in tests).
+  2. From test thread, call `set_cat_location_cm(10, 10)` (or inject command however you do in tests).
   3. Assert that state machine eventually reaches GOTO_TARGET then (after AT_TARGET) SEARCH, and that APPROACH/TRACK receive bbox from shared state (e.g. stub tracker sets bbox, main reads it and runs center_cat_control).
   4. Optional: assert that no exception is raised and that `get_bbox_tracker()` is read repeatedly in the main loop (e.g. add a small counter in a test subclass or via a mock).
 - **Manual test:** Run `python -m cat_follow.main_loop`; send a cat_location command (e.g. via file or in-code); confirm state transitions and that the loop keeps running with bbox from shared state.

@@ -1,5 +1,11 @@
 # Cat-Follow Design: Clarifications, Calibration, and File Plan
 
+> **Legacy prototype document.** This file plan and its motion behavior apply
+> to the historical `main_loop.py` stack. Production architecture and future
+> FSM work must follow
+> `cat_follow/docs/Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+> Hardware truth is Radxa ROCK 4D + Radxa 4K IMX415 with RKNN-only inference.
+
 This document refines the cat-follow design with your clarifications, adds **calibration** (speed–time–distance, max U-turn radius), and defines a **modular file plan**.
 
 **Range sensing:** Production contract runtime publishes ultrasonic distance through `range_sensor` → `RangeAdapter` (ROCK 4D: libgpiod edge worker). Legacy prototype paths may still reference bbox-area distance calibration.
@@ -167,10 +173,9 @@ car-x/
 │   ├── test_motion_center_cat.py  # Mock bbox → assert steer/speed
 │   └── ...
 │
-├── picar-x/                       # Existing
-├── vilib/                         # Existing
-├── robot-hat/                     # Existing
-└── ...
+├── picar-x/                       # Existing (drivetrain)
+├── robot-hat/                     # Existing (GPIO/PWM/I2C for picarx)
+└── ...                            # (vilib removed; vision is cat_follow)
 ```
 
 ---

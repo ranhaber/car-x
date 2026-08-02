@@ -3,6 +3,12 @@
 **Project:** Autonomous Yard Navigator & Cat Tracker (PiCar-X Platform)
 **Status:** In Progress
 
+> **Historical migration checklist.** Completed boxes remain evidence for the
+> original contract runtime; unchecked work is not automatically part of the
+> approved redesign. The canonical future FSM, protocol, hardware policy, and
+> 15 cm `BRAKE_REVERSE` contract are defined in
+> `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`.
+
 ## 1. Goal
 Replace the no-op backends from Milestone 2 with real I/O implementations
 so the contract-driven runtime can drive the actual PiCar-X chassis,
