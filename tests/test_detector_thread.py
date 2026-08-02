@@ -14,11 +14,13 @@ def test_center_bottom_model_crop_copies_matching_y_and_uv_planes():
     frame = np.zeros(FRAME_SHAPE, dtype=np.uint8)
     frame[:FRAME_H] = np.arange(FRAME_SHAPE[1], dtype=np.uint8)
     frame[FRAME_H:] = 173
+    crop_dst = np.empty((480, 320), dtype=np.uint8)
     crop, offset_x, offset_y = detector_module._center_bottom_crop(
-        frame, (320, 320)
+        frame, (320, 320), dst=crop_dst
     )
 
     assert crop.shape == (480, 320)
+    assert crop is crop_dst
     assert (offset_x, offset_y) == (160, 160)
     assert not np.shares_memory(crop, frame)
     assert np.array_equal(crop[0], frame[160, 160:480])
@@ -123,6 +125,108 @@ def test_detector_stub_publishes_bbox(monkeypatch):
     stop_event.set()
     th.join(timeout=1.0)
     assert found, "Detector stub did not publish a bbox within timeout"
+
+
+def test_repeated_infer_failures_escalate_instead_of_returning_empty(monkeypatch):
+    """Swallowed inference errors would look like "no cat" forever."""
+    stop_event = threading.Event()
+    fatal = detector_module.DetectorFatalHook()
+    received = []
+    fatal.set_handler(received.append)
+
+    shared = SharedState(allocate_pool())
+    shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
+
+    class _Backend:
+        loaded = True
+        last_error = "rknn inference returned -1"
+
+        def __init__(self):
+            self.consecutive_failures = 0
+
+        def infer_all(self, _frame_bgr, _score_threshold):
+            self.consecutive_failures += 1
+            # Keep the loop fed so it can reach the escalation threshold.
+            shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
+            return []
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        detector_module, "build_validated_backend", lambda config, path: _Backend()
+    )
+
+    watchdog = threading.Timer(10.0, stop_event.set)
+    watchdog.start()
+    try:
+        run_detector_loop(
+            shared,
+            stop_event,
+            target_fps=100.0,
+            config=PerceptionConfig(motion_gating=False, max_infer_failures=3),
+            on_fatal=fatal,
+        )
+    finally:
+        watchdog.cancel()
+
+    assert stop_event.is_set()
+    assert received and "inference failed" in received[0]
+
+
+def test_dmabuf_without_lores_reports_inert_motion_gating(monkeypatch, caplog):
+    """Fd-only frames carry no luma, so gating must say so instead of
+    silently suppressing motion forever."""
+    stop_event = threading.Event()
+
+    class _Backend:
+        loaded = True
+        consecutive_failures = 0
+        last_error = None
+
+        def infer_all_nv12(self, _frame_nv12, _score_threshold):
+            stop_event.set()
+            return []
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(
+        detector_module, "build_validated_backend", lambda config, path: _Backend()
+    )
+    shared = SharedState(allocate_pool())
+    # Publish a dmabuf-backed frame with no NumPy pixels and no lores stream.
+    shared.attach_zerocopy_session(object(), requeue_cb=lambda _index: True)
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_dmabuf_from_write(
+        capture_started_ns=time.monotonic_ns(),
+        dmabuf_fd=42,
+        buffer_index=1,
+        image_size=460800,
+        stride=640,
+    )
+    assert shared.acquire_latest_frame().frame is None
+
+    with caplog.at_level("WARNING"):
+        worker = threading.Thread(
+            target=run_detector_loop,
+            args=(shared, stop_event),
+            kwargs={
+                "target_fps": 100.0,
+                "config": PerceptionConfig(motion_gating=True),
+            },
+            daemon=True,
+        )
+        worker.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if any("Motion gating is inert" in r.message for r in caplog.records):
+                break
+            time.sleep(0.02)
+        stop_event.set()
+        worker.join(timeout=5.0)
+
+    assert any("Motion gating is inert" in r.message for r in caplog.records)
 
 
 def test_detector_preserves_primary_confidence(monkeypatch):

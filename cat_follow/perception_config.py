@@ -114,8 +114,8 @@ class PerceptionConfig:
 
     # Detector cadence.  ``detect_interval_tracking`` is how many tracker
     # frames elapse between detector invocations once a target is locked.
-    detect_fps: float = 5.0
-    detect_interval_tracking: int = 2
+    detect_fps: float = 30.0
+    detect_interval_tracking: int = 1
     score_threshold: float = 0.5
 
     # Model lifecycle. Unload RKNN after this many idle seconds (0 disables).
@@ -149,6 +149,7 @@ class PerceptionConfig:
     # size must match the converted .rknn (YOLOv8n COCO INT8 320x320 for rk3576).
     rknn_model_path: str = "models/yolov8n_coco_320_rk3576_int8.rknn"
     rknn_input_size: Tuple[int, int] = (320, 320)
+    rknn_input_format: str = "rgb"
 
     # Animal mode: collapse confusable quadrupeds (dog/horse/sheep/cow/bear) to
     # the cat class so a cat-sized animal counts as a cat at range, where the
@@ -162,11 +163,32 @@ class PerceptionConfig:
     inject_cat_image: str = "models/cat_1_320.png"
     inject_cat_speed_px_s: float = 60.0
 
+    # Zero-copy perception path: ``numpy`` (default) or ``dmabuf`` (V4L2 fd ->
+    # RGA -> RKNN fd).  Inject forces NumPy/Option A for the run.
+    zerocopy: str = "numpy"
+
+    def effective_zerocopy(self) -> str:
+        """Return the active capture path after inject and validation rules."""
+        if self.inject_cat_enabled:
+            return "numpy"
+        mode = (self.zerocopy or "numpy").strip().lower()
+        return mode if mode in ("numpy", "dmabuf") else "numpy"
+
     def __post_init__(self) -> None:
         if not math.isfinite(self.score_threshold) or not (
             0.0 <= self.score_threshold <= 1.0
         ):
             raise ValueError("score_threshold must be finite and within [0, 1]")
+        if self.rknn_input_format not in ("nv12", "rgb"):
+            raise ValueError(
+                "rknn_input_format must be 'nv12' or 'rgb', "
+                f"got {self.rknn_input_format!r}"
+            )
+        mode = (self.zerocopy or "numpy").strip().lower()
+        if mode not in ("numpy", "dmabuf"):
+            raise ValueError(
+                "zerocopy must be 'numpy' or 'dmabuf', " f"got {self.zerocopy!r}"
+            )
 
 
 def load_perception_config() -> PerceptionConfig:
@@ -176,8 +198,8 @@ def load_perception_config() -> PerceptionConfig:
         motion_scale=_float("MOTION_SCALE", 0.35, minimum=0.05),
         motion_threshold=_int("MOTION_THRESHOLD", 25, minimum=1),
         motion_min_area=_int("MOTION_MIN_AREA", 500, minimum=1),
-        detect_fps=_float("DETECT_FPS", 5.0, minimum=0.1),
-        detect_interval_tracking=_int("DETECT_INTERVAL_TRACKING", 2, minimum=1),
+        detect_fps=_float("DETECT_FPS", 30.0, minimum=0.1),
+        detect_interval_tracking=_int("DETECT_INTERVAL_TRACKING", 1, minimum=1),
         score_threshold=_float("SCORE_THRESHOLD", 0.5),
         idle_unload_sec=_float("IDLE_UNLOAD_SEC", 10.0, minimum=0.0),
         warmup_on_start=_bool("WARMUP_ON_START", False),
@@ -192,10 +214,12 @@ def load_perception_config() -> PerceptionConfig:
             "RKNN_MODEL_PATH", "models/yolov8n_coco_320_rk3576_int8.rknn"
         ),
         rknn_input_size=_size_pair("RKNN_INPUT", (320, 320)),
+        rknn_input_format=_str("RKNN_INPUT_FORMAT", "rgb").lower(),
         animal_mode=_bool("ANIMAL_MODE", False),
         inject_cat_enabled=_bool("INJECT_CAT_ENABLED", False),
         inject_cat_image=_str("INJECT_CAT_IMAGE", "models/cat_1_320.png"),
         inject_cat_speed_px_s=_float(
             "INJECT_CAT_SPEED_PX_S", 60.0, minimum=0.0
         ),
+        zerocopy=_str("ZEROCOPY", "numpy").lower(),
     )

@@ -40,6 +40,12 @@ class CameraConfig:
     backend: str = "default"
     capture_backend: str = "opencv"
     fps: float = 30.0
+    # Camera health escalation thresholds. Individual timeout/EAGAIN/drop
+    # events remain retryable; sustained failures stop the service so systemd
+    # can restart it instead of leaving the vehicle running blind.
+    open_failure_limit: int = 5
+    dequeue_failure_limit: int = 30
+    no_publish_timeout_sec: float = 5.0
 
     # Optional second (lores) stream from a hardware ISP self-path. When set,
     # the camera opens it in addition to the main stream and publishes a
@@ -107,6 +113,9 @@ def load_camera_config() -> CameraConfig:
         backend=backend,
         capture_backend=capture_backend,
         fps=_positive_float("FPS", 30.0),
+        open_failure_limit=_positive_int("OPEN_FAILURE_LIMIT", 5),
+        dequeue_failure_limit=_positive_int("DEQUEUE_FAILURE_LIMIT", 30),
+        no_publish_timeout_sec=_positive_float("NO_PUBLISH_TIMEOUT_SEC", 5.0),
         lores_device=lores_device,
         lores_width=_positive_int("LORES_WIDTH", 320),
         lores_height=_positive_int("LORES_HEIGHT", 240),

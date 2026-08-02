@@ -64,6 +64,10 @@ def test_constructor_validates_arguments():
         VisionAdapter(
             proto, contract, image_width=640, image_height=480, poll_rate_hz=0
         )
+    with pytest.raises(ValueError):
+        VisionAdapter(
+            proto, contract, image_width=640, image_height=480, freshness_ttl_ms=0
+        )
 
 
 # ── invisible / visible ────────────────────────────────────────────
@@ -205,6 +209,27 @@ def test_frozen_tracker_ages_out_received_ms():
     assert s2.received_ms == s1.received_ms
 
 
+def test_coasting_tracker_reports_not_fresh_once_past_the_ttl():
+    """``fresh`` must track observation age, not just "the cat is visible"."""
+    proto = ProtoSharedState(allocate_pool())
+    contract = SharedState()
+    adapter = VisionAdapter(
+        proto,
+        contract,
+        image_width=640,
+        image_height=480,
+        freshness_ttl_ms=20,
+    )
+
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)
+    assert adapter.update().fresh is True
+
+    time.sleep(0.05)
+    stale = adapter.update()  # tracker coasting: still visible, no new frame
+    assert stale.cat_visible is True
+    assert stale.fresh is False
+
+
 # ── last_seen_ms ───────────────────────────────────────────────────
 
 
@@ -256,6 +281,68 @@ def test_update_emits_vision_update_telemetry():
 
 
 # ── polling thread ─────────────────────────────────────────────────
+
+
+def test_adapter_failure_retracts_the_vision_channel():
+    """A broken adapter must not leave a stale "cat visible" for the FSM."""
+    proto = ProtoSharedState(allocate_pool())
+    contract = SharedState()
+    adapter = VisionAdapter(proto, contract, image_width=640, image_height=480)
+
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)
+    good = adapter.update()
+    assert good.cat_visible is True
+    assert good.fresh is True
+
+    adapter._publish_fault_state()
+
+    published = contract.get_vision()
+    assert published.cat_visible is False
+    assert published.cat_visible_stable is False
+    assert published.fresh is False
+    assert published.confidence == 0.0
+    # The last genuine sighting stays visible for operators.
+    assert published.last_seen_ms == good.last_seen_ms
+
+
+def test_polling_thread_retracts_vision_after_a_failed_update():
+    adapter, proto, contract = _make_adapter(poll_rate_hz=200.0)
+    proto.set_bbox((300.0, 200.0, 40.0, 40.0, 1.0))
+    adapter.update()
+    assert contract.get_vision().cat_visible is True
+
+    def _boom():
+        raise RuntimeError("tracker read failed")
+
+    proto.get_bbox_tracker = _boom
+    adapter.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if not contract.get_vision().cat_visible:
+                break
+            time.sleep(0.01)
+        published = contract.get_vision()
+        assert published.cat_visible is False
+        assert published.fresh is False
+    finally:
+        adapter.stop()
+
+
+def test_freshness_uses_monotonic_time_not_the_wall_clock():
+    """An NTP step must not make an observation look fresh or stale."""
+    proto = ProtoSharedState(allocate_pool())
+    contract = SharedState()
+    adapter = VisionAdapter(
+        proto, contract, image_width=640, image_height=480, freshness_ttl_ms=50
+    )
+    proto.set_bbox_tracker(300.0, 200.0, 40.0, 40.0, 1.0)
+    state = adapter.update()
+
+    # received_ms comes from the monotonic clock, so it cannot be near the
+    # wall-clock epoch milliseconds reported for display.
+    assert state.received_ms < state.timestamp_ms
+    assert state.fresh is True
 
 
 def test_polling_thread_publishes_updates_and_stops_cleanly():

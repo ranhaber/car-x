@@ -65,9 +65,24 @@ def create_backend(
     *,
     input_size: Tuple[int, int] = (320, 320),
     animal_mode: bool = False,
+    input_format: str | None = None,
 ) -> RknnBackend:
-    """Return the RKNN NPU detection backend (the only backend)."""
-    return RknnBackend(model_path, input_size=input_size, animal_mode=animal_mode)
+    """Return the RKNN NPU detection backend (the only backend).
+
+    ``rknn_input_format`` defaults to RGB, so pairing it with an NV12 model
+    would silently add a CPU colour conversion and feed the NPU the wrong
+    layout. When the filename declares a format, a mismatch is a hard error;
+    when it declares none, NV12 must be opted into explicitly.
+    """
+    from cat_follow.vision.rknn_backend import resolve_input_format
+
+    fmt = resolve_input_format(model_path, input_format or None)
+    return RknnBackend(
+        model_path,
+        input_size=input_size,
+        animal_mode=animal_mode,
+        input_format=fmt,  # type: ignore[arg-type]
+    )
 
 
 __all__ = [

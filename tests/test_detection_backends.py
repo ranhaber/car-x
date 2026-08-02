@@ -38,6 +38,30 @@ def test_rknn_backend_unavailable_without_runtime(tmp_path, monkeypatch):
     assert backend.infer(frame, 0.5) == (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def test_rknn_self_test_validates_nv12_models(monkeypatch):
+    # An NV12 model must be validated through the packed-NV12 input path; the
+    # RGB self-test tensor would not match its input contract.
+    backend = create_backend("models/yolov8n_coco_320_nv12_rk3576.rknn")
+    assert backend.input_format == "nv12"
+
+    inference_shapes = []
+
+    class _FakeRknn:
+        def inference(self, inputs):
+            inference_shapes.append(inputs[0].shape)
+            return _empty_yolo_outputs()
+
+    backend._rknn = _FakeRknn()
+    backend.self_test()
+
+    assert inference_shapes == [(1, 480, 320, 1)]
+
+
+def test_create_backend_rejects_unknown_input_format():
+    with pytest.raises(ValueError):
+        create_backend("models/foo.rknn", input_format="yuv420")
+
+
 def _empty_yolo_outputs():
     outputs = []
     for grid in (40, 20, 10):

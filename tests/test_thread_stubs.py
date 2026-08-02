@@ -492,10 +492,12 @@ def test_detector_escalates_on_repeated_inference_failure(monkeypatch):
         daemon=True,
     )
     t.start()
-    # The worker should escalate within a few ticks and set stop_event itself.
+    # Each failure is driven by a fresh camera generation; the event-driven
+    # detector must never retry the same frozen frame.
     for _ in range(50):
         if stop.is_set():
             break
+        shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
         time.sleep(0.05)
     t.join(timeout=3.0)
     assert stop.is_set(), "detector should escalate repeated failures via stop_event"
@@ -618,6 +620,7 @@ def test_detector_runtime_escalation_fires_on_fatal(monkeypatch):
     for _ in range(50):
         if stop.is_set():
             break
+        shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
         time.sleep(0.05)
     t.join(timeout=3.0)
     assert stop.is_set()

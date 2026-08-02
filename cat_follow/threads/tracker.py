@@ -79,7 +79,10 @@ def run_tracker_loop(
     observation_interval = None
     fps_counter = 0
     fps_timer = time.monotonic()
-    log.info("PredictiveTracker loop started (poll target %.0f FPS).", target_fps)
+    log.info(
+        "PredictiveTracker loop started (detection-event + %.0f FPS coast deadline).",
+        target_fps,
+    )
 
     while not stop_event.is_set():
         started = time.monotonic()
@@ -172,6 +175,10 @@ def run_tracker_loop(
             fps_timer = now
 
         elapsed = now - started
-        stop_event.wait(max(0.0, tick - elapsed))
+        shared.wait_for_detector_update(
+            generation,
+            stop_event,
+            timeout_s=max(0.0, tick - elapsed),
+        )
 
     log.info("PredictiveTracker loop stopped.")

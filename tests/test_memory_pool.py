@@ -49,6 +49,7 @@ def test_frame_ring_shape_and_dtype():
     pool = _make_pool()
     assert pool.frame_ring.shape == (FRAME_RING_N, *FRAME_NV12_SHAPE)
     assert pool.frame_ring.dtype == np.uint8
+    assert pool.crop_ring.shape[0] == FRAME_RING_N
 
 
 def test_frame_nbytes():

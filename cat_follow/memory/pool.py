@@ -21,9 +21,15 @@ FRAME_NV12_SHAPE: tuple = (FRAME_H * 3 // 2, FRAME_W)
 FRAME_SHAPE: tuple = FRAME_NV12_SHAPE
 FRAME_NBYTES: int = FRAME_H * FRAME_W * 3 // 2  # 460 800
 
-# Detector + MJPEG + H.264 may pin independent slots concurrently. Four slots
+# Detector + H.264 may pin independent slots concurrently. Four slots
 # leave the single camera writer one reclaimable slot without blocking.
 FRAME_RING_N: int = 4
+
+# Paired 320×320 NV12 crop buffers: Cam[i] → Crop[i] → RKNN.
+CROP_W: int = 320
+CROP_H: int = 320
+CROP_NV12_SHAPE: tuple = (CROP_H * 3 // 2, CROP_W)
+CROP_RING_N: int = 4
 
 # ---------------------------------------------------------------------------
 # Bbox layout: 5 floats  [x, y, w, h, confidence/valid]
@@ -51,6 +57,9 @@ class MemoryPool:
     # Camera writes into one slot, readers read the latest published index.
     frame_ring: np.ndarray
 
+    # Paired center-bottom crop buffers (uint8, N x (crop_H*3/2) x crop_W).
+    crop_ring: np.ndarray
+
     # Two bbox arrays (float64, length 5 each)
     bbox_tracker: np.ndarray
     bbox_detector: np.ndarray
@@ -69,8 +78,10 @@ def allocate_pool() -> MemoryPool:
     # into a rotating slot and readers can atomically publish the latest
     # index without copying the whole frame twice.
     frame_ring_shape = (FRAME_RING_N, *FRAME_NV12_SHAPE)
+    crop_ring_shape = (CROP_RING_N, *CROP_NV12_SHAPE)
     return MemoryPool(
         frame_ring=np.zeros(frame_ring_shape, dtype=np.uint8),
+        crop_ring=np.zeros(crop_ring_shape, dtype=np.uint8),
         bbox_tracker=np.zeros(BBOX_LEN, dtype=np.float64),
         bbox_detector=np.zeros(BBOX_LEN, dtype=np.float64),
         odometry=np.zeros(ODOM_LEN, dtype=np.float64),

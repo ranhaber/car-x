@@ -36,8 +36,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from cat_follow.camera_config import load_camera_config
 from cat_follow.logger import get_logger
-from cat_follow.memory.pool import FRAME_H, FRAME_W
+from cat_follow.memory.pool import FRAME_H, FRAME_W, CROP_RING_N
 from cat_follow.memory.shared_state import SharedState
 from cat_follow.perception.motion_detector import MotionDetector
 from cat_follow.perception.phase import Phase, PhaseMachine
@@ -45,13 +46,12 @@ from cat_follow.perception.status import update_perception_diagnostics
 from cat_follow.perception.tuning import apply_affinity, set_opencv_threads
 from cat_follow.perception_config import PerceptionConfig, load_perception_config
 from cat_follow.vision.backends import create_backend
+from cat_follow.vision.rga_crop import crop_center_bottom_nv12, crop_backend_name
 from cat_follow.vision.nv12_utils import (
-    center_bottom_nv12_region,
-    extract_nv12_crop,
-    nv12_shape,
     nv12_to_bgr,
     y_plane,
 )
+from cat_follow.vision.zerocopy_backend import ZerocopySession, runtime_available
 
 log = get_logger("thread.detector")
 
@@ -135,6 +135,8 @@ class DetectorFatalHook:
 
     def fire(self, message: str) -> None:
         with self._lock:
+            if self.fired:
+                return
             self.fired = True
             cb = self._cb
             if cb is None:
@@ -152,19 +154,20 @@ def _center_bottom_crop(
     frame_nv12: np.ndarray,
     input_size: tuple[int, int],
     *,
-    dst: Optional[np.ndarray] = None,
+    dst: np.ndarray,
+    src_w: int = FRAME_W,
+    src_h: int = FRAME_H,
 ) -> tuple[np.ndarray, int, int]:
     """Extract a model-sized center-bottom packed NV12 crop."""
     crop_w, crop_h = input_size
-    if crop_w > FRAME_W or crop_h > FRAME_H:
-        raise ValueError(
-            f"RKNN input {crop_w}x{crop_h} exceeds frame {FRAME_W}x{FRAME_H}"
-        )
-    region = center_bottom_nv12_region(FRAME_W, FRAME_H, crop_w, crop_h)
-    crop = extract_nv12_crop(
-        frame_nv12, FRAME_W, FRAME_H, region, dst=dst
+    return crop_center_bottom_nv12(
+        frame_nv12,
+        src_w,
+        src_h,
+        crop_w,
+        crop_h,
+        dst=dst,
     )
-    return crop, region[0], region[1]
 
 
 def build_validated_backend(
@@ -191,7 +194,10 @@ def build_validated_backend(
     """
     path = _resolve_model_path(config, model_path)
     b = create_backend(
-        path, input_size=config.rknn_input_size, animal_mode=config.animal_mode
+        path,
+        input_size=config.rknn_input_size,
+        animal_mode=config.animal_mode,
+        input_format=config.rknn_input_format,
     )
     if not b.runtime_available():
         if config.allow_stub:
@@ -280,6 +286,8 @@ def run_detector_loop(
     if target_fps is None:
         target_fps = config.detect_fps
     tick = 1.0 / target_fps
+    camera_fps = load_camera_config().fps
+    rate_cap_enabled = target_fps < camera_fps * 0.99
     frame_h, frame_w = FRAME_H, FRAME_W
     crop_w, crop_h = config.rknn_input_size
     if crop_w > frame_w or crop_h > frame_h:
@@ -303,13 +311,47 @@ def run_detector_loop(
     )
 
     last_detect_s = time.monotonic()
-    crop_nv12 = np.empty(nv12_shape(crop_w, crop_h), dtype=np.uint8)
+    crop_logged = False
+    zerocopy_active = config.effective_zerocopy() == "dmabuf"
+    zerocopy_session: ZerocopySession | None = None
+    zerocopy_offsets = (0, 0)
 
     # Validate the backend HERE, in the worker, and report to the supervisor.
     # This is the single point of initialization (no preflight double-init): if
     # it fails, the supervisor waiting on the handshake aborts startup.
     try:
-        backend = build_validated_backend(config, model_path)
+        if zerocopy_active:
+            if not runtime_available():
+                raise RuntimeError(
+                    "CAT_FOLLOW_PERCEPTION_ZEROCOPY=dmabuf but native zerocopy "
+                    "runtime is unavailable"
+                )
+            for _ in range(100):
+                zerocopy_session = shared.zerocopy_session()
+                if zerocopy_session is not None:
+                    break
+                if stop_event.wait(0.05):
+                    break
+            if zerocopy_session is None:
+                raise RuntimeError(
+                    "zerocopy requested but camera did not attach a session"
+                )
+            zerocopy_offsets = (
+                zerocopy_session.offset_x,
+                zerocopy_session.offset_y,
+            )
+            if not config.warmup_on_start and not zerocopy_session.unload_model():
+                raise RuntimeError(
+                    "failed to unload native RKNN model after startup "
+                    f"validation: {zerocopy_session.last_error}"
+                )
+            backend = None
+            log.info(
+                "Detector using zerocopy fd path (crop offset=%s).",
+                zerocopy_offsets,
+            )
+        else:
+            backend = build_validated_backend(config, model_path)
     except Exception as exc:  # noqa: BLE001
         log.error("Detector backend validation failed: %s", exc)
         update_perception_diagnostics(
@@ -336,7 +378,7 @@ def run_detector_loop(
         else np.empty((crop_h, crop_w, 3), dtype=np.uint8)
     )
     if handshake is not None:
-        handshake.set_ready(stub_mode=backend is None)
+        handshake.set_ready(stub_mode=backend is None and zerocopy_session is None)
 
     def _escalate(message: str) -> None:
         """Fatal runtime failure: notify the supervisor and stop the app."""
@@ -353,8 +395,11 @@ def run_detector_loop(
         stop_event.set()
 
     log.info(
-        "Detector loop started (backend=%s, motion_gating=%s, target %.1f FPS).",
-        "stub" if backend is None else "rknn",
+        "Detector loop started (backend=%s, crop=%s, motion_gating=%s, target %.1f FPS).",
+        "zerocopy"
+        if zerocopy_session is not None
+        else ("stub" if backend is None else "rknn"),
+        "native-fd" if zerocopy_session is not None else crop_backend_name(),
         config.motion_gating,
         target_fps,
     )
@@ -362,8 +407,42 @@ def run_detector_loop(
     frame_index = 0
     stub_cycle = 0
     lores_gray = None
+    last_frame_gen = 0
+    next_run_at = 0.0
+    # Latches once the loop proves motion gating has no luma source to read.
+    motion_gating_inert = False
     while not stop_event.is_set():
+        wake_gen = shared.wait_for_new_frame(
+            last_frame_gen, stop_event, timeout_s=0.1
+        )
+        if stop_event.is_set():
+            break
+        if wake_gen <= last_frame_gen:
+            # The dev/CI stub has no camera producer, so retain a deadline wake
+            # solely for synthetic output. Real backends require a new frame.
+            if backend is not None or zerocopy_session is not None:
+                continue
+
+        # A lower configured detector rate remains a cap, but the wake source
+        # is always camera publication. While waiting for the cap deadline,
+        # coalesce further camera notifications and process only the newest gen.
+        while (
+            rate_cap_enabled
+            and time.monotonic() < next_run_at
+            and not stop_event.is_set()
+        ):
+            newer_gen = shared.wait_for_new_frame(
+                wake_gen,
+                stop_event,
+                timeout_s=max(0.0, next_run_at - time.monotonic()),
+            )
+            wake_gen = max(wake_gen, newer_gen)
+        if stop_event.is_set():
+            break
+
+        last_frame_gen = wake_gen
         t0 = time.monotonic()
+        next_run_at = t0 + tick if rate_cap_enabled else 0.0
         frame_index += 1
         tick_lease = None
         lease_request_ns = None
@@ -371,12 +450,13 @@ def run_detector_loop(
         published_frame_gen = None
 
         try:
+            warmup_requested = shared.consume_detector_warmup_request()
             # START_CHASE asks this owner thread to load and warm the model. Keeping
             # RKNN ownership here avoids cross-thread runtime calls while ensuring
             # the first chase detection does not pay load/initialization latency.
             if (
                 backend is not None
-                and shared.consume_detector_warmup_request()
+                and warmup_requested
             ):
                 warmup_start = time.perf_counter()
                 try:
@@ -405,12 +485,26 @@ def run_detector_loop(
                     ) / 1_000_000.0
                     if tick_lease is None:
                         has_motion = False
-                    else:
+                    elif tick_lease.frame is not None:
                         motion_result = motion.detect(
                             y_plane(tick_lease.frame, frame_w, frame_h),
                             gray_input=True,
                         )
                         has_motion = motion_result.motion
+                    else:
+                        # A DMA-BUF descriptor contains no motion evidence.
+                        # Require a real lores/luma sample (or disable motion
+                        # gating explicitly) instead of treating every fd-only
+                        # frame as moving.
+                        has_motion = False
+                        if not motion_gating_inert:
+                            motion_gating_inert = True
+                            log.warning(
+                                "Motion gating is inert: frames are DMA-BUF "
+                                "only and no lores luma stream is available. "
+                                "Detection now runs on the phase cadence and "
+                                "mission demand only."
+                            )
             else:
                 has_motion = True
             lores_active = lores_gray is not None
@@ -420,26 +514,88 @@ def run_detector_loop(
             # while inject is active so end-to-end pipeline tests exercise real RKNN.
             if shared.cat_injection_enabled():
                 has_motion = True
+                if zerocopy_session is not None:
+                    # Inject needs CPU NV12 blend; it is incompatible with the
+                    # dmabuf-only detection path. Disable inject rather than
+                    # silently falling back to NumPy/RKNNLite.
+                    log.error(
+                        "Live cat inject is incompatible with ZEROCOPY=dmabuf; "
+                        "disabling inject for this run."
+                    )
+                    shared.set_cat_injection_enabled(False)
 
             # Decide whether to run the model this tick (phase + cadence).
+            # Mission override (SEARCH/CHASE/GOTO+yolo) cannot be suppressed by
+            # PhaseMachine IDLE or motion gating.
             detected_last = False
-            want_detect = (
-                (not config.motion_gating)
-                or phase.should_detect(frame_index)
-                or has_motion
-            )
+            detector_force_off = False
+            detector_required = False
+            mission_override = False
+            if hasattr(shared, "get_perception_intent"):
+                intent = shared.get_perception_intent()
+                detector_force_off = bool(intent.get("detector_force_off"))
+                detector_required = bool(intent.get("detector_required"))
+                mission_override = bool(intent.get("detector_mission_override"))
+            if detector_force_off:
+                want_detect = False
+            elif mission_override or detector_required:
+                want_detect = True
+            else:
+                want_detect = (
+                    (not config.motion_gating)
+                    or phase.should_detect(frame_index)
+                    or has_motion
+                )
+
+            if zerocopy_session is not None and warmup_requested:
+                # The camera thread is actively dequeuing. Never dequeue here:
+                # warm the NPU against a published buffer while its ring lease
+                # prevents QBUF/reuse.
+                if tick_lease is None:
+                    lease_request_ns = time.monotonic_ns()
+                    tick_lease = shared.acquire_latest_frame()
+                    lease_acquire_ms = (
+                        time.monotonic_ns() - lease_request_ns
+                    ) / 1_000_000.0
+                if (
+                    tick_lease is None
+                    or tick_lease.stale
+                    or tick_lease.dmabuf_buffer_index < 0
+                ):
+                    shared.request_detector_warmup()
+                    log.debug("Deferring zerocopy warmup until a valid frame lease")
+                else:
+                    warmup_start = time.perf_counter()
+                    try:
+                        zerocopy_session.warmup(
+                            tick_lease.dmabuf_buffer_index,
+                            score_threshold=score_threshold,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _escalate(f"zerocopy chase-start warmup failed: {exc}")
+                        break
+                    last_detect_s = t0
+                    # Warmup already ran inference; avoid running the same
+                    # leased frame twice. The next camera frame performs the
+                    # first published chase detection without reload latency.
+                    want_detect = False
+                    log.info(
+                        "[RKNN-WARMUP] zerocopy chase request ready in %.2f ms",
+                        (time.perf_counter() - warmup_start) * 1000.0,
+                    )
 
             det: tuple = (0.0, 0.0, 0.0, 0.0, 0.0)
-            if want_detect and backend is not None:
+            if want_detect and (backend is not None or zerocopy_session is not None):
                 set_opencv_threads(config.opencv_threads_active)
-                # Explicit (re)load so a failed reload after idle-unload is treated
-                # as fatal rather than silently running blind.
-                if not backend.loaded and not backend.load():
-                    _escalate(
-                        "RKNN reload failed after idle unload: "
-                        f"{config.rknn_model_path}"
-                    )
-                    break
+                if zerocopy_session is None and backend is not None:
+                    # Explicit (re)load so a failed reload after idle-unload is treated
+                    # as fatal rather than silently running blind.
+                    if not backend.loaded and not backend.load():
+                        _escalate(
+                            "RKNN reload failed after idle unload: "
+                            f"{config.rknn_model_path}"
+                        )
+                        break
                 if tick_lease is None:
                     lease_request_ns = time.monotonic_ns()
                     tick_lease = shared.acquire_latest_frame()
@@ -447,8 +603,6 @@ def run_detector_loop(
                         time.monotonic_ns() - lease_request_ns
                     ) / 1_000_000.0
                 if tick_lease is None:
-                    # Camera has not published yet, or every slot is pinned.
-                    # Do not infer on synthetic pixels or replace prior results.
                     set_opencv_threads(config.opencv_threads_idle)
                 elif tick_lease.stale:
                     log.debug(
@@ -456,15 +610,151 @@ def run_detector_loop(
                         tick_lease.slot_idx,
                     )
                     set_opencv_threads(config.opencv_threads_idle)
-                else:
+                elif (
+                    zerocopy_session is not None
+                    and tick_lease.dmabuf_buffer_index >= 0
+                ):
+                    if (
+                        not zerocopy_session.model_loaded
+                        and not zerocopy_session.load_model()
+                    ):
+                        _escalate(
+                            "zerocopy RKNN reload failed after idle unload: "
+                            f"{zerocopy_session.last_error}"
+                        )
+                        break
                     frame_gen = tick_lease.frame_seq
                     crop_start_ns = time.monotonic_ns()
+                    offset_x, offset_y = zerocopy_offsets
+                    infer_start_ns = crop_start_ns
+                    failures_before = zerocopy_session.consecutive_failures
+                    local_detections = zerocopy_session.infer(
+                        tick_lease.dmabuf_buffer_index,
+                        score_threshold,
+                    )
+                    infer_done_ns = time.monotonic_ns()
+                    crop_done_ns = infer_done_ns
+                    convert_done_ns = infer_done_ns
+                    failures = zerocopy_session.consecutive_failures
+                    if failures >= config.max_infer_failures:
+                        _escalate(
+                            f"zerocopy infer failed {failures} times "
+                            f"({zerocopy_session.last_error})"
+                        )
+                        break
+                    # A failed inference means "no information", not "no cat".
+                    # Publishing its empty result would hand the FSM a
+                    # confident negative, so let the last observation age out
+                    # on freshness instead.
+                    publish_results = failures <= failures_before
+                    if not publish_results:
+                        log.debug(
+                            "zerocopy infer error; withholding result: %s",
+                            zerocopy_session.last_error,
+                        )
+                    detections = [
+                        (
+                            item[0] + offset_x,
+                            item[1] + offset_y,
+                            item[2] + offset_x,
+                            item[3] + offset_y,
+                            item[4],
+                            item[5],
+                        )
+                        for item in local_detections
+                    ]
+                    if detections:
+                        best = max(detections, key=lambda item: item[4])
+                        det = (
+                            float(best[0]),
+                            float(best[1]),
+                            float(best[2] - best[0]),
+                            float(best[3] - best[1]),
+                            float(best[4]),
+                        )
+                    else:
+                        det = (0.0, 0.0, 0.0, 0.0, 0.0)
+                    detected_last = det[4] > 0
+                    if detected_last:
+                        last_detect_s = t0
+                    result_publish_start_ns = time.monotonic_ns()
+                    if publish_results:
+                        published_frame_gen = frame_gen
+                        shared.set_detector_detections(detections, frame_gen)
+                        shared.set_bbox_detector(
+                            det[0],
+                            det[1],
+                            det[2],
+                            det[3],
+                            det[4],
+                            frame_gen=frame_gen,
+                        )
+                    result_publish_done_ns = time.monotonic_ns()
+                    perf = zerocopy_session.last_perf
+                    capture_ms = (
+                        tick_lease.published_ns - tick_lease.capture_started_ns
+                    ) / 1_000_000.0
+                    queue_ms = (
+                        (lease_request_ns or crop_start_ns) - tick_lease.published_ns
+                    ) / 1_000_000.0
+                    crop_ms = float(perf.get("pre", 0.0))
+                    convert_ms = 0.0
+                    infer_call_ms = (
+                        infer_done_ns - infer_start_ns
+                    ) / 1_000_000.0
+                    result_publish_ms = (
+                        result_publish_done_ns - result_publish_start_ns
+                    ) / 1_000_000.0
+                    detector_ms = (
+                        result_publish_done_ns
+                        - (lease_request_ns or crop_start_ns)
+                    ) / 1_000_000.0
+                    end_to_end_ms = (
+                        result_publish_done_ns - tick_lease.capture_started_ns
+                    ) / 1_000_000.0
+                    log.info(
+                        "[DETECT-PERF] gen=%d capture=%.2fms queue=%.2fms "
+                        "lease=%.3fms crop=%.2fms nv12_rgb=%.2fms "
+                        "npu=%.2fms post=%.2fms lifecycle_wait=%.2fms "
+                        "native=%.2fms infer_call=%.2fms publish=%.2fms "
+                        "detector=%.2fms end_to_end=%.2fms path=zerocopy",
+                        frame_gen,
+                        capture_ms,
+                        max(0.0, queue_ms),
+                        lease_acquire_ms,
+                        crop_ms,
+                        convert_ms,
+                        float(perf.get("invoke", 0.0)),
+                        float(perf.get("post", 0.0)),
+                        float(perf.get("lifecycle_wait_ms", 0.0)),
+                        float(perf.get("native_ms", 0.0)),
+                        infer_call_ms,
+                        result_publish_ms,
+                        detector_ms,
+                        end_to_end_ms,
+                    )
+                elif backend is not None:
+                    frame_gen = tick_lease.frame_seq
+                    if tick_lease.frame is None:
+                        set_opencv_threads(config.opencv_threads_idle)
+                        continue
+                    crop_start_ns = time.monotonic_ns()
+                    slot_idx = tick_lease.slot_idx % CROP_RING_N
+                    crop_buf = shared.crop_buffer_for_slot(slot_idx)
                     crop, offset_x, offset_y = _center_bottom_crop(
                         tick_lease.frame,
                         config.rknn_input_size,
-                        dst=crop_nv12,
+                        dst=crop_buf,
                     )
+                    if not crop_logged:
+                        log.info(
+                            "Detector crop path: %s (Cam[i]->Crop[i], slot=%d)",
+                            crop_backend_name(),
+                            slot_idx,
+                        )
+                        crop_logged = True
                     crop_done_ns = time.monotonic_ns()
+                    failures_before = getattr(backend, "consecutive_failures", 0)
                     if direct_nv12_input:
                         convert_done_ns = crop_done_ns
                         infer_start_ns = crop_done_ns
@@ -538,20 +828,29 @@ def run_detector_loop(
                             f"(last error: {getattr(backend, 'last_error', None)})"
                         )
                         break
+                    # See the zerocopy branch: an errored inference must not be
+                    # published as a confident "cat absent".
+                    publish_results = failures <= failures_before
+                    if not publish_results:
+                        log.debug(
+                            "RKNN infer error; withholding result: %s",
+                            getattr(backend, "last_error", None),
+                        )
                     detected_last = det[4] > 0
                     if detected_last:
                         last_detect_s = t0
-                    published_frame_gen = frame_gen
                     result_publish_start_ns = time.monotonic_ns()
-                    shared.set_detector_detections(detections, frame_gen)
-                    shared.set_bbox_detector(
-                        det[0],
-                        det[1],
-                        det[2],
-                        det[3],
-                        det[4],
-                        frame_gen=frame_gen,
-                    )
+                    if publish_results:
+                        published_frame_gen = frame_gen
+                        shared.set_detector_detections(detections, frame_gen)
+                        shared.set_bbox_detector(
+                            det[0],
+                            det[1],
+                            det[2],
+                            det[3],
+                            det[4],
+                            frame_gen=frame_gen,
+                        )
                     result_publish_done_ns = time.monotonic_ns()
 
                     perf = getattr(backend, "last_perf", {})
@@ -601,7 +900,7 @@ def run_detector_loop(
                         detector_ms,
                         end_to_end_ms,
                     )
-            elif backend is not None:
+            elif backend is not None or zerocopy_session is not None:
                 # Not invoking the model this tick; keep the previous bbox.
                 set_opencv_threads(config.opencv_threads_idle)
             else:
@@ -646,27 +945,56 @@ def run_detector_loop(
                 shared.set_detector_detections([], published_frame_gen)
 
             # Idle unload: release the interpreter after a quiet period.
+            # Never unload while mission policy requires the detector.
+            # Force-off (HOME/FAILSAFE) is a definitive "detector must not run",
+            # so it releases the NPU immediately: yard motion would otherwise
+            # keep the phase machine out of IDLE and pin the model forever.
+            can_idle_unload = (
+                config.idle_unload_sec > 0
+                and not detector_required
+                and not mission_override
+                and (
+                    detector_force_off
+                    or (
+                        phase.phase is Phase.IDLE
+                        and (t0 - last_detect_s) >= config.idle_unload_sec
+                    )
+                )
+            )
             if (
                 backend is not None
                 and backend.loaded
-                and config.idle_unload_sec > 0
-                and phase.phase is Phase.IDLE
-                and (t0 - last_detect_s) >= config.idle_unload_sec
+                and can_idle_unload
             ):
                 backend.unload()
                 set_opencv_threads(config.opencv_threads_idle)
+            elif (
+                zerocopy_session is not None
+                and zerocopy_session.model_loaded
+                and can_idle_unload
+            ):
+                if not zerocopy_session.unload_model():
+                    _escalate(
+                        "zerocopy RKNN idle unload failed: "
+                        f"{zerocopy_session.last_error}"
+                    )
+                    break
+                set_opencv_threads(config.opencv_threads_idle)
 
+            model_loaded = bool(
+                zerocopy_session.model_loaded
+                if zerocopy_session is not None
+                else (backend is not None and backend.loaded)
+            )
             update_perception_diagnostics(
                 phase=phase.phase.value,
-                backend="rknn",
-                model_loaded=bool(backend is not None and backend.loaded),
+                backend="zerocopy" if zerocopy_session is not None else "rknn",
+                model_loaded=model_loaded,
                 lores_active=lores_active,
                 motion=has_motion,
                 motion_gating=config.motion_gating,
             )
         finally:
             if tick_lease is not None:
+                last_frame_gen = max(last_frame_gen, tick_lease.frame_seq)
                 tick_lease.release()
-
-        elapsed = time.monotonic() - t0
-        time.sleep(max(0.0, tick - elapsed))

@@ -12,7 +12,8 @@ def test_nv12_pipeline_avoids_videoconvert():
     assert "mpph264enc" in pipeline
     assert "profile=baseline" in pipeline
     assert "stream-format=byte-stream" in pipeline
-    assert "drop=false" in pipeline
+    assert "drop=true" in pipeline
+    assert "max-buffers=2" in pipeline
 
 
 def test_bgr_compatibility_pipeline_keeps_videoconvert():

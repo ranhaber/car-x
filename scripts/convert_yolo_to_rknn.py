@@ -9,24 +9,31 @@ The ONNX MUST be the airockchip ``rknn_model_zoo`` head:
 A plain Ultralytics ``yolo export`` emits one ``(1, 84, N)`` tensor and is
 not accepted by the production YOLO postprocess.
 
-This project does not ship a calibration image set. Prefer ``--no-quant``
-(FP model). Pass ``--dataset`` only if you later add INT8 calibration images.
+The supported input format is RGB uint8 ``(1, H, W, 3)`` with mean=0/std=255.
+RKNN Toolkit2 cannot turn a three-channel YOLO ONNX tensor into a packed NV12
+tensor by overriding ``input_size_list``. Use RGA NV12→RGB conversion before
+RKNN for a zero-copy camera path.
 
-Example (rk3576, no quantization)::
+Example (rk3576 RGB INT8)::
 
     python scripts/convert_yolo_to_rknn.py \\
         --onnx yolov8n_320.onnx \\
-        --output models/yolov8n_coco_320_rk3576.rknn \\
+        --output models/yolov8n_coco_320_rk3576_int8.rknn \\
         --platform rk3576 \\
-        --no-quant
-
-Mean/std ``0 / 255``: feed RGB uint8; the NPU normalizes to 0..1.
+        --dataset calib_rgb.txt
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+
+
+def _parse_input_format(value: str) -> str:
+    fmt = value.strip().lower()
+    if fmt not in ("rgb", "nv12"):
+        raise argparse.ArgumentTypeError("input-format must be rgb or nv12")
+    return fmt
 
 
 def main() -> None:
@@ -42,6 +49,25 @@ def main() -> None:
         help="target_platform (default rk3576 for ROCK 4D)",
     )
     parser.add_argument(
+        "--input-format",
+        type=_parse_input_format,
+        default="rgb",
+        choices=("rgb", "nv12"),
+        help="Runtime input layout (default rgb)",
+    )
+    parser.add_argument(
+        "--input-width",
+        type=int,
+        default=320,
+        help="Model input width (default 320)",
+    )
+    parser.add_argument(
+        "--input-height",
+        type=int,
+        default=320,
+        help="Model input height (default 320)",
+    )
+    parser.add_argument(
         "--dataset",
         default=None,
         help="Optional INT8 calibration list (one image path per line)",
@@ -55,6 +81,11 @@ def main() -> None:
     parser.add_argument("--std", type=float, nargs=3, default=[255.0, 255.0, 255.0])
     args = parser.parse_args()
 
+    if args.input_format == "nv12":
+        raise SystemExit(
+            "packed NV12 model conversion is unsupported: the YOLO ONNX input "
+            "is RGB [N,3,H,W]. Build an RGB RKNN model and use RGA NV12->RGB."
+        )
     if not os.path.exists(args.onnx):
         raise SystemExit(f"ONNX not found: {args.onnx}")
     if not args.no_quant and not args.dataset:
@@ -72,8 +103,16 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
+    in_w = int(args.input_width)
+    in_h = int(args.input_height)
+    input_size_list = [[1, in_h, in_w, 3]]
+
     rknn = RKNN(verbose=True)
-    print(f"[convert] config: platform={args.platform} mean={args.mean} std={args.std}")
+    print(
+        f"[convert] config: platform={args.platform} "
+        f"input={args.input_format} size={input_size_list[0]} "
+        f"mean={args.mean} std={args.std}"
+    )
     rknn.config(
         mean_values=[args.mean],
         std_values=[args.std],
@@ -81,7 +120,13 @@ def main() -> None:
     )
 
     print(f"[convert] load_onnx: {args.onnx}")
-    if rknn.load_onnx(model=args.onnx) != 0:
+    if (
+        rknn.load_onnx(
+            model=args.onnx,
+            input_size_list=input_size_list,
+        )
+        != 0
+    ):
         raise SystemExit("load_onnx failed")
 
     do_quant = not args.no_quant
@@ -97,7 +142,7 @@ def main() -> None:
     size_mb = os.path.getsize(args.output) / (1024.0 * 1024.0)
     print(
         f"[convert] OK -> {args.output} ({size_mb:.1f} MB, "
-        f"{'INT8' if do_quant else 'FP'})"
+        f"{'INT8' if do_quant else 'FP'}, input={args.input_format})"
     )
 
 

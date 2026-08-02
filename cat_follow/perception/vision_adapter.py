@@ -33,6 +33,14 @@ every publish.  The adapter counts stability and advances ``received_ms``
 only when the generation changes (a genuinely new tracker observation), so a
 frozen/dead tracker ages out via the DecisionEngine's freshness rules instead
 of the adapter counting its own poll rate as "stable" frames.
+
+Every age and freshness decision uses the monotonic ``received_ms``;
+``timestamp_ms`` is wall-clock and exists only for operator-facing display, so
+an NTP step cannot make an observation look fresh or stale.
+
+If ``update()`` raises, the adapter retracts the channel (``fresh=False``,
+``cat_visible=False``) rather than leaving the last good observation
+published for the DecisionEngine to act on.
 """
 
 from __future__ import annotations
@@ -58,6 +66,11 @@ DEFAULT_POLL_RATE_HZ = 30.0
 # Default consecutive-frame requirement before declaring a stable lock.
 DEFAULT_STABILITY_FRAMES = 3
 
+# Default age past which a published observation stops counting as fresh.
+# Production wiring passes ``TargetRuntimeConfig.local_track_stale_ms`` so the
+# reported flag matches the staleness rule DecisionEngine actually applies.
+DEFAULT_FRESHNESS_TTL_MS = 350
+
 
 class _PrototypeVisionStateLike(Protocol):
     """Subset of the prototype ``SharedState`` API used by the adapter."""
@@ -81,6 +94,7 @@ class VisionAdapter:
         *,
         stability_frames: int = DEFAULT_STABILITY_FRAMES,
         poll_rate_hz: float = DEFAULT_POLL_RATE_HZ,
+        freshness_ttl_ms: int = DEFAULT_FRESHNESS_TTL_MS,
         logger: Optional[AsyncLogger] = None,
         thread_name: str = "CatFollow-VisionAdapter",
         source: str = "VisionAdapter",
@@ -93,6 +107,8 @@ class VisionAdapter:
             raise ValueError("stability_frames must be >= 1")
         if poll_rate_hz <= 0:
             raise ValueError("poll_rate_hz must be positive")
+        if freshness_ttl_ms <= 0:
+            raise ValueError("freshness_ttl_ms must be positive")
 
         self._proto_ss = prototype_shared_state
         self._contract_ss = contract_shared_state
@@ -100,6 +116,7 @@ class VisionAdapter:
         self._image_height = float(image_height)
         self._stability_frames = stability_frames
         self._poll_rate_hz = poll_rate_hz
+        self._freshness_ttl_ms = int(freshness_ttl_ms)
         self._logger = logger
         self._thread_name = thread_name
         self._source = source
@@ -174,17 +191,34 @@ class VisionAdapter:
             cat_visible and self._consecutive_visible >= self._stability_frames
         )
         received_ms = self._last_received_ms if cat_visible else now
+        active_target_id = self._contract_ss.get_mission().active_target_id
+
+        # A coasting tracker keeps reporting the cat without advancing
+        # ``received_ms``, so freshness must be judged by observation age, not
+        # by visibility. Otherwise status would show "fresh" for a channel the
+        # DecisionEngine has already aged out.
+        fresh = (
+            cat_visible
+            and received_ms > 0
+            and (now - received_ms) <= self._freshness_ttl_ms
+        )
 
         new_state = VisionState(
             timestamp_ms=int(time.time() * 1000),
             received_ms=received_ms,
-            fresh=cat_visible,
+            fresh=fresh,
             authority=self._source,
             cat_visible=cat_visible,
             cat_visible_stable=cat_visible_stable,
             x_offset_norm=x_offset_norm,
             confidence=max(0.0, min(1.0, valid)) if cat_visible else 0.0,
             last_seen_ms=self._last_seen_ms,
+            observation_sequence=gen,
+            # The current prototype tracker owns one PRIMARY_CAT slot. During
+            # migration, bind that slot to the active protocol target; the
+            # future association layer will replace this adapter evidence.
+            associated_target_id=active_target_id if cat_visible else None,
+            association_ambiguous=False,
         )
         self._contract_ss.update_vision(new_state)
         self._log_update(new_state)
@@ -201,7 +235,37 @@ class VisionAdapter:
                 # Adapter errors must never kill the thread; log via
                 # thread_health and continue.
                 self._log_thread_exception()
+                self._publish_fault_state()
             self._stop.wait(period_s)
+
+    def _publish_fault_state(self) -> None:
+        """Retract the vision channel after a failed update.
+
+        Leaving the last good observation published would let the
+        DecisionEngine keep steering toward a cat this adapter can no longer
+        confirm.
+        """
+        self._consecutive_visible = 0
+        try:
+            self._contract_ss.update_vision(
+                VisionState(
+                    timestamp_ms=int(time.time() * 1000),
+                    received_ms=self._last_received_ms,
+                    fresh=False,
+                    authority=self._source,
+                    cat_visible=False,
+                    cat_visible_stable=False,
+                    x_offset_norm=0.0,
+                    confidence=0.0,
+                    last_seen_ms=self._last_seen_ms,
+                    observation_sequence=self._last_bbox_gen,
+                    associated_target_id=None,
+                    association_ambiguous=False,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            # Shared state itself is failing; the thread must still survive.
+            self._log_thread_exception()
 
     def _compute_offset(self, x: float, w: float) -> float:
         cat_center_x = x + w / 2.0

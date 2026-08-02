@@ -43,6 +43,19 @@ except Exception:  # pragma: no cover - only on boards with GStreamer
     _HAS_GST = False
 
 
+def _release_lease(lease) -> None:  # noqa: ANN001
+    """Release one camera lease without aborting the rest of a drain.
+
+    Releasing a lease can requeue a V4L2 buffer, and a failed QBUF raises after
+    it has already escalated to the supervisor. Letting that propagate here
+    would strand the remaining pending leases pinned.
+    """
+    try:
+        lease.release()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Camera lease release failed during H.264 drain: %s", exc)
+
+
 class MppH264Encoder:
     """Encode packed NV12 or BGR frames via the Rockchip VPU."""
 
@@ -54,6 +67,7 @@ class MppH264Encoder:
         bitrate_kbps: int = 4000,
         *,
         pixel_format: str = "NV12",
+        container: str = "annexb",
     ) -> None:
         self._w = int(width)
         self._h = int(height)
@@ -64,6 +78,12 @@ class MppH264Encoder:
             raise ValueError(
                 f"unsupported H.264 input format {pixel_format!r}; "
                 "expected NV12 or BGR"
+            )
+        self._container = str(container).lower()
+        if self._container not in {"annexb", "matroska"}:
+            raise ValueError(
+                f"unsupported H.264 container {container!r}; "
+                "expected annexb or matroska"
             )
         self._pipeline = None
         self._appsrc = None
@@ -110,7 +130,25 @@ class MppH264Encoder:
     def _pipeline_description(self) -> str:
         """Build the GStreamer pipeline without touching board-only APIs."""
         convert = " ! videoconvert" if self._pixel_format == "BGR" else ""
-        # Baseline + Annex-B byte-stream matches Chrome WebCodecs reliably.
+        if self._container == "matroska":
+            # ``streamable`` writes headers up front: an appsink cannot seek
+            # back to patch duration/cues, and a recording must stay playable
+            # even if power is lost mid-segment. ``drop=false`` because losing
+            # a muxed chunk corrupts the file, unlike a dropped live frame.
+            tail = (
+                "! h264parse config-interval=-1 "
+                "! matroskamux streamable=true "
+                "! appsink name=sink emit-signals=false sync=false "
+                "max-buffers=8 drop=false"
+            )
+        else:
+            # Baseline + Annex-B byte-stream matches Chrome WebCodecs reliably.
+            tail = (
+                "! h264parse config-interval=-1 "
+                "! video/x-h264,stream-format=byte-stream,alignment=au "
+                "! appsink name=sink emit-signals=false sync=false "
+                "max-buffers=2 drop=true"
+            )
         return (
             f"appsrc name=src is-live=true format=time do-timestamp=true "
             f"caps=video/x-raw,format={self._pixel_format},"
@@ -118,10 +156,7 @@ class MppH264Encoder:
             f"framerate={self._fps}/1 "
             f"{convert} ! mpph264enc bps={self._bitrate * 1000} "
             f"profile=baseline level=40 "
-            f"! h264parse config-interval=-1 "
-            f"! video/x-h264,stream-format=byte-stream,alignment=au "
-            f"! appsink name=sink emit-signals=false sync=false "
-            f"max-buffers=4 drop=false"
+            f"{tail}"
         )
 
     def submit(self, frame: np.ndarray) -> list[bytes]:
@@ -167,10 +202,10 @@ class MppH264Encoder:
             or self._appsink is None
             or self._dmabuf_allocator is None
         ):
-            lease.release()
+            _release_lease(lease)
             return []
         if not getattr(lease, "dmabuf", False):
-            lease.release()
+            _release_lease(lease)
             raise ValueError("submit_dmabuf requires a DMA-BUF frame lease")
 
         chunks: list[bytes] = []
@@ -180,10 +215,11 @@ class MppH264Encoder:
         with self._io_lock:
             dup_fd = -1
             pending_pts = None
+            submitted = False
             try:
                 chunks.extend(self._drain_encoded_locked())
                 if len(self._pending_leases) >= _MAX_PENDING_CAMERA_LEASES:
-                    lease.release()
+                    _release_lease(lease)
                     return chunks
 
                 stride = int(lease.dmabuf_stride or self._w)
@@ -224,10 +260,13 @@ class MppH264Encoder:
                 buf.pts = pending_pts
                 buf.dts = pending_pts
                 buf.duration = Gst.SECOND // self._fps
-                self._pending_leases[pending_pts] = lease
                 flow = self._appsrc.emit("push-buffer", buf)
                 if flow != Gst.FlowReturn.OK:
                     raise RuntimeError(f"appsrc push-buffer failed: {flow}")
+                # Pin the camera lease only after MPP accepted the buffer.
+                # If push blocks or fails, the lease must not enter pending.
+                self._pending_leases[pending_pts] = lease
+                submitted = True
                 chunks.extend(
                     self._drain_encoded_locked(wait_ns=10 * Gst.MSECOND)
                 )
@@ -235,12 +274,11 @@ class MppH264Encoder:
             except Exception as exc:  # noqa: BLE001
                 if dup_fd >= 0:
                     os.close(dup_fd)
-                if pending_pts is not None:
-                    pending = self._pending_leases.pop(pending_pts, None)
-                    if pending is not None:
-                        pending.release()
-                else:
-                    lease.release()
+                if not submitted:
+                    _release_lease(lease)
+                # Once MPP has accepted the buffer it may still be reading the
+                # camera DMA-BUF, so a later failure (e.g. drain/map) must leave
+                # the lease pinned. stop()/poll() release it after the flush.
                 log.warning("MPP DMA-BUF encode step failed: %s", exc)
                 return chunks
 
@@ -248,6 +286,34 @@ class MppH264Encoder:
         """Return delayed access units even when no newer frame is submitted."""
         with self._io_lock:
             return self._drain_encoded_locked(wait_ns=wait_ns)
+
+    def finish(self, *, budget_ms: int = 500) -> list[bytes]:
+        """End the stream and return every remaining encoded chunk.
+
+        A muxed container is only a valid file once its trailing bytes are
+        written, so callers recording to disk must persist what this returns
+        before closing the segment.
+        """
+        chunks: list[bytes] = []
+        with self._io_lock:
+            if self._appsrc is None or self._appsink is None:
+                return chunks
+            try:
+                self._appsrc.emit("end-of-stream")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("H.264 end-of-stream signal failed: %s", exc)
+            slice_ns = int(20 * Gst.MSECOND)
+            remaining_ms = max(0, int(budget_ms))
+            idle_ms = 0
+            while remaining_ms > 0 and idle_ms < 100:
+                batch = self._drain_encoded_locked(wait_ns=slice_ns)
+                remaining_ms -= 20
+                if batch:
+                    chunks.extend(batch)
+                    idle_ms = 0
+                else:
+                    idle_ms += 20
+        return chunks
 
     def _drain_encoded_locked(self, *, wait_ns: int = 0) -> list[bytes]:
         """Pull every ready encoded sample and release matching input leases."""
@@ -259,7 +325,7 @@ class MppH264Encoder:
             if sample is None:
                 break
             gst_buf = sample.get_buffer()
-            self._release_input_for_pts(int(gst_buf.pts))
+            self._release_input_for_pts(gst_buf.pts)
             ok, mapinfo = gst_buf.map(Gst.MapFlags.READ)
             if not ok:
                 continue
@@ -271,7 +337,7 @@ class MppH264Encoder:
             sample = self._appsink.emit("try-pull-sample", int(wait_ns))
             if sample is not None:
                 gst_buf = sample.get_buffer()
-                self._release_input_for_pts(int(gst_buf.pts))
+                self._release_input_for_pts(gst_buf.pts)
                 ok, mapinfo = gst_buf.map(Gst.MapFlags.READ)
                 if ok:
                     try:
@@ -280,16 +346,51 @@ class MppH264Encoder:
                         gst_buf.unmap(mapinfo)
         return chunks
 
-    def _release_input_for_pts(self, pts: int) -> None:
-        lease = self._pending_leases.pop(pts, None)
-        if lease is None and self._pending_leases:
+    def _normalize_output_pts(self, pts) -> Optional[int]:  # noqa: ANN001
+        if pts is None:
+            return None
+        try:
+            value = int(pts)
+        except (TypeError, ValueError):
+            return None
+        if value < 0:
+            return None
+        none_value = getattr(Gst, "CLOCK_TIME_NONE", None)
+        if none_value is not None and value == int(none_value):
+            return None
+        return value
+
+    def _release_input_for_pts(self, pts) -> None:  # noqa: ANN001
+        normalized = self._normalize_output_pts(pts)
+        lease = None
+        if normalized is not None:
+            lease = self._pending_leases.pop(normalized, None)
+        if lease is None and len(self._pending_leases) == 1:
             # Baseline H.264 has no B-frame reordering. Some Rockchip MPP
-            # builds do not preserve PTS; release FIFO so the sole pending
-            # camera lease cannot pin V4L2 indefinitely.
+            # builds do not preserve PTS; with cap=1, any completed output
+            # corresponds to the sole pending input.
             oldest_pts = next(iter(self._pending_leases))
             lease = self._pending_leases.pop(oldest_pts)
         if lease is not None:
-            lease.release()
+            _release_lease(lease)
+
+    def _flush_pipeline_locked(self) -> None:
+        """Drain encoded output before tearing down in-flight DMA-BUF reads."""
+        if self._appsrc is not None:
+            try:
+                self._appsrc.emit("end-of-stream")
+            except Exception:  # noqa: BLE001
+                pass
+        deadline_ns = int(250 * Gst.MSECOND)
+        while deadline_ns > 0:
+            before = len(self._pending_leases)
+            self._drain_encoded_locked(wait_ns=min(deadline_ns, int(10 * Gst.MSECOND)))
+            if not self._pending_leases:
+                break
+            if len(self._pending_leases) == before:
+                deadline_ns -= int(10 * Gst.MSECOND)
+            else:
+                deadline_ns = int(250 * Gst.MSECOND)
 
     def encode(self, frame: np.ndarray) -> Optional[bytes]:
         """Compatibility wrapper; prefer :meth:`submit` for lossless streaming."""
@@ -302,10 +403,17 @@ class MppH264Encoder:
         return chunks[-1] if chunks else None
 
     def stop(self) -> None:
+        pipeline = None
         with self._io_lock:
-            if self._pipeline is not None:
+            pipeline = self._pipeline
+            if pipeline is not None:
                 try:
-                    self._pipeline.set_state(Gst.State.NULL)
+                    self._flush_pipeline_locked()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    pipeline.set_state(Gst.State.NULL)
+                    pipeline.get_state(int(Gst.SECOND))
                 except Exception:  # noqa: BLE001
                     pass
             self._pipeline = None
@@ -315,7 +423,7 @@ class MppH264Encoder:
             pending = tuple(self._pending_leases.values())
             self._pending_leases.clear()
         for lease in pending:
-            lease.release()
+            _release_lease(lease)
 
 
 __all__ = ["MppH264Encoder"]
