@@ -247,6 +247,65 @@ def test_tracking_ingress_continues_while_a_command_is_committing():
         receiver.stop()
 
 
+def test_stop_abandons_queued_commands_instead_of_committing_them():
+    """Shutdown must drop the backlog, not commit it one blocking call apiece."""
+
+    captured = []
+    logger = AsyncLogger(
+        sink=CallableSink(captured.append),
+        max_queue=64,
+        flush_interval_s=0.05,
+    )
+    logger.start()
+    manager, _, _ = _make_manager_and_acks()
+    receiver, _ = _start_receiver(manager, logger=logger)
+    command_thread = receiver._command_thread
+    committed = []
+    entered = threading.Event()
+
+    def _blocks_until_shutdown(msg):
+        committed.append(msg.command_id)
+        entered.set()
+        # Stands in for a commit that only unblocks once the control loop is
+        # being torn down, which is exactly when the backlog must be dropped.
+        deadline = time.monotonic() + 5.0
+        while not receiver._stop.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    manager.submit_command = _blocks_until_shutdown
+    try:
+        for i in range(8):
+            receiver._command_queue.put_nowait(
+                (
+                    CommandMessage(
+                        sequence=3000 + i,
+                        timestamp_ms=10,
+                        command_id=f"cmd-backlog-{i}",
+                        command=CommandName.STOP_CHASE,
+                        params={},
+                    ),
+                    ("127.0.0.1", 5000),
+                )
+            )
+        assert entered.wait(timeout=2.0)
+        receiver.stop(timeout=2.0)
+
+        assert not command_thread.is_alive()
+        # Only the command already in flight when stop() was requested commits.
+        assert committed == ["cmd-backlog-0"]
+        assert _wait_until(
+            lambda: sum(
+                1
+                for e in captured
+                if e["data"].get("cause") == "receiver_stopping"
+            )
+            == 7
+        )
+    finally:
+        receiver.stop(timeout=2.0)
+        logger.stop()
+
+
 def test_receiver_survives_unexpected_handler_error():
     captured = []
     logger = AsyncLogger(

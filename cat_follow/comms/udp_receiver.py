@@ -195,6 +195,9 @@ class UdpReceiver:
                 if self._stop.is_set():
                     return
                 continue
+            if self._stop.is_set():
+                self._discard_backlog(item)
+                return
             msg, addr = item
             try:
                 if isinstance(msg, CommandMessage):
@@ -208,6 +211,26 @@ class UdpReceiver:
                 self._log_packet_error(addr, "commit_timeout", str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._log_packet_error(addr, "handler_error", repr(exc))
+
+    def _discard_backlog(self, item: "_QueuedMessage") -> None:
+        """Drop queued commands once shutdown has been requested.
+
+        Committing them would be wrong twice over: the operator intent is
+        stale, and a control loop that is itself stopping makes every submit
+        block for the full commit timeout, which would keep this thread alive
+        for ``command_queue_size * commit_timeout`` seconds past ``stop``.
+        """
+
+        while True:
+            self._log_packet_error(
+                item[1],
+                "receiver_stopping",
+                "command dropped without commit; receiver is shutting down",
+            )
+            try:
+                item = self._command_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def _enqueue_command(
         self, msg: "_ContractMessage", addr: Tuple[str, int]
