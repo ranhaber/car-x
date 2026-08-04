@@ -29,6 +29,7 @@ import os
 from typing import Optional, Protocol
 
 from cat_follow.logger import get_logger
+from cat_follow.memory.shared_state import FrameConsumer
 from cat_follow.perception.h264_encoder import MppH264Encoder
 from cat_follow.perception.recording_writer import (
     AccessUnitEncoder,
@@ -44,7 +45,7 @@ DEFAULT_RECORDING_BITRATE_KBPS = 4000
 class FrameLeaseSource(Protocol):
     """The frame-ring subset the recording encoder consumes."""
 
-    def acquire_latest_frame(self): ...
+    def acquire_latest_frame(self, *, consumer: FrameConsumer): ...
 
 
 def allow_stub_recording() -> bool:
@@ -129,7 +130,7 @@ class MppRecordingEncoder:
         encoder = self._encoder
         if encoder is None:
             return []
-        lease = self._frames.acquire_latest_frame()
+        lease = self._frames.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
         if lease is None:
             return encoder.poll()
         if not getattr(lease, "dmabuf", False):

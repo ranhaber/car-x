@@ -8,12 +8,38 @@ inside the get/set methods.
 
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from enum import Enum
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 
 from cat_follow.memory.pool import MemoryPool, BBOX_LEN, ODOM_LEN
 from cat_follow.memory.pool import FRAME_SHAPE
+
+
+class FrameConsumer(str, Enum):
+    """Ring readers ordered by product priority under slot pressure.
+
+    Camera never acquires; it only writes via ``try_get_write_buffer``.
+    Admission reserves reclaimable slots so Camera > Detector > Recording >
+    Web UI holds when pins are scarce.
+    """
+
+    DETECTOR = "detector"
+    RECORDING = "recording"
+    STREAM = "stream"
+
+    @property
+    def refusable(self) -> bool:
+        """Whether admission may deny this consumer to protect a higher tier."""
+        return self is not FrameConsumer.DETECTOR
+
+
+# The writer needs two slots it can always cycle through: the latest published
+# frame, which it never reclaims, plus one reclaimable slot to capture into.
+# Readers therefore never pin more than ``FRAME_RING_N - 2`` distinct slots, and
+# the camera never drops a frame because of leases.
+CAMERA_RESERVED_SLOTS = 2
 
 
 class DmabufRequeueError(RuntimeError):
@@ -35,10 +61,14 @@ class FrameLease:
     underlying V4L2 buffer through the registered callback -- unless the slot
     is still the latest published frame, whose buffer is only handed back once
     a newer capture supersedes it.
+
+    ``consumer`` records the admission tier that pinned the slot, so releasing
+    hands that tier's share of the ring budget back rather than a generic pin.
     """
 
     __slots__ = (
         "_owner",
+        "consumer",
         "frame",
         "frame_seq",
         "capture_started_ns",
@@ -62,12 +92,14 @@ class FrameLease:
         slot_generation: int,
         frame: Optional[np.ndarray],
         *,
+        consumer: FrameConsumer,
         dmabuf_fd: int = -1,
         dmabuf_buffer_index: int = -1,
         dmabuf_stride: int = 0,
         dmabuf_size: int = 0,
     ) -> None:
         self._owner = owner
+        self.consumer = consumer
         self.slot_idx = slot_idx
         self.frame_seq = frame_seq
         self.capture_started_ns = capture_started_ns
@@ -100,7 +132,7 @@ class FrameLease:
         """Release this reader's pin. Safe to call more than once."""
         if self._released:
             return
-        self._owner._release_frame_slot(self.slot_idx)
+        self._owner._release_frame_slot(self.slot_idx, self.consumer)
         self._released = True
 
 
@@ -144,6 +176,9 @@ class SharedState:
         self._latest_idx = -1
         self._active_write_idx: Optional[int] = None
         self._slot_refcounts = [0] * self._ring_n
+        # Pins held by refusable consumers (recording / stream), tracked apart
+        # from the total so a detector pin never spends the refusable budget.
+        self._slot_refusable_refcounts = [0] * self._ring_n
         # Odd means write in progress; even means stable/published.
         self._slot_generations = [0] * self._ring_n
         self._slot_frame_seqs = [0] * self._ring_n
@@ -191,6 +226,7 @@ class SharedState:
         self._capture_active = True
         self._detector_required = False
         self._detector_mission_override = False
+        self._recording_required = False
         self._stream_forced_off = False
         self._detector_force_off = False
 
@@ -206,6 +242,10 @@ class SharedState:
         self._slot_dmabuf_size = [0] * self._ring_n
         self._slot_dmabuf_stride = [0] * self._ring_n
 
+        # Latest-wins denials per consumer. Cheap observability for status and
+        # board soak; a detector denial means detection itself lost a capture.
+        self._admission_denied = {consumer.value: 0 for consumer in FrameConsumer}
+
     def set_perception_intent(
         self,
         *,
@@ -213,6 +253,7 @@ class SharedState:
         detector_required: bool,
         detector_mission_override: bool,
         stream_forced_off: bool,
+        recording_required: bool = False,
         detector_force_off: bool = False,
     ) -> None:
         """Publish lifecycle intent for camera/detector owner threads."""
@@ -221,6 +262,7 @@ class SharedState:
             self._capture_active = bool(capture_active)
             self._detector_required = bool(detector_required)
             self._detector_mission_override = bool(detector_mission_override)
+            self._recording_required = bool(recording_required)
             self._stream_forced_off = bool(stream_forced_off)
             self._detector_force_off = bool(detector_force_off)
 
@@ -234,6 +276,7 @@ class SharedState:
                 "detector_mission_override": (
                     self._detector_mission_override and not force_off
                 ),
+                "recording_required": self._recording_required,
                 "stream_forced_off": self._stream_forced_off,
                 "detector_force_off": force_off,
             }
@@ -249,6 +292,10 @@ class SharedState:
     def detector_mission_override(self) -> bool:
         with self._lock_perception_intent:
             return self._detector_mission_override and not self._detector_force_off
+
+    def recording_required(self) -> bool:
+        with self._lock_perception_intent:
+            return self._recording_required
 
     def stream_forced_off(self) -> bool:
         with self._lock_perception_intent:
@@ -596,8 +643,72 @@ class SharedState:
             self._active_write_idx = None
             self._write_idx = (idx + 1) % self._ring_n
 
-    def acquire_latest_frame(self) -> Optional[FrameLease]:
-        """Pin and return the latest stable frame without copying pixels."""
+    def _pinned_slot_counts_locked(self) -> Tuple[int, int]:
+        """Distinct pinned slots as ``(total, refusable)``.
+
+        The active write slot is deliberately excluded: readers only ever pin
+        the latest published slot, which the writer never reserves.
+        """
+        total = 0
+        refusable = 0
+        for idx in range(self._ring_n):
+            if self._slot_refcounts[idx] > 0:
+                total += 1
+                if self._slot_refusable_refcounts[idx] > 0:
+                    refusable += 1
+        return total, refusable
+
+    def _admit_acquire_locked(
+        self, consumer: FrameConsumer, latest_idx: int
+    ) -> bool:
+        """Whether *consumer* may pin ``latest_idx`` without starving higher tiers.
+
+        Priority is Camera > Detector > Recording > Web UI:
+
+        - an already-pinned slot costs nothing, so same-latest multi-reader
+          (detector + stream on the current capture) is always admitted;
+        - a new distinct pin must leave ``CAMERA_RESERVED_SLOTS`` slots for the
+          writer, which is what keeps the camera from dropping on leases;
+        - while the detector is required it keeps one further distinct pin, so
+          a slow RKNN tick can still pin the next capture;
+        - while recording is required the stream gives up one beyond that, so
+          recording wins the last refusable distinct pin. Reservations follow
+          demand, so an idle recorder does not cost the live view its pin.
+        """
+        if self._slot_refcounts[latest_idx] > 0:
+            return True
+
+        pinned, refusable_pinned = self._pinned_slot_counts_locked()
+        budget = self._ring_n - CAMERA_RESERVED_SLOTS
+        if pinned + 1 > budget:
+            return False
+        if not consumer.refusable:
+            return True
+
+        # Intent flags are published under a different lock, and reading them
+        # here without it keeps the frame lock free of nested acquisition. A
+        # one-tick-stale snapshot only shifts which reader drops a frame.
+        detector_required = self._detector_required and not self._detector_force_off
+        recording_required = self._recording_required
+
+        limit = budget
+        if detector_required:
+            limit -= 1
+        if recording_required and consumer is FrameConsumer.STREAM:
+            limit -= 1
+        return refusable_pinned + 1 <= limit
+
+    def acquire_latest_frame(
+        self, *, consumer: FrameConsumer
+    ) -> Optional[FrameLease]:
+        """Pin and return the latest stable frame without copying pixels.
+
+        Admission keeps the camera writer and the detector ahead of recording
+        and the web UI: a refusable consumer is denied a *new* distinct slot
+        that a higher tier still needs, while pinning an already-pinned slot is
+        always allowed. Refusal returns ``None`` — a latest-wins drop at the
+        reader, never a camera block.
+        """
         with self._lock_frame:
             idx = self._latest_idx
             if idx < 0:
@@ -605,7 +716,12 @@ class SharedState:
             slot_generation = self._slot_generations[idx]
             if slot_generation % 2 != 0:
                 return None
+            if not self._admit_acquire_locked(consumer, idx):
+                self._admission_denied[consumer.value] += 1
+                return None
             self._slot_refcounts[idx] += 1
+            if consumer.refusable:
+                self._slot_refusable_refcounts[idx] += 1
             frame_seq = self._slot_frame_seqs[idx]
             dmabuf_fd = self._slot_dmabuf_fd[idx]
             buffer_index = self._slot_dmabuf_buffer_index[idx]
@@ -624,11 +740,21 @@ class SharedState:
                 self._slot_published_ns[idx],
                 slot_generation,
                 frame_view,
+                consumer=consumer,
                 dmabuf_fd=dmabuf_fd,
                 dmabuf_buffer_index=buffer_index,
                 dmabuf_stride=stride,
                 dmabuf_size=image_size,
             )
+
+    def admission_denied_counts(self) -> Dict[str, int]:
+        """Acquire refusals per consumer, keyed by ``FrameConsumer`` value.
+
+        A non-zero ``detector`` count means detection lost a capture to slot
+        pressure, which is more serious than a recording or stream drop.
+        """
+        with self._lock_frame:
+            return dict(self._admission_denied)
 
     def latest_frame_generation(self) -> int:
         """Return the latest published capture sequence, or zero before startup."""
@@ -662,15 +788,23 @@ class SharedState:
                 self._frame_cv.wait(wait_s)
             return self._frame_seq
 
-    def _release_frame_slot(self, slot_idx: int) -> None:
+    def _release_frame_slot(self, slot_idx: int, consumer: FrameConsumer) -> None:
         requeue_index = -1
         requeue_cb = None
         with self._lock_frame:
             if not 0 <= slot_idx < self._ring_n:
                 raise ValueError(f"invalid frame-ring slot {slot_idx}")
+            # Both counters are validated before either is touched so a bad
+            # release cannot leave admission accounting inconsistent.
             if self._slot_refcounts[slot_idx] <= 0:
                 raise RuntimeError(f"frame-ring slot {slot_idx} is not acquired")
+            if consumer.refusable and self._slot_refusable_refcounts[slot_idx] <= 0:
+                raise RuntimeError(
+                    f"frame-ring slot {slot_idx} has no {consumer.value} pin"
+                )
             self._slot_refcounts[slot_idx] -= 1
+            if consumer.refusable:
+                self._slot_refusable_refcounts[slot_idx] -= 1
             if (
                 self._slot_refcounts[slot_idx] == 0
                 and self._slot_dmabuf_buffer_index[slot_idx] >= 0

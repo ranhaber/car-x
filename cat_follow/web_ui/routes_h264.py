@@ -19,6 +19,7 @@ import threading
 
 from cat_follow.logger import get_logger
 from cat_follow.memory.pool import FRAME_H, FRAME_W
+from cat_follow.memory.shared_state import FrameConsumer
 
 log = get_logger("web_ui.h264")
 
@@ -133,7 +134,9 @@ def _serve_h264(ws) -> None:  # noqa: ANN001
             )
             if frame_gen <= last_frame_gen:
                 continue
-            frame_lease = _ctx.shared.acquire_latest_frame()
+            frame_lease = _ctx.shared.acquire_latest_frame(
+                consumer=FrameConsumer.STREAM
+            )
             if frame_lease is None:
                 continue
             if frame_lease.frame_seq <= last_frame_gen:

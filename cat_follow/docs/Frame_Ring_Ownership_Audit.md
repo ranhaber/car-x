@@ -119,7 +119,7 @@ the changed library.
 |-----|----------|
 | `try_get_write_buffer()` | Under lock, reserves a non-latest slot with `refcount == 0`; returns `None` if full |
 | `publish_latest_from_write()` | Marks generation stable, advances capture sequence and latest index |
-| `acquire_latest_frame()` | Increments slot refcount and returns `FrameLease(view, frame_seq, generation)` |
+| `acquire_latest_frame(consumer=...)` | Tiered admission, then increments slot refcount and returns `FrameLease` |
 | `get_frame_latest(dst)` | Lock → `np.copyto(dst, ring[latest_idx])` |
 
 ### 1.3 Data flow
@@ -256,12 +256,24 @@ Evaluated in [Compare zero-copy designs](5693520a-e3f1-46f0-8c5f-1989d651ff72).
 
 Each slot: `{generation, refcount}`. Camera publishes into a write slot; readers `acquire` → `FrameLease(view, gen)` → `release`. Camera reuses slot only when `refcount == 0`.
 
+Readers are not equal under load. `acquire_latest_frame(consumer=...)` admits pins by product priority **Camera > Detector > Recording > Web UI**. Readers only ever pin the latest published slot, so at most one *new distinct* pin is created per capture, and the budget is expressed in distinct pinned slots:
+
+- The writer keeps `CAMERA_RESERVED_SLOTS = 2` slots — the latest published frame, which it never reclaims, plus one slot to capture into. Readers therefore never hold more than `FRAME_RING_N - 2` distinct pins, and **the camera never drops a frame because of leases**.
+- Same-slot multi-reader (detector + recording + stream on the current latest) is always admitted: an already-pinned slot costs the writer nothing.
+- While the detector is required (`detector_required`, in any FSM state, not only under mission), recording/stream give up one further distinct pin, so a slow RKNN tick can still pin the next capture.
+- While recording is required (`recording_required`), the stream gives up one beyond that, so recording wins the last refusable distinct pin. Reservations follow *demand*, so an idle recorder never costs the live view its pin.
+- Denied acquires return `None` (latest-wins drop at the reader); the camera writer never waits.
+- `admission_denied_counts()` counts refusals per consumer. A rising `detector` count means detection lost captures; it is published in `/api/status` perception diagnostics and gated in `scripts/board_soak_concurrent_h264.py`.
+
+With `FRAME_RING_N = 4` the budget is 2 distinct reader pins: one for the detector and one shared by recording and the stream. Because the detector normally holds its pin across RKNN inference, recording and the stream co-read that same latest slot for free and all three keep every frame. They only contend when both hold cross-tick encoder leases on *different* slots; then recording keeps the pin and the stream drops (latest-wins). `FRAME_RING_N = 5` would give recording and the stream a distinct pin each.
+
 | Path | Behavior |
 |------|----------|
-| camera → detector | Hold lease through RKNN infer; **zero full-frame copy** |
-| camera → H264 | Non-blocking `SharedState.acquire_latest_frame()`; skip tick if busy (latest-wins) |
+| camera → detector | Hold lease through RKNN infer; **zero full-frame copy**; `FrameConsumer.DETECTOR` |
+| camera → recording | `FrameConsumer.RECORDING`; skip tick if admission refuses or encoder busy |
+| camera → H264 | `FrameConsumer.STREAM`; skip tick if admission refuses or busy (latest-wins) |
 | inject | Mutate camera staging only; never inject into slot with `refcount > 0` |
-| lag | Camera drops frames when all slots leased; readers never see torn data |
+| lag | Readers are refused before the writer loses its last reclaimable slot; readers never see torn data |
 
 **Pros:** Safest multi-reader model; combines picarx tear semantics with explicit pinning.
 **Cons:** RAII discipline in Python; likely need `FRAME_RING_N = 4–5` for detector + dual streams.
@@ -357,9 +369,10 @@ Incremental phases and current status:
 
 ### Thread contracts (implemented)
 
-- **Camera:** `try_get_write_buffer()` → staging/inject → `publish_latest_from_write()`; drop when full
-- **Detector:** one `acquire_latest_frame()` per tick when needed; hold through motion fallback + RKNN + publish; `release()` in `finally`
-- **H264:** sole admitted viewer acquires one latest lease per encode tick;
+- **Camera:** `try_get_write_buffer()` → staging/inject → `publish_latest_from_write()`; admission keeps two slots reserved, so the writer always has one
+- **Detector:** one `acquire_latest_frame(consumer=DETECTOR)` per tick when needed; hold through motion fallback + RKNN + publish; `release()` in `finally`
+- **Recording:** `acquire_latest_frame(consumer=RECORDING)`; admission may refuse a new distinct pin while the detector is required
+- **H264:** sole admitted viewer acquires with `consumer=STREAM` per encode tick;
   DMA-BUF ownership transfers to MPP until matching output PTS, additional
   pending frames drop, and `poll()` drains delayed AUs without a new frame
 - **Tracker:** unchanged — reacts to `_detector_detections_gen` changes only

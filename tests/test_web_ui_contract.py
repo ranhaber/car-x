@@ -29,11 +29,17 @@ def test_perception_diagnostics_roundtrip():
         lores_active=True,
         motion=True,
         motion_gating=True,
+        frame_admission_denied={"detector": 0, "recording": 2, "stream": 7},
     )
     d = get_perception_diagnostics()
     assert d.phase == "TRACKING"
     assert d.model_loaded is True
     assert d.lores_active is True
+    assert d.frame_admission_denied == {"detector": 0, "recording": 2, "stream": 7}
+
+    # Unset fields keep their published value across a partial update.
+    update_perception_diagnostics(motion=False)
+    assert get_perception_diagnostics().frame_admission_denied["stream"] == 7
 
 
 def test_motion_endpoint_open_when_no_token(monkeypatch):

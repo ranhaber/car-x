@@ -39,7 +39,7 @@ import numpy as np
 from cat_follow.camera_config import load_camera_config
 from cat_follow.logger import get_logger
 from cat_follow.memory.pool import FRAME_H, FRAME_W, CROP_RING_N
-from cat_follow.memory.shared_state import SharedState
+from cat_follow.memory.shared_state import FrameConsumer, SharedState
 from cat_follow.perception.motion_detector import MotionDetector
 from cat_follow.perception.phase import Phase, PhaseMachine
 from cat_follow.perception.status import update_perception_diagnostics
@@ -479,7 +479,7 @@ def run_detector_loop(
                     has_motion = motion_result.motion
                 else:
                     lease_request_ns = time.monotonic_ns()
-                    tick_lease = shared.acquire_latest_frame()
+                    tick_lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
                     lease_acquire_ms = (
                         time.monotonic_ns() - lease_request_ns
                     ) / 1_000_000.0
@@ -553,7 +553,7 @@ def run_detector_loop(
                 # prevents QBUF/reuse.
                 if tick_lease is None:
                     lease_request_ns = time.monotonic_ns()
-                    tick_lease = shared.acquire_latest_frame()
+                    tick_lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
                     lease_acquire_ms = (
                         time.monotonic_ns() - lease_request_ns
                     ) / 1_000_000.0
@@ -598,7 +598,7 @@ def run_detector_loop(
                         break
                 if tick_lease is None:
                     lease_request_ns = time.monotonic_ns()
-                    tick_lease = shared.acquire_latest_frame()
+                    tick_lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
                     lease_acquire_ms = (
                         time.monotonic_ns() - lease_request_ns
                     ) / 1_000_000.0
@@ -993,6 +993,9 @@ def run_detector_loop(
                 lores_active=lores_active,
                 motion=has_motion,
                 motion_gating=config.motion_gating,
+                # Published from the detector so ring admission stays visible
+                # headlessly, with no browser or stream client attached.
+                frame_admission_denied=shared.admission_denied_counts(),
             )
         finally:
             if tick_lease is not None:

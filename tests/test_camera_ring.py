@@ -2,7 +2,7 @@ import numpy as np
 import time
 
 from cat_follow.memory.pool import FRAME_SHAPE, allocate_pool
-from cat_follow.memory.shared_state import SharedState
+from cat_follow.memory.shared_state import FrameConsumer, SharedState
 
 
 def test_frame_ring_publish_and_detector_copy():
@@ -29,7 +29,7 @@ def test_frame_ring_publish_and_detector_copy():
     # Ensure the two ring slots are not identical
     assert not np.array_equal(pool.frame_ring[0], pool.frame_ring[1])
 
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
     with lease:
         assert np.shares_memory(lease.frame, pool.frame_ring)
@@ -44,7 +44,7 @@ def test_frame_lease_carries_capture_and_publish_timestamps():
     write.fill(0)
     shared.publish_latest_from_write(capture_started_ns=capture_started_ns)
 
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
     with lease:
         assert lease.capture_started_ns == capture_started_ns

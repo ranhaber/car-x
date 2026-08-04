@@ -22,7 +22,7 @@ import pytest
 import cat_follow.threads.camera as camera_module
 import cat_follow.threads.detector as detector_module
 from cat_follow.memory.pool import allocate_pool, FRAME_H, FRAME_SHAPE
-from cat_follow.memory.shared_state import SharedState
+from cat_follow.memory.shared_state import FrameConsumer, SharedState
 from cat_follow.threads.camera import run_camera_loop
 from cat_follow.threads.tracker import run_tracker_loop
 from cat_follow.threads.detector import run_detector_loop
@@ -172,7 +172,7 @@ def test_acquire_latest_frame_during_run():
         t.start()
 
     time.sleep(0.2)
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
     with lease:
         snapshot = lease.frame.copy()

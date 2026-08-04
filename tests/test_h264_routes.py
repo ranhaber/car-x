@@ -80,7 +80,7 @@ def test_every_submit_au_is_sent_in_fifo_order(monkeypatch):
     lease = SimpleNamespace(dmabuf=True, frame_seq=1)
     shared = SimpleNamespace(
         wait_for_new_frame=lambda *args, **kwargs: 1,
-        acquire_latest_frame=lambda: lease,
+        acquire_latest_frame=lambda **kwargs: lease,
     )
     encoder = _Encoder(polls=[[]], submitted=[b"old", b"new"])
     ws = _Ws(fail_after=2)

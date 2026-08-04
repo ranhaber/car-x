@@ -11,6 +11,7 @@ Pass gates:
   - detect FPS >= 29.5 from detector log rows, contiguous generations
   - stream chunks FPS >= 28 using production submit/poll path
   - fd_delta == 0 after thread join, zero requeue errors in soak logs
+  - zero detector frame-ring admission denials
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from cat_follow.memory.pool import allocate_pool  # noqa: E402
 from cat_follow.memory.shared_state import SharedState  # noqa: E402
+from cat_follow.memory.shared_state import FrameConsumer  # noqa: E402
 from cat_follow.perception.h264_encoder import MppH264Encoder  # noqa: E402
 from cat_follow.perception_config import load_perception_config  # noqa: E402
 from cat_follow.threads.camera import run_camera_loop  # noqa: E402
@@ -80,7 +82,7 @@ def _run_h264_consumer(
             )
             if frame_gen <= last_frame_gen:
                 continue
-            frame_lease = shared.acquire_latest_frame()
+            frame_lease = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
             if frame_lease is None:
                 continue
             if frame_lease.frame_seq <= last_frame_gen:
@@ -188,6 +190,7 @@ def main() -> int:
     camera_gen = shared.latest_frame_generation()
     camera_samples = max(0, camera_gen - camera_gen_start)
     requeue_errors = count_requeue_errors_since(log_since)
+    admission_denied = shared.admission_denied_counts()
 
     gates = {
         "capture_p95_le_34": cap["capture_p95_ms"] <= 34.0 if detect_rows else False,
@@ -199,6 +202,11 @@ def main() -> int:
         "stream_fps_ge_28": stream_fps >= 28.0,
         "fd_delta_zero": fds_after == fds_before,
         "zero_requeue_errors": requeue_errors == 0,
+        # One detector + one stream fit the ring budget, so the detector must
+        # never be refused a slot in this configuration.
+        "zero_detector_admission_denials": (
+            admission_denied.get("detector", 0) == 0
+        ),
         "threads_joined": not threads_alive,
     }
     passed = all(gates.values()) and stats.get("encoder_error") is None
@@ -217,6 +225,7 @@ def main() -> int:
         "capture_max_ms": cap["capture_max_ms"],
         "stalls_ge_50ms": cap["stalls_ge_50ms"],
         "requeue_errors": requeue_errors,
+        "admission_denied": admission_denied,
         "fd_before": fds_before,
         "fd_after": fds_after,
         "threads_alive": threads_alive,

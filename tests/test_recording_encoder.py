@@ -40,7 +40,7 @@ class _FakeFrameSource:
         self._leases = list(leases)
         self.handed_out = []
 
-    def acquire_latest_frame(self):
+    def acquire_latest_frame(self, *, consumer=None):
         if not self._leases:
             return None
         lease = self._leases.pop(0)

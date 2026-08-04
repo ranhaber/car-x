@@ -235,6 +235,7 @@ class ControlLoop:
                     capture_active=lifecycle.capture_active,
                     detector_required=lifecycle.detector.requested,
                     detector_mission_override=lifecycle.detector_mission_override,
+                    recording_required=lifecycle.recording.requested,
                     stream_forced_off=lifecycle.stream_forced_off,
                     detector_force_off=self._fsm.state
                     in {FsmState.HOME, FsmState.FAILSAFE},

@@ -4,7 +4,7 @@ import time
 import numpy as np
 
 from cat_follow.memory.pool import FRAME_H, FRAME_SHAPE, allocate_pool
-from cat_follow.memory.shared_state import SharedState
+from cat_follow.memory.shared_state import FrameConsumer, SharedState
 from cat_follow.perception_config import PerceptionConfig
 import cat_follow.threads.detector as detector_module
 from cat_follow.threads.detector import run_detector_loop
@@ -32,9 +32,9 @@ def test_detector_acquires_frame_once_per_tick(monkeypatch):
     acquire_calls = {"count": 0}
     original_acquire = SharedState.acquire_latest_frame
 
-    def _counting_acquire(self):
+    def _counting_acquire(self, *, consumer=FrameConsumer.DETECTOR):
         acquire_calls["count"] += 1
-        return original_acquire(self)
+        return original_acquire(self, consumer=consumer)
 
     monkeypatch.setattr(SharedState, "acquire_latest_frame", _counting_acquire)
 
@@ -205,7 +205,7 @@ def test_dmabuf_without_lores_reports_inert_motion_gating(monkeypatch, caplog):
         image_size=460800,
         stride=640,
     )
-    assert shared.acquire_latest_frame().frame is None
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR).frame is None
 
     with caplog.at_level("WARNING"):
         worker = threading.Thread(

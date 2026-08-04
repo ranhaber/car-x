@@ -23,7 +23,12 @@ import numpy as np
 import pytest
 
 from cat_follow.memory.pool import allocate_pool, FRAME_RING_N, FRAME_SHAPE, BBOX_LEN
-from cat_follow.memory.shared_state import DmabufRequeueError, SharedState
+from cat_follow.memory.shared_state import (
+    CAMERA_RESERVED_SLOTS,
+    DmabufRequeueError,
+    FrameConsumer,
+    SharedState,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -64,7 +69,7 @@ def test_dmabuf_lease_requeue_callback():
         stride=640,
         frame=None,
     )
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
     assert lease.dmabuf_fd == 42
     assert lease.dmabuf_buffer_index == 3
@@ -96,7 +101,7 @@ def test_pinned_superseded_dmabuf_requeues_on_final_release():
         image_size=460800,
         stride=640,
     )
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
 
     assert shared.try_get_write_buffer() is not None
@@ -273,7 +278,7 @@ def test_detector_frame_generation_and_bbox_tagging():
     # A detector lease carries the exact capture sequence for bbox tagging.
     src = np.full(FRAME_SHAPE, 7, dtype=np.uint8)
     shared.set_frame_latest(src)
-    lease1 = shared.acquire_latest_frame()
+    lease1 = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease1 is not None
     gen1 = lease1.frame_seq
     assert gen1 == 1
@@ -285,7 +290,7 @@ def test_detector_frame_generation_and_bbox_tagging():
     lease1.release()
 
     shared.set_frame_latest(np.full(FRAME_SHAPE, 8, dtype=np.uint8))
-    lease2 = shared.acquire_latest_frame()
+    lease2 = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease2 is not None
     gen2 = lease2.frame_seq
     assert gen2 == 2
@@ -441,7 +446,7 @@ def test_event_waits_observe_stop_with_bounded_latency():
 def test_frame_lease_pins_slot_until_release():
     shared = _make_shared()
     shared.set_frame_latest(np.full(FRAME_SHAPE, 11, dtype=np.uint8))
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
 
     assert lease is not None
     assert lease.frame_seq == 1
@@ -471,31 +476,333 @@ def test_frame_lease_pins_slot_until_release():
     assert lease.stale
 
 
-def test_frame_ring_drops_write_when_all_slots_are_pinned():
+def test_camera_keeps_a_write_slot_under_maximum_reader_pressure():
+    """Readers can never take the writer's last reclaimable slot.
+
+    Admission caps distinct reader pins at ``FRAME_RING_N -
+    CAMERA_RESERVED_SLOTS``, so capture keeps succeeding however many acquires
+    the readers attempt; the excess acquires are refused instead of the camera
+    dropping frames.
+    """
     shared = _make_shared()
     leases = []
-    for value in range(1, FRAME_RING_N + 1):
+    for value in range(1, FRAME_RING_N + 3):
+        write_buf = shared.try_get_write_buffer()
+        assert write_buf is not None, f"camera starved with {len(leases)} pins"
+        write_buf.fill(value)
+        shared.publish_latest_from_write()
+        lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+        if lease is not None:
+            leases.append(lease)
+
+    assert len(leases) == FRAME_RING_N - CAMERA_RESERVED_SLOTS
+    assert shared.admission_denied_counts()["detector"] > 0
+    # Pinned slots were never recycled underneath their readers.
+    assert np.all(leases[0].frame == 1)
+
+    # Releasing a pin hands its share of the budget back.
+    leases.pop().release()
+    extra = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert extra is not None
+    extra.release()
+    for lease in leases:
+        lease.release()
+
+
+def test_admission_reserves_detector_slot_and_prefers_recording_over_stream():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        recording_required=True,
+        stream_forced_off=False,
+    )
+    # Pin an older slot as the detector would during a slow RKNN tick.
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+
+    # With recording requested, stream may not open a second distinct pin.
+    assert (
+        shared.acquire_latest_frame(consumer=FrameConsumer.STREAM) is None
+    )
+    assert shared.admission_denied_counts() == {
+        "detector": 0,
+        "recording": 0,
+        "stream": 1,
+    }
+
+    # Recording may take the last refusable distinct pin; camera still writes.
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+    assert shared.try_get_write_buffer() is not None
+    shared.abort_frame_write()
+
+    detector.release()
+    recording.release()
+
+
+def test_admission_same_latest_allows_multi_reader_without_extra_slot():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        stream_forced_off=False,
+    )
+    shared.set_frame_latest(np.zeros(FRAME_SHAPE, dtype=np.uint8))
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert detector is not None
+    assert stream is not None
+    assert detector.slot_idx == stream.slot_idx
+    detector.release()
+    stream.release()
+
+
+def test_admission_admits_same_latest_stream_beside_a_distinct_recording_pin():
+    """Mission pressure only refuses a *new distinct* pin.
+
+    Detector on an older slot plus recording on the latest spends the whole
+    distinct-pin budget, yet the stream can still co-read that same latest slot
+    for free instead of losing the frame.
+    """
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert stream is not None
+    assert stream.slot_idx == recording.slot_idx
+    assert shared.admission_denied_counts()["stream"] == 0
+
+    # The camera still owns a reclaimable slot with all three readers pinned.
+    assert shared.try_get_write_buffer() is not None
+    shared.abort_frame_write()
+
+    for lease in (detector, recording, stream):
+        lease.release()
+
+
+def test_admission_keeps_recording_ahead_of_the_stream():
+    """The web UI cannot take a pin that recording still needs.
+
+    Asking first is not enough: while recording is requested, the last
+    refusable pin belongs to it.
+    """
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=False,
+        recording_required=True,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.STREAM) is None
+    assert shared.admission_denied_counts()["stream"] == 1
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+    recording.release()
+
+
+def test_admission_gives_the_stream_a_slot_when_recording_is_idle():
+    """Reservations follow demand, so an idle recorder costs the stream nothing.
+
+    Under SEARCH/CHASE with the detector holding an older slot, the live view
+    still gets its own pin as long as nothing is recording.
+    """
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        recording_required=False,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert stream is not None
+    assert stream.slot_idx != detector.slot_idx
+    assert shared.admission_denied_counts()["stream"] == 0
+
+    detector.release()
+    stream.release()
+
+
+def test_admission_off_mission_still_reserves_a_detector_slot():
+    """Detector headroom does not depend on SEARCH/CHASE.
+
+    Recording and the stream are both refusable, so off-mission they would
+    otherwise fill the ring and deny the detector its next capture.
+    """
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=False,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.STREAM) is None
+    assert shared.admission_denied_counts()["stream"] == 1
+
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+    assert detector.slot_idx != recording.slot_idx
+    assert shared.admission_denied_counts()["detector"] == 0
+
+    detector.release()
+    recording.release()
+
+
+def test_admission_counts_detector_denial_when_budget_is_spent():
+    """With the detector off, refusable readers may use the whole budget.
+
+    The detector then loses its first capture, and that refusal is counted
+    instead of disappearing silently.
+    """
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=False,
+        detector_mission_override=False,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert stream is not None
+    assert stream.slot_idx != recording.slot_idx
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR) is None
+    assert shared.admission_denied_counts()["detector"] == 1
+
+    # Whoever was refused, the camera keeps writing.
+    assert shared.try_get_write_buffer() is not None
+    shared.abort_frame_write()
+
+    recording.release()
+    stream.release()
+
+
+def test_releasing_a_refusable_pin_returns_its_budget():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=False,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    recording = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+    assert recording is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.STREAM) is None
+
+    recording.release()
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert stream is not None
+    stream.release()
+
+
+def test_admission_off_mission_stream_may_pin_beside_detector():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=False,
+        detector_mission_override=False,
+        stream_forced_off=False,
+    )
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+
+    assert shared.try_get_write_buffer() is not None
+    shared.publish_latest_from_write()
+    stream = shared.acquire_latest_frame(consumer=FrameConsumer.STREAM)
+    assert stream is not None
+    assert stream.slot_idx != detector.slot_idx
+
+    detector.release()
+    stream.release()
+
+
+def test_admission_detector_still_acquires_when_stream_denied():
+    shared = _make_shared()
+    shared.set_perception_intent(
+        capture_active=True,
+        detector_required=True,
+        detector_mission_override=True,
+        stream_forced_off=False,
+    )
+    leases = []
+    for value in range(1, 3):
         write_buf = shared.try_get_write_buffer()
         assert write_buf is not None
         write_buf.fill(value)
         shared.publish_latest_from_write()
-        lease = shared.acquire_latest_frame()
-        assert lease is not None
-        leases.append(lease)
+        lease = shared.acquire_latest_frame(consumer=FrameConsumer.RECORDING)
+        if lease is not None:
+            leases.append(lease)
 
-    assert shared.try_get_write_buffer() is None
-
-    leases[0].release()
     assert shared.try_get_write_buffer() is not None
-    shared.abort_frame_write()
-    for lease in leases[1:]:
+    shared.publish_latest_from_write()
+    assert shared.acquire_latest_frame(consumer=FrameConsumer.STREAM) is None
+    detector = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
+    assert detector is not None
+    detector.release()
+    for lease in leases:
         lease.release()
 
 
 def test_slow_frame_reader_never_observes_torn_pixels():
     shared = _make_shared()
     shared.set_frame_latest(np.full(FRAME_SHAPE, 9, dtype=np.uint8))
-    lease = shared.acquire_latest_frame()
+    lease = shared.acquire_latest_frame(consumer=FrameConsumer.DETECTOR)
     assert lease is not None
     errors = []
 
