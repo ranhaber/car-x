@@ -27,9 +27,19 @@ The pack scopes context; it does not replace the plan.
    - Focused pass over a large tree (add to any of the above):  
      `--paths cat_follow/control cat_follow/runtime/control_loop.py`
 2. Read `.cursor/review_pack/review_pack.md` (and `review_pack.json` if needed).
-   If `meta.caps.truncated` is true, tell the user the pack is incomplete and
-   review in `--paths` passes instead of trusting one pack.
-3. Read **only** `must_read_docs` and the symbol excerpts in the pack.
+   Treat cap losses differently:
+   - `meta.caps.truncated` true (changed or related symbols dropped): the pack
+     is incomplete. Say so and review in `--paths` passes instead of trusting
+     one pack.
+   - `excerpt_clipped_symbols` only (`truncated` false): the changed lines are
+     present with omitted ranges marked `# ... skipped lines A-B ...`. Proceed,
+     and open the file only for a finding that depends on skipped context.
+   New files must be staged (`git add -N`) before building, since `git diff`
+   never reports untracked paths.
+3. Read **only** `must_read_docs`, `change_summary`, `must_check`, Spotlight,
+   and the symbol excerpts in the pack. State Review intent (why) from the
+   user/PR/commit — do not invent it. Deep-review Spotlight symbols first.
+   Answer every Must-check item before free-form findings.
 4. Do **not** open unrelated large files or whole subsystems unless a finding
    requires one missing callee and the pack marks incomplete context.
 5. If `risk.level` is `shallow`: skim for accidental behavior edits; report or

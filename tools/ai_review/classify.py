@@ -7,6 +7,16 @@ from dataclasses import dataclass, field
 
 from .diff import FileDiff
 
+# Meta tooling that *mentions* product tokens (lease, motor, QoS, …) in
+# pattern tables and fixtures. Token rules would otherwise inflate risk tags.
+_META_TOOLING_PREFIXES = ("tools/ai_review/",)
+
+
+def is_meta_tooling(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(normalized.startswith(prefix) for prefix in _META_TOOLING_PREFIXES)
+
+
 # Path-based deep tags: (substring_in_path, tag, reason)
 _PATH_RULES: list[tuple[str, str, str]] = [
     ("shared_state", "shared_state", "touches shared_state module"),
@@ -77,12 +87,19 @@ def classify_diffs(files: list[FileDiff]) -> RiskAssessment:
 
     any_behavior = False
     for fd in files:
-        for tag, reason in _tags_from_path(fd.path):
-            path_tags_all.add(tag)
-            path_reasons.append(reason)
+        meta = is_meta_tooling(fd.path)
+        if not meta:
+            for tag, reason in _tags_from_path(fd.path):
+                path_tags_all.add(tag)
+                path_reasons.append(reason)
+        elif fd.path.endswith((".md", ".txt", ".rst")):
+            path_tags_all.add("docs")
+            path_reasons.append(f"documentation path {fd.path}")
 
         for hunk in fd.hunk_texts:
-            hunk_tags, hunk_reasons, behavior = _classify_hunk(hunk)
+            hunk_tags, hunk_reasons, behavior = _classify_hunk(
+                hunk, apply_token_rules=not meta
+            )
             tags.update(hunk_tags)
             reasons.extend(hunk_reasons)
             any_behavior = any_behavior or behavior
@@ -137,7 +154,9 @@ def _tags_from_path(path: str) -> list[tuple[str, str]]:
     return out
 
 
-def _classify_hunk(hunk: str) -> tuple[set[str], list[str], bool]:
+def _classify_hunk(
+    hunk: str, *, apply_token_rules: bool = True
+) -> tuple[set[str], list[str], bool]:
     tags: set[str] = set()
     reasons: list[str] = []
     changed_lines = [
@@ -165,17 +184,20 @@ def _classify_hunk(hunk: str) -> tuple[set[str], list[str], bool]:
         if _looks_type_hint_only(ln):
             tags.add("types")
             continue
-        if _LOG_LINE.match(ln) and not _has_deep_token(ln):
+        if _LOG_LINE.match(ln) and not (
+            apply_token_rules and _has_deep_token(ln)
+        ):
             tags.add("logging")
             continue
 
         matched_deep = False
-        for pattern, tag, reason in _TOKEN_RULES:
-            if pattern.search(ln):
-                tags.add(tag)
-                reasons.append(reason)
-                matched_deep = True
-                behavior = True
+        if apply_token_rules:
+            for pattern, tag, reason in _TOKEN_RULES:
+                if pattern.search(ln):
+                    tags.add(tag)
+                    reasons.append(reason)
+                    matched_deep = True
+                    behavior = True
         if matched_deep:
             continue
 
@@ -209,22 +231,25 @@ def _all_hunks_shallow(files: list[FileDiff]) -> bool:
             continue
         if fd.status == "deleted":
             return False
+        apply_tokens = not is_meta_tooling(fd.path)
         for hunk in fd.hunk_texts:
-            _, _, behavior = _classify_hunk(hunk)
+            _, _, behavior = _classify_hunk(hunk, apply_token_rules=apply_tokens)
             if behavior:
                 # Still shallow if only docs/types/logging/format tags and no deep tokens.
-                tags, _, _ = _classify_hunk(hunk)
+                tags, _, _ = _classify_hunk(hunk, apply_token_rules=apply_tokens)
                 deep = tags - {"docs", "format", "rename", "types", "logging"}
                 if deep or (behavior and "code_structure" in tags and deep):
                     # Re-check lines: if any non-shallow line exists, not all shallow.
-                    if not _hunk_is_shallow(hunk):
+                    if not _hunk_is_shallow(hunk, apply_token_rules=apply_tokens):
                         return False
-                elif behavior and not _hunk_is_shallow(hunk):
+                elif behavior and not _hunk_is_shallow(
+                    hunk, apply_token_rules=apply_tokens
+                ):
                     return False
     return True
 
 
-def _hunk_is_shallow(hunk: str) -> bool:
+def _hunk_is_shallow(hunk: str, *, apply_token_rules: bool = True) -> bool:
     changed = [
         line[1:]
         for line in hunk.splitlines()
@@ -239,12 +264,14 @@ def _hunk_is_shallow(hunk: str) -> bool:
             continue
         if _IMPORT_LINE.match(ln):
             # Treat pure import lines as shallow for gate; deep import of dangerous APIs still caught by tokens.
-            if _has_deep_token(ln):
+            if apply_token_rules and _has_deep_token(ln):
                 return False
             continue
         if _looks_type_hint_only(ln):
             continue
-        if _LOG_LINE.match(ln) and not _has_deep_token(ln):
+        if _LOG_LINE.match(ln) and not (
+            apply_token_rules and _has_deep_token(ln)
+        ):
             continue
         if not ln.strip():
             continue

@@ -29,6 +29,15 @@ class DiffResult:
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
+_PREFERRED_REVIEW_PREFIXES = (
+    "cat_follow/",
+    "ros_ws/",
+    "tools/ai_review/",
+    ".cursor/skills/",
+    "tests/",
+    "scripts/",
+)
+
 
 def _run_git(repo: Path, args: list[str]) -> str:
     completed = subprocess.run(
@@ -207,8 +216,12 @@ def filter_review_paths(
     """Scope the diff to a review pass.
 
     ``include_paths`` restricts the pack to explicit path prefixes so a large
-    working tree can be reviewed in focused passes.  Without it, prefer
-    ``cat_follow/`` and ``ros_ws/`` and fall back to everything.
+    working tree can be reviewed in focused passes.  Without it, prefer the
+    reviewed source trees and fall back to everything.
+
+    ``tests/``, ``scripts/``, and ``.cursor/skills/`` are preferred too: the
+    Tests lens cannot be applied to a change whose tests were filtered out of
+    the pack, and skill edits must stay visible beside product diffs.
     """
     if include_paths:
         prefixes = [p.replace("\\", "/").rstrip("/") for p in include_paths]
@@ -222,10 +235,6 @@ def filter_review_paths(
         ]
 
     preferred = [
-        f
-        for f in files
-        if f.path.startswith("cat_follow/")
-        or f.path.startswith("ros_ws/")
-        or f.path.startswith("tools/ai_review/")
+        f for f in files if f.path.startswith(_PREFERRED_REVIEW_PREFIXES)
     ]
     return preferred if preferred else files

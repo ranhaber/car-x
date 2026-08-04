@@ -15,10 +15,17 @@ class SymbolSpan:
     start_line: int
     end_line: int
     source: str
+    clipped: bool = False
 
     @property
     def line_range(self) -> list[int]:
         return [self.start_line, self.end_line]
+
+
+# A clipped excerpt keeps this many leading lines (signature + docstring head)
+# before spending the rest of the budget on the changed lines themselves.
+_HEAD_CONTEXT_LINES = 12
+_CHANGE_CONTEXT_LINES = 4
 
 
 def extract_changed_symbols(
@@ -53,6 +60,7 @@ def extract_changed_symbols(
                 start_line=1,
                 end_line=min(len(lines), max_excerpt_lines),
                 source=excerpt,
+                clipped=len(lines) > max_excerpt_lines,
             )
         ]
 
@@ -84,10 +92,17 @@ def extract_changed_symbols(
         # Deduplicate by qualname.
         seen: set[str] = set()
         out: list[SymbolSpan] = []
+        lines = source.splitlines()
         for span in innermost:
             if span.qualname in seen:
                 continue
             seen.add(span.qualname)
+            # A long symbol clipped to its head can hide every changed line, so
+            # re-excerpt around the diff instead.
+            span.source = _excerpt_around_changes(
+                lines, span.start_line, span.end_line, changed_lines, max_excerpt_lines
+            )
+            span.clipped = _is_clipped(span.start_line, span.end_line, max_excerpt_lines)
             out.append(span)
         return out
 
@@ -97,7 +112,9 @@ def extract_changed_symbols(
     last = max(changed_lines)
     start = max(1, first - 5)
     end = min(len(lines), last + 5)
-    excerpt = _excerpt_lines(lines, start, end, max_excerpt_lines)
+    excerpt = _excerpt_around_changes(
+        lines, start, end, changed_lines, max_excerpt_lines
+    )
     return [
         SymbolSpan(
             file=file_path,
@@ -106,6 +123,7 @@ def extract_changed_symbols(
             start_line=start,
             end_line=end,
             source=excerpt,
+            clipped=_is_clipped(start, end, max_excerpt_lines),
         )
     ]
 
@@ -167,6 +185,7 @@ def _collect_spans(
                     start_line=start,
                     end_line=end,
                     source=excerpt,
+                    clipped=_is_clipped(start, end, max_excerpt_lines),
                 )
             )
 
@@ -185,3 +204,61 @@ def _excerpt_lines(lines: list[str], start: int, end: int, max_lines: int) -> st
     # Keep head of symbol; note truncation.
     chunk = lines[start - 1 : start - 1 + max_lines]
     return "\n".join(chunk) + f"\n# ... truncated ({length - max_lines} more lines)"
+
+
+def _is_clipped(start: int, end: int, max_lines: int) -> bool:
+    return (abs(end - start) + 1) > max_lines
+
+
+def _excerpt_around_changes(
+    lines: list[str],
+    start: int,
+    end: int,
+    changed_lines: set[int],
+    max_lines: int,
+) -> str:
+    """Excerpt a symbol, prioritizing the lines the diff actually touched.
+
+    Under the budget the whole symbol is returned. Over it, every changed line
+    inside the symbol is always kept (even if that alone exceeds
+    ``max_lines``). Remaining budget fills a short head (signature) then
+    widening context around the changes. Gaps carry absolute line numbers so a
+    reviewer can locate the omitted region.
+    """
+    if end < start:
+        start, end = end, start
+    if not _is_clipped(start, end, max_lines):
+        return "\n".join(lines[start - 1 : end])
+
+    inside = sorted(ln for ln in changed_lines if start <= ln <= end)
+    if not inside:
+        return _excerpt_lines(lines, start, end, max_lines)
+
+    # Changed lines are mandatory — never drop them for the line budget.
+    keep: set[int] = set(inside)
+    head_len = min(_HEAD_CONTEXT_LINES, max(1, max_lines // 4))
+    for line_no in range(start, min(end, start + head_len - 1) + 1):
+        keep.add(line_no)
+
+    budget = max_lines - len(keep)
+    for radius in range(1, _CHANGE_CONTEXT_LINES + 1):
+        if budget <= 0:
+            break
+        for line_no in inside:
+            for candidate in (line_no - radius, line_no + radius):
+                if budget <= 0:
+                    break
+                if start <= candidate <= end and candidate not in keep:
+                    keep.add(candidate)
+                    budget -= 1
+
+    out: list[str] = []
+    previous: int | None = None
+    for line_no in sorted(keep):
+        if previous is not None and line_no != previous + 1:
+            out.append(f"# ... skipped lines {previous + 1}-{line_no - 1} ...")
+        out.append(lines[line_no - 1])
+        previous = line_no
+    if previous is not None and previous < end:
+        out.append(f"# ... skipped lines {previous + 1}-{end} ...")
+    return "\n".join(out)

@@ -32,8 +32,29 @@ def slice_related(
     max_related: int = MAX_RELATED_SYMBOLS,
     max_excerpt_lines: int = 80,
 ) -> list[RelatedSymbol]:
+    related, _total = slice_related_with_total(
+        repo,
+        changed,
+        max_related=max_related,
+        max_excerpt_lines=max_excerpt_lines,
+    )
+    return related
+
+
+def slice_related_with_total(
+    repo: Path,
+    changed: list[SymbolSpan],
+    *,
+    max_related: int = MAX_RELATED_SYMBOLS,
+    max_excerpt_lines: int = 80,
+) -> tuple[list[RelatedSymbol], int]:
+    """Return the capped related slice plus the pre-cap total.
+
+    The caller needs the total to report an honest truncation flag; capping
+    inside here alone made dropped related symbols invisible.
+    """
     if not changed:
-        return []
+        return [], 0
 
     by_file: dict[str, list[SymbolSpan]] = {}
     for span in changed:
@@ -106,7 +127,7 @@ def slice_related(
     # Prefer calls/called_by over keyword_hit.
     order = {"calls": 0, "called_by": 1, "same_module": 2, "keyword_hit": 3}
     related.sort(key=lambda r: (order.get(r.relation, 9), r.span.file, r.span.qualname))
-    return related[:max_related]
+    return related[:max_related], len(related)
 
 
 def _build_call_map(tree: ast.AST) -> dict[str, set[str]]:
@@ -169,32 +190,66 @@ def _call_names(func: ast.AST) -> set[str]:
 
 
 def _imported_local_modules(tree: ast.AST, current_file: str) -> list[str]:
-    """Best-effort resolve relative package imports under cat_follow/."""
+    """Best-effort resolve local package imports (cat_follow, tools/ai_review)."""
     out: list[str] = []
     parts = current_file.replace("\\", "/").split("/")
-    if "cat_follow" not in parts:
+    pkg = _local_package_root(parts)
+    if pkg is None:
         return out
-    pkg_index = parts.index("cat_follow")
-    pkg_root = "/".join(parts[: pkg_index + 1])
+    pkg_name, pkg_root = pkg
 
     for node in tree.body if isinstance(tree, ast.Module) else []:
-        if isinstance(node, ast.ImportFrom) and node.module:
-            mod = node.module
+        if isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
                 # Relative import: resolve from current package dir.
                 base = parts[: -(node.level)]
                 if node.module:
                     candidate = "/".join([*base, *node.module.split(".")]) + ".py"
+                elif node.names:
+                    # from . import foo -> sibling modules
+                    for alias in node.names:
+                        sibling = "/".join([*base, alias.name]) + ".py"
+                        out.append(sibling.replace("\\", "/"))
+                    continue
                 else:
                     continue
-            elif mod.startswith("cat_follow"):
-                candidate = mod.replace(".", "/") + ".py"
-            else:
+                out.append(candidate.replace("\\", "/"))
+            elif node.module and node.module.startswith(pkg_name):
+                if pkg_name == "ai_review":
+                    # Import path ai_review.X maps to tools/ai_review/X.py
+                    rest = node.module[len(pkg_name) :].lstrip(".")
+                    if rest:
+                        candidate = f"{pkg_root}/{rest.replace('.', '/')}.py"
+                    else:
+                        candidate = f"{pkg_root}/__init__.py"
+                else:
+                    candidate = node.module.replace(".", "/") + ".py"
+                out.append(candidate.replace("\\", "/"))
+            elif node.module and pkg_name == "cat_follow":
                 # Same top package local imports like `from control import fsm`
-                candidate = f"{pkg_root}/{mod.replace('.', '/')}.py"
-            out.append(candidate.replace("\\", "/"))
+                candidate = f"{pkg_root}/{node.module.replace('.', '/')}.py"
+                out.append(candidate.replace("\\", "/"))
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("cat_follow"):
-                    out.append(alias.name.replace(".", "/") + ".py")
+                if alias.name.startswith(pkg_name):
+                    if pkg_name == "ai_review":
+                        rest = alias.name[len(pkg_name) :].lstrip(".")
+                        if rest:
+                            candidate = f"{pkg_root}/{rest.replace('.', '/')}.py"
+                        else:
+                            candidate = f"{pkg_root}/__init__.py"
+                    else:
+                        candidate = alias.name.replace(".", "/") + ".py"
+                    out.append(candidate.replace("\\", "/"))
     return out
+
+
+def _local_package_root(parts: list[str]) -> tuple[str, str] | None:
+    """Return (package_name, package_root_path) for known local trees."""
+    if "cat_follow" in parts:
+        idx = parts.index("cat_follow")
+        return "cat_follow", "/".join(parts[: idx + 1])
+    if "ai_review" in parts:
+        idx = parts.index("ai_review")
+        return "ai_review", "/".join(parts[: idx + 1])
+    return None

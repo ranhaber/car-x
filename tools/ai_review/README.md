@@ -20,6 +20,15 @@ python tools/ai_review/build_pack.py --base origin/main --out .cursor/review_pac
 Default (no flags): if the working tree is dirty, uses uncommitted diff vs
 `HEAD`; otherwise diffs the branch against the merge-base with `main`/`master`.
 
+Every mode runs `git diff`, which never reports untracked files. Stage a
+brand-new file with `git add -N <path>` first, or the pack silently omits it.
+The CLI prints a warning when untracked paths look relevant.
+
+Without `--paths`, the pack prefers `cat_follow/`, `ros_ws/`, `tools/ai_review/`,
+`.cursor/skills/`, `tests/`, and `scripts/`, falling back to every changed file
+when none match. Tests are included on purpose: the Tests lens cannot be
+applied to a change whose tests were filtered out of the pack.
+
 Large working trees hit the symbol caps, so review them in focused passes with
 `--paths`:
 
@@ -28,21 +37,29 @@ python tools/ai_review/build_pack.py --uncommitted --paths cat_follow/control ca
 python tools/ai_review/build_pack.py --uncommitted --paths cat_follow/perception cat_follow/memory cat_follow/threads
 ```
 
-The pack reports `meta.caps.truncated` (and the CLI prints a warning) whenever
-changed symbols were dropped by a cap.
+Caps:
+
+- `meta.caps.truncated` — changed or related symbols were dropped by a cap.
+  Re-run with `--paths`.
+- `meta.caps.excerpt_clipped_symbols` — long symbols were excerpted around
+  changed lines. The pack is still complete; open the file only if skipped
+  context matters.
 
 Outputs:
 
 - `.cursor/review_pack/review_pack.json`
 - `.cursor/review_pack/review_pack.md`
 
-## Pack schema (`schema_version: 1`)
+## Pack schema (`schema_version: 2`)
 
 | Field | Meaning |
 |---|---|
 | `meta` | repo root, mode, git base, timestamp, `include_paths`, `caps` |
 | `risk` | `shallow` \| `deep`, `tags[]`, `reasons[]` |
-| `changed_symbols[]` | file, qualname, kind, line_range, excerpt |
+| `change_summary[]` | narrative bullets (`api` / `behavior` / `wiring` / …) with evidence |
+| `must_check[]` | concrete checklist items with lens + evidence (public API deltas only) |
+| `spotlight[]` | ranked `file:qualname` citations that deserve deep scrutiny first |
+| `changed_symbols[]` | file, qualname, kind, line_range, excerpt, `clipped` (risk-ranked) |
 | `related_symbols[]` | same + `relation` (`calls` / `called_by` / `same_module` / `keyword_hit`) |
 | `lenses[]` | Code_Review_Plan lens ids + why |
 | `must_read_docs[]` | always includes Code_Review_Plan |
@@ -51,9 +68,26 @@ Outputs:
 
 ## Caps (token protection)
 
-- Max changed symbols: 30
-- Max related symbols: 40
-- Max excerpt lines per symbol: 80
+- Max changed symbols: 30 (`--max-changed`)
+- Max related symbols: 40 (`--max-related`)
+- Max excerpt lines per symbol: 80 (`--max-excerpt-lines`)
+
+Changed symbols are ranked (path + ownership/safety tokens) before the changed
+cap is applied, so Spotlight keeps high-risk hunks instead of first-seen order.
+New private helpers (`_foo`) are omitted from api narrative / Must-check rows;
+public signature edits still become contract checks (capped, with overflow
+folded into one row).
+
+A changed symbol longer than the excerpt cap is not clipped to its head, which
+would hide the diff inside a large function. The excerpt always keeps every
+changed line (even if that alone exceeds the budget), then a short head and
+widening context, and marks omitted ranges as `# ... skipped lines A-B ...`.
+Such symbols carry `clipped: true`; open the file when a finding depends on
+skipped context.
+
+Edits under `tools/ai_review/` are classified as tooling structure, not as
+product `frame_ring` / `motor` / `ros` risk — the pack builder’s own pattern
+tables would otherwise contaminate the lens list.
 
 ## Smoke test
 
