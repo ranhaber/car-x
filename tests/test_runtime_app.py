@@ -21,7 +21,12 @@ from cat_follow.control.types import (  # noqa: E402
     RangeBackend,
     RangeState,
 )
-from cat_follow.runtime.app import _build_web_ui_thread, build_app  # noqa: E402
+from cat_follow.runtime.app import (  # noqa: E402
+    _build_web_ui_thread,
+    _make_default_backend,
+    build_app,
+)
+from cat_follow.motion.motor_interface import NoOpMotorBackend  # noqa: E402
 
 
 def _wait_until(predicate, timeout=2.0, interval=0.01):
@@ -73,6 +78,54 @@ def test_build_app_wires_all_components(tmp_path):
     # Slice 1 is observability-only: active control still uses the legacy
     # safety threshold until the BRAKE_REVERSE implementation slice.
     assert app.decision_engine.obstacle_too_close_cm == 10.0
+
+
+def test_make_default_backend_passes_pan_forward_deg():
+    """CLI injects a backend into build_app; forward must match MotorInterface."""
+    backend = _make_default_backend(use_picarx=False, pan_forward_deg=8.5)
+    assert isinstance(backend, NoOpMotorBackend)
+    assert backend._pan_forward_deg == 8.5
+    backend.emergency_stop()
+    assert backend.look_applied[-1] == 8.5
+
+
+def test_look_frame_half_width_default_matches_640_frame():
+    from cat_follow.target_config import TargetRuntimeConfig
+
+    cfg = TargetRuntimeConfig()
+    assert cfg.look_frame_half_width_px == 320.0
+
+
+def test_main_cli_wires_look_pan_forward_env_into_backend(monkeypatch):
+    """argparse main path: LOOK_PAN_FORWARD_DEG → injected motor_backend."""
+    import threading
+
+    from cat_follow.runtime.app import main
+
+    captured = {}
+
+    class _FakeApp:
+        def start(self) -> None:
+            pass
+
+        def stop(self, timeout: float = 2.0) -> None:
+            pass
+
+    def _fake_build_app(**kwargs):
+        captured.update(kwargs)
+        return _FakeApp()
+
+    monkeypatch.setenv("CAT_FOLLOW_LOOK_PAN_FORWARD_DEG", "8.5")
+    monkeypatch.setattr("cat_follow.runtime.app.build_app", _fake_build_app)
+    monkeypatch.setattr(
+        "cat_follow.runtime.app._install_signal_handlers", lambda _e: None
+    )
+    monkeypatch.setattr(threading.Event, "wait", lambda self, timeout=None: True)
+
+    assert main([]) == 0
+    backend = captured["motor_backend"]
+    assert isinstance(backend, NoOpMotorBackend)
+    assert backend._pan_forward_deg == 8.5
 
 
 def test_build_app_applies_persisted_calibration_safety(tmp_path):

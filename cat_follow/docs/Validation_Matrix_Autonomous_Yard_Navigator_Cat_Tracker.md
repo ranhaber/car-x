@@ -110,6 +110,16 @@ objective and return a committed reason.
 | NAV-14 | Cat perimeter authority | Only reliable overhead event declares cat exit; never infer it from car geofence | Pending |
 | NAV-15 | Ultrasonic costmap | Valid `sensor_msgs/Range` and RangeSensorLayer integration; disabling layer does not disable direct safety | Pending |
 | NAV-16 | RF2O/startup authority | Seed/validate from overhead once, then local Nav2/SLAM is authoritative; no continuous overwrite or bicycle fallback | Pending |
+| ENV-01 | Costmap sweep envelope | Local costmap sweep publishes contiguous free `[safe_steering_min, max]` containing path_correction when viable; `envelope_source=costmap_sweep` | Pending |
+| ENV-02 | Stale/missing costmap | `path_viable=false`; zero/empty envelope; no silent `[-1,1]` synthesis; no motion on that envelope | Pending |
+| ENV-03 | Point envelope fallback | `envelope_source=point` only when explicitly configured for test/fallback; never production default with ROS nav | Pending |
+| LOOK-01 | LOOK_AT eligibility | CHASE + fresh bound track + error ≤ N_enter + pan can center → LOOK_AT; chassis uses path_correction only | Pending |
+| LOOK-02 | Vision chassis gate | Vision `x_offset_norm` never steers chassis while pan outside forward deadband | Pending |
+| LOOK-03 | PAN_RESET before BODY_STEER | Leaving LOOK_AT for vision body steer always passes through PAN_RESET to calibrated forward | Pending |
+| LOOK-04 | BODY_STEER clamp | With pan at forward, applied steer = clamp(x_offset_norm, envelope); never summed with path_correction | Pending |
+| LOOK-05 | Mode hysteresis | N_exit > N_enter and mode dwell prevent LOOK_AT↔BODY_STEER chatter | Pending |
+| LOOK-06 | Safety pan forward | BRAKE_REVERSE / FAILSAFE / HOME / IDLE / GOTO / RETURN_HOME command pan to calibrated forward | Pending |
+| LOOK-07 | Ambiguous track | Association ambiguity disables look chase; no pan tracking of unbound boxes | Pending |
 
 ## 7. Safety, dual sensors, thermal, and degraded perception
 

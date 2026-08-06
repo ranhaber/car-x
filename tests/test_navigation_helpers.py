@@ -19,10 +19,12 @@ from cat_follow.navigation.ros_bridge import (
     ActionGoalRegistry,
     _front_min_distance_cm,
     _yaw_from_quaternion,
+    overlay_ros_drive_on_navigation,
     reduce_front_sector,
     sanitize_cmd_vel,
     sanitize_odom_pose,
 )
+from cat_follow.control.types import NavigationState
 import cat_follow.odometry as odom
 
 
@@ -172,3 +174,97 @@ def test_rejected_goal_drops_its_parked_cancel():
     assert registry.pending_cancel_count == 0
     # A later goal reusing bookkeeping must not inherit the stale cancel.
     assert registry.register_accepted("ag-1", object()) is False
+
+
+def test_overlay_ros_drive_preserves_nav_manager_envelope_policy():
+    """Odom/cmd overlay must not flicker authority/path_viable/envelope."""
+    current = NavigationState(
+        authority="NavigationManager",
+        path_viable=True,
+        envelope_source="costmap_sweep",
+        safe_steering_min=-0.3,
+        safe_steering_max=0.4,
+        path_correction=0.1,
+        costmap_age_ms=42,
+    )
+    updated = overlay_ros_drive_on_navigation(
+        current,
+        timestamp_ms=2000,
+        drive_received_ms=1900,
+        cmd_vel_fresh=True,
+        heading=1.2,
+        heading_valid=True,
+        path_correction=0.25,
+        speed_limit=0.5,
+        pose_x_m=1.0,
+        pose_y_m=2.0,
+        pose_yaw_rad=1.2,
+        pose_received_ms=1900,
+        odom_received=True,
+    )
+    assert updated.authority == "NavigationManager"
+    assert updated.path_viable is True
+    assert updated.envelope_source == "costmap_sweep"
+    assert updated.safe_steering_min == -0.3
+    assert updated.safe_steering_max == 0.4
+    assert updated.costmap_age_ms == 42
+    assert abs(updated.path_correction - 0.25) < 1e-6
+    assert abs(updated.heading - 1.2) < 1e-6
+
+
+def test_overlay_ros_drive_preserves_nav_manager_fail_closed_none():
+    """NM fail-closed (source=none, path_viable=False) must not reopen on odom."""
+    current = NavigationState(
+        authority="NavigationManager",
+        path_viable=False,
+        envelope_source="none",
+        safe_steering_min=0.0,
+        safe_steering_max=0.0,
+    )
+    updated = overlay_ros_drive_on_navigation(
+        current,
+        timestamp_ms=2000,
+        drive_received_ms=1900,
+        cmd_vel_fresh=True,
+        heading=0.0,
+        heading_valid=True,
+        path_correction=0.1,
+        speed_limit=0.4,
+        pose_x_m=0.0,
+        pose_y_m=0.0,
+        pose_yaw_rad=0.0,
+        pose_received_ms=1900,
+        odom_received=True,
+    )
+    assert updated.authority == "NavigationManager"
+    assert updated.path_viable is False
+    assert updated.envelope_source == "none"
+    assert abs(updated.path_correction - 0.1) < 1e-6
+
+
+def test_overlay_ros_drive_sets_authority_when_bridge_owns_none():
+    """Without NavigationManager ownership, RosBridge may derive path_viable."""
+    current = NavigationState(
+        authority="RosBridge",
+        path_viable=False,
+        envelope_source="none",
+        safe_steering_min=0.0,
+        safe_steering_max=0.0,
+    )
+    updated = overlay_ros_drive_on_navigation(
+        current,
+        timestamp_ms=2000,
+        drive_received_ms=1900,
+        cmd_vel_fresh=True,
+        heading=0.0,
+        heading_valid=True,
+        path_correction=0.1,
+        speed_limit=0.4,
+        pose_x_m=0.0,
+        pose_y_m=0.0,
+        pose_yaw_rad=0.0,
+        pose_received_ms=1900,
+        odom_received=True,
+    )
+    assert updated.authority == "RosBridge"
+    assert updated.path_viable is True

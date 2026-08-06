@@ -44,6 +44,16 @@ class MissionEventName(str, Enum):
     PRIMARY_CAT_LEFT_PERIMETER = "PRIMARY_CAT_LEFT_PERIMETER"
 
 
+class LookDriveMode(str, Enum):
+    """Mutually exclusive look/drive fusion mode (see Look_Drive_Path_Design)."""
+
+    PATH_FOLLOW = "PATH_FOLLOW"
+    LOOK_AT = "LOOK_AT"
+    PAN_RESET = "PAN_RESET"
+    BODY_STEER = "BODY_STEER"
+    HOLD = "HOLD"
+
+
 class FsmState(str, Enum):
     HOME = "HOME"
     IDLE = "IDLE"
@@ -149,6 +159,7 @@ class ReasonCode(str, Enum):
     NAVIGATION_FAILURE = "navigation_failure"
     NAVIGATION_FAILURES_EXHAUSTED = "navigation_failures_exhausted"
     NAVIGATION_PATH_BLOCKED = "navigation_path_blocked"
+    LOOK_DRIVE_HOLD = "look_drive_hold"
     STOP_CHASE_ACCEPTED = "stop_chase_accepted"
     RETURN_HOME_ACCEPTED = "return_home_accepted"
     RETURN_HOME_COMPLETE = "return_home_complete"
@@ -385,6 +396,9 @@ class VisionState:
     cat_visible: bool = False
     cat_visible_stable: bool = False
     x_offset_norm: float = 0.0
+    # Horizontal pixel error from frame center (positive = cat right of center).
+    # When unset, look/drive derives it from x_offset_norm * half_frame_width_px.
+    x_offset_px: Optional[float] = None
     confidence: float = 0.0
     last_seen_ms: int = 0
     observation_sequence: int = 0
@@ -424,6 +438,9 @@ class NavigationState:
     safe_steering_min: float = 0.0
     safe_steering_max: float = 0.0
     speed_cap_mps: float = 0.0
+    # costmap_sweep | point | none — provenance for safe_steering_* band.
+    envelope_source: str = "none"
+    costmap_age_ms: Optional[int] = None
     pose_x_m: float = 0.0
     pose_y_m: float = 0.0
     pose_yaw_rad: float = 0.0
@@ -583,6 +600,12 @@ class DecisionState:
     brake: bool = False
     reason: ReasonCode = ReasonCode.INIT
     active_constraints: Tuple[str, ...] = ()
+    look_drive_mode: LookDriveMode = LookDriveMode.PATH_FOLLOW
+    pan_deg: float = 0.0
+    pan_forward_deg: float = 0.0
+    look_reason: str = ""
+    pixel_error_px: float = 0.0
+    camera_request: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -628,6 +651,18 @@ class DecisionInput:
 
 
 @dataclass(frozen=True)
+class LookCommand:
+    """Atomic pan command emitted with chassis DecisionOutput."""
+
+    mode: LookDriveMode = LookDriveMode.PATH_FOLLOW
+    pan_deg: float = 0.0
+    pan_forward_deg: float = 0.0
+    reason: str = "init"
+    pixel_error_px: float = 0.0
+    camera_request: float = 0.0
+
+
+@dataclass(frozen=True)
 class DecisionOutput:
     timestamp_ms: int
     requested_state: FsmState
@@ -640,3 +675,4 @@ class DecisionOutput:
     target_y: Optional[float] = None
     target_source: TargetSource = TargetSource.NONE
     rejected_transition: bool = False
+    look: LookCommand = field(default_factory=LookCommand)

@@ -8,7 +8,8 @@ end-to-end wiring tests; Milestone 3 will add a real PiCar-X backend.
 Logging policy
 --------------
 Per Milestone 2 design: log motor commands only when the (speed, steering,
-brake) tuple differs from the last applied tuple.  This keeps telemetry at
+brake) tuple differs from the last applied tuple.  Pan-only changes are also
+logged so look/drive telemetry stays reconstructable.  This keeps telemetry at
 50 Hz from drowning the queue while still capturing every meaningful change
 including transitions to/from braking.
 
@@ -47,10 +48,26 @@ class MotorCommand:
     brake: bool
 
 
+@dataclass(frozen=True)
+class LookActuatorCommand:
+    """Camera pan command after clamping to hardware limits."""
+
+    pan_deg: float
+    mode: str
+    reason: str
+
+
 class MotorBackend(Protocol):
-    """Contract a motor backend must satisfy."""
+    """Contract a motor backend must satisfy.
+
+    ``apply_look`` is required: look/drive pan is part of the actuator
+    contract, not an optional extension.
+    """
 
     def apply(self, *, speed: float, steering: float, brake: bool) -> None:
+        ...
+
+    def apply_look(self, *, pan_deg: float) -> None:
         ...
 
     def emergency_stop(self) -> None:
@@ -62,15 +79,21 @@ class NoOpMotorBackend:
     Milestone 2 end-to-end wiring before the real PiCar-X backend lands.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, pan_forward_deg: float = 0.0) -> None:
         self.applied: list = []
+        self.look_applied: list = []
         self.emergency_stops: int = 0
+        self._pan_forward_deg = float(pan_forward_deg)
 
     def apply(self, *, speed: float, steering: float, brake: bool) -> None:
         self.applied.append(MotorCommand(speed=speed, steering=steering, brake=brake))
 
+    def apply_look(self, *, pan_deg: float) -> None:
+        self.look_applied.append(float(pan_deg))
+
     def emergency_stop(self) -> None:
         self.emergency_stops += 1
+        self.look_applied.append(self._pan_forward_deg)
 
 
 class MotorInterface:
@@ -85,11 +108,19 @@ class MotorInterface:
         backend: MotorBackend,
         logger: Optional[AsyncLogger] = None,
         source: str = "MotorInterface",
+        *,
+        pan_min_deg: float = -90.0,
+        pan_max_deg: float = 90.0,
+        pan_forward_deg: float = 0.0,
     ) -> None:
         self._backend = backend
         self._logger = logger
         self._source = source
         self._last_command: Optional[Tuple[float, float, bool]] = None
+        self._last_pan: Optional[float] = None
+        self._pan_min_deg = float(pan_min_deg)
+        self._pan_max_deg = float(pan_max_deg)
+        self._pan_forward_deg = float(pan_forward_deg)
 
     def apply(self, decision: DecisionOutput) -> MotorCommand:
         speed = _clamp(decision.speed, -1.0, 1.0)
@@ -98,12 +129,32 @@ class MotorInterface:
         command = MotorCommand(speed=speed, steering=steering, brake=brake)
         tup = (speed, steering, brake)
 
-        if tup != self._last_command:
+        chassis_changed = tup != self._last_command
+        if chassis_changed:
             self._last_command = tup
-            self._log_change(decision, command)
 
         self._backend.apply(speed=speed, steering=steering, brake=brake)
+        look_cmd = self.apply_look(decision)
+        if chassis_changed:
+            self._log_change(decision, command)
+        elif look_cmd is not None:
+            self._log_look(decision, look_cmd)
         return command
+
+    def apply_look(
+        self, decision: DecisionOutput
+    ) -> Optional[LookActuatorCommand]:
+        pan = _clamp(decision.look.pan_deg, self._pan_min_deg, self._pan_max_deg)
+        cmd = LookActuatorCommand(
+            pan_deg=pan,
+            mode=decision.look.mode.value,
+            reason=decision.look.reason,
+        )
+        if self._last_pan is not None and abs(pan - self._last_pan) <= 1e-3:
+            return None
+        self._backend.apply_look(pan_deg=pan)
+        self._last_pan = pan
+        return cmd
 
     def emergency_stop(self, *, reason: str = "emergency_stop") -> None:
         if self._logger is not None:
@@ -115,10 +166,13 @@ class MotorInterface:
                 data={
                     "emergency_stop": True,
                     "reason": reason,
+                    "pan_forward_deg": self._pan_forward_deg,
                 },
             )
         self._backend.emergency_stop()
         self._last_command = (0.0, 0.0, True)
+        # Must match backend hardware pan after e-stop (calibrated forward).
+        self._last_pan = self._pan_forward_deg
 
     # ── helpers ─────────────────────────────────────────────────────
 
@@ -139,11 +193,37 @@ class MotorInterface:
                 "steering": command.steering,
                 "brake": command.brake,
                 "reason": decision.reason.value,
+                "look_drive_mode": decision.look.mode.value,
+                "pan_deg": decision.look.pan_deg,
+                "look_reason": decision.look.reason,
+                "pixel_error_px": decision.look.pixel_error_px,
+                "camera_request": decision.look.camera_request,
+            },
+        )
+
+    def _log_look(
+        self, decision: DecisionOutput, command: LookActuatorCommand
+    ) -> None:
+        if self._logger is None:
+            return
+        self._logger.log(
+            event_type=TelemetryEventType.MOTOR_COMMAND,
+            severity=TelemetrySeverity.DEBUG,
+            source=self._source,
+            state=decision.requested_state,
+            data={
+                "look_only": True,
+                "pan_deg": command.pan_deg,
+                "look_drive_mode": command.mode,
+                "look_reason": command.reason,
+                "pixel_error_px": decision.look.pixel_error_px,
+                "camera_request": decision.look.camera_request,
             },
         )
 
 
 __all__ = [
+    "LookActuatorCommand",
     "MotorBackend",
     "MotorCommand",
     "MotorInterface",

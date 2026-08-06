@@ -42,6 +42,9 @@ class FakePicarx:
     def set_dir_servo_angle(self, angle_deg: float) -> None:
         self.calls.append(("set_dir_servo_angle", float(angle_deg)))
 
+    def set_cam_pan_angle(self, angle_deg: float) -> None:
+        self.calls.append(("set_cam_pan_angle", float(angle_deg)))
+
 
 def _decision(*, speed=0.0, steering=0.0, brake=False):
     return DecisionOutput(
@@ -142,14 +145,95 @@ def test_repeated_same_steering_only_writes_once():
 
 def test_emergency_stop_stops_drivetrain_and_centers_wheels():
     px = FakePicarx()
-    backend = PiCarXBackend(px)
+    backend = PiCarXBackend(px, pan_forward_deg=8.0)
     backend.apply(speed=0.5, steering=0.4, brake=False)
+    backend.apply_look(pan_deg=20.0)
     backend.emergency_stop()
     # The last-three calls should include a stop and a centered steering.
     assert ("stop",) in px.calls
     assert ("set_dir_servo_angle", 0.0) in px.calls
+    assert ("set_cam_pan_angle", 8.0) in px.calls
     assert backend._last_steering == 0.0  # type: ignore[attr-defined]
     assert backend._last_drive == "stop"  # type: ignore[attr-defined]
+
+
+def test_emergency_stop_warns_when_pan_api_missing():
+    class NoPanPicarx:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def forward(self, speed: int) -> None:
+            self.calls.append(("forward", int(speed)))
+
+        def backward(self, speed: int) -> None:
+            self.calls.append(("backward", int(speed)))
+
+        def stop(self) -> None:
+            self.calls.append(("stop",))
+
+        def set_dir_servo_angle(self, angle_deg: float) -> None:
+            self.calls.append(("set_dir_servo_angle", float(angle_deg)))
+
+    px = NoPanPicarx()
+    backend = PiCarXBackend(px, pan_forward_deg=8.0)
+    # Stale cache from a prior successful pan on a different stub is N/A;
+    # simulate a prior software-side pan angle.
+    backend._last_pan = 25.0  # type: ignore[attr-defined]
+    with pytest.warns(RuntimeWarning, match="set_cam_pan_angle missing"):
+        backend.emergency_stop()
+    assert ("stop",) in px.calls
+    assert ("set_dir_servo_angle", 0.0) in px.calls
+    # Cache still advances to calibrated forward so MotorInterface dedup matches.
+    assert backend._last_pan == 8.0  # type: ignore[attr-defined]
+
+
+def test_apply_look_updates_cache_when_pan_api_missing():
+    class NoPanPicarx:
+        def forward(self, speed: int) -> None:
+            pass
+
+        def backward(self, speed: int) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def set_dir_servo_angle(self, angle_deg: float) -> None:
+            pass
+
+    backend = PiCarXBackend(NoPanPicarx(), pan_forward_deg=8.0)
+    with pytest.warns(RuntimeWarning, match="set_cam_pan_angle missing"):
+        backend.apply_look(pan_deg=12.0)
+    assert backend._last_pan == 12.0  # type: ignore[attr-defined]
+    # Dedup: same target does not re-warn.
+    backend.apply_look(pan_deg=12.0)
+    assert backend._last_pan == 12.0  # type: ignore[attr-defined]
+
+
+def test_apply_look_sets_cam_pan():
+    px = FakePicarx()
+    backend = PiCarXBackend(px)
+    iface = MotorInterface(backend=backend)
+    from cat_follow.control.types import LookCommand, LookDriveMode
+
+    decision = _decision(speed=0.0, steering=0.0, brake=True)
+    # Rebuild with look — DecisionOutput is frozen; use replace via new ctor
+    decision = DecisionOutput(
+        timestamp_ms=0,
+        requested_state=FsmState.CHASE,
+        speed=0.0,
+        steering=0.0,
+        brake=True,
+        reason=ReasonCode.MANUAL_SEQUENCE,
+        look=LookCommand(
+            mode=LookDriveMode.LOOK_AT,
+            pan_deg=12.0,
+            pan_forward_deg=0.0,
+            reason="test",
+        ),
+    )
+    iface.apply(decision)
+    assert ("set_cam_pan_angle", 12.0) in px.calls
 
 
 # ── integration with MotorInterface ────────────────────────────────

@@ -252,6 +252,12 @@ class ControlLoop:
             brake=output.brake,
             reason=output.reason,
             active_constraints=output.active_constraints,
+            look_drive_mode=output.look.mode,
+            pan_deg=output.look.pan_deg,
+            pan_forward_deg=output.look.pan_forward_deg,
+            look_reason=output.look.reason,
+            pixel_error_px=output.look.pixel_error_px,
+            camera_request=output.look.camera_request,
         )
         self._ss.update_decision(decision_state)
 
@@ -325,6 +331,12 @@ class ControlLoop:
                     if output.target_source is not None
                     else None
                 ),
+                "look_drive_mode": output.look.mode.value,
+                "pan_deg": output.look.pan_deg,
+                "pan_forward_deg": output.look.pan_forward_deg,
+                "look_reason": output.look.reason,
+                "pixel_error_px": output.look.pixel_error_px,
+                "camera_request": output.look.camera_request,
             },
         )
 

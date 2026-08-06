@@ -26,6 +26,7 @@ from cat_follow.control.fsm import FSM, NORMAL_DRIVING_STATES
 
 if TYPE_CHECKING:
     from cat_follow.motion.sequence_executor import MotionSequenceExecutor
+from cat_follow.control.look_drive import LookDriveController
 from cat_follow.control.types import (
     AckStatus,
     BrakeReversePhase,
@@ -34,6 +35,8 @@ from cat_follow.control.types import (
     DecisionOutput,
     FsmEvent,
     FsmState,
+    LookCommand,
+    LookDriveMode,
     MissionState,
     RangeState,
     ReasonCode,
@@ -192,6 +195,10 @@ class DecisionEngine:
         self._thermal_critical_return_active = False
         self._last_dual_sensor_health: Optional[DualSensorHealthState] = None
         self._last_hold_reason: Optional[str] = None
+        self._look_drive = LookDriveController(
+            self._target_config,
+            pan_forward_deg=self._target_config.look_pan_forward_deg,
+        )
 
     def set_safety_thresholds(self, config) -> None:
         """Apply runtime safety threshold updates from :mod:`safety_config`."""
@@ -1028,6 +1035,9 @@ class DecisionEngine:
                 if self._fsm.state != FsmState.BRAKE_REVERSE:
                     self.clear_brake_reverse_context()
                     return self._stale_brake_context_output(decision_input)
+                look = self._look_for_fsm_state(
+                    decision_input, hold_motion=False
+                )
                 return DecisionOutput(
                     timestamp_ms=now_ms,
                     requested_state=FsmState.BRAKE_REVERSE,
@@ -1036,6 +1046,7 @@ class DecisionEngine:
                     brake=False,
                     reason=ReasonCode.BRAKE_REVERSE_ACTIVE,
                     active_constraints=tuple(constraints),
+                    look=look,
                 )
             self._brake_phase = BrakeReversePhase.STOP_EXIT
             self._brake_phase_started_ms = now_ms
@@ -1618,6 +1629,11 @@ class DecisionEngine:
             )
 
         constraints.append("manual_sequence")
+        look = self._look_for_fsm_state(
+            decision_input,
+            path_correction=cmd.steering,
+            hold_motion=False,
+        )
         return DecisionOutput(
             timestamp_ms=decision_input.now_ms,
             requested_state=current_state,
@@ -1626,6 +1642,7 @@ class DecisionEngine:
             brake=cmd.brake,
             reason=ReasonCode.MANUAL_SEQUENCE,
             active_constraints=tuple(constraints),
+            look=look,
         )
 
     def _abort_sequence(self, reason: str) -> None:
@@ -1668,26 +1685,61 @@ class DecisionEngine:
                 brake=True,
             )
 
-        if current_state == FsmState.CHASE:
-            camera_request = max(
-                -1.0, min(1.0, decision_input.vision.x_offset_norm)
+        camera_request = max(
+            -1.0, min(1.0, decision_input.vision.x_offset_norm)
+        )
+        path_correction = max(-1.0, min(1.0, nav.path_correction))
+        look_decision = self._look_drive.tick(
+            now_ms=decision_input.now_ms,
+            fsm_state=current_state,
+            vision=decision_input.vision,
+            navigation=nav,
+            hold_motion=False,
+            path_correction=path_correction,
+            camera_request=camera_request,
+        )
+        if look_decision.constraint:
+            constraints.append(look_decision.constraint)
+        final_steer = look_decision.steering
+        if look_decision.mode == LookDriveMode.HOLD:
+            # Envelope unusable / pan-reset timeout / other fail-closed holds:
+            # never keep chase speed with zero or stale steer.
+            hold_reason = (
+                ReasonCode.NAVIGATION_PATH_BLOCKED
+                if look_decision.look.reason == "envelope_unusable"
+                else ReasonCode.LOOK_DRIVE_HOLD
             )
-            safe_min = max(-1.0, min(1.0, nav.safe_steering_min))
-            safe_max = max(-1.0, min(1.0, nav.safe_steering_max))
-            if safe_min > safe_max:
-                constraints.append("navigation_envelope_invalid")
-                return self._safe_stop_output(
-                    decision_input,
-                    reason=ReasonCode.NAVIGATION_PATH_BLOCKED,
-                    constraints=constraints,
-                    brake=True,
-                )
-            # Canonical non-additive fusion: camera requests steering and Nav2
-            # supplies the permitted envelope.  path_correction is not summed.
-            final_steer = max(safe_min, min(safe_max, camera_request))
-            constraints.append("camera_steering_clamped")
-        else:
-            final_steer = max(-1.0, min(1.0, nav.path_correction))
+            return self._safe_stop_output(
+                decision_input,
+                reason=hold_reason,
+                constraints=constraints,
+                brake=True,
+                look=look_decision.look,
+            )
+        if current_state == FsmState.CHASE:
+            if look_decision.mode == LookDriveMode.BODY_STEER:
+                # Enforce envelope clamp even if selector used stale bounds.
+                safe_min = max(-1.0, min(1.0, nav.safe_steering_min))
+                safe_max = max(-1.0, min(1.0, nav.safe_steering_max))
+                if safe_min > safe_max:
+                    constraints.append("navigation_envelope_invalid")
+                    # Already advanced look_drive once this tick — snap forward
+                    # without a second tick/slew.
+                    look = self._look_drive.force_forward(
+                        reason="envelope_invalid",
+                        pixel_error_px=look_decision.look.pixel_error_px,
+                        camera_request=camera_request,
+                        now_ms=decision_input.now_ms,
+                    )
+                    return self._safe_stop_output(
+                        decision_input,
+                        reason=ReasonCode.NAVIGATION_PATH_BLOCKED,
+                        constraints=constraints,
+                        brake=True,
+                        look=look,
+                    )
+                final_steer = max(safe_min, min(safe_max, final_steer))
+        look_cmd = look_decision.look
 
         if current_state == FsmState.GOTO:
             final_speed = speed_cap
@@ -1737,6 +1789,7 @@ class DecisionEngine:
             target_y=self._last_valid_target_y if chase_target else None,
             target_source=target_source,
             rejected_transition=False,
+            look=look_cmd,
         )
 
     def _safe_stop_output(
@@ -1746,7 +1799,18 @@ class DecisionEngine:
         reason: ReasonCode,
         constraints: List[str],
         brake: bool,
+        look: Optional[LookCommand] = None,
     ) -> DecisionOutput:
+        if look is None:
+            look = self._look_drive.tick(
+                now_ms=decision_input.now_ms,
+                fsm_state=self._fsm.state,
+                vision=decision_input.vision,
+                navigation=decision_input.navigation,
+                hold_motion=True,
+                path_correction=0.0,
+                camera_request=0.0,
+            ).look
         return DecisionOutput(
             timestamp_ms=decision_input.now_ms,
             requested_state=self._fsm.state,
@@ -1759,7 +1823,28 @@ class DecisionEngine:
             target_y=None,
             target_source=TargetSource.NONE,
             rejected_transition=False,
+            look=look,
         )
+
+    def _look_for_fsm_state(
+        self,
+        decision_input: DecisionInput,
+        *,
+        path_correction: float = 0.0,
+        camera_request: float = 0.0,
+        hold_motion: bool = False,
+    ) -> LookCommand:
+        """Tick look/drive once for the current FSM state (pan → forward)."""
+
+        return self._look_drive.tick(
+            now_ms=decision_input.now_ms,
+            fsm_state=self._fsm.state,
+            vision=decision_input.vision,
+            navigation=decision_input.navigation,
+            hold_motion=hold_motion,
+            path_correction=path_correction,
+            camera_request=camera_request,
+        ).look
 
 
 __all__ = [

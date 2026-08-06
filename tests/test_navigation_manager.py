@@ -614,3 +614,66 @@ def test_expected_replacements_stay_bounded():
             now,
         )
     assert len(manager._expected_replacements) <= MAX_EXPECTED_REPLACEMENTS
+
+
+def test_manager_missing_costmap_fails_closed_when_getter_wired():
+    transport = FakeTransport()
+    cfg = TargetRuntimeConfig(envelope_provider="costmap_sweep")
+    manager = NavigationManager(
+        cfg, transport=transport, costmap_getter=lambda: None
+    )
+    snapshot = SharedSnapshot(
+        overhead=_overhead(100.0),
+        navigation=NavigationState(
+            received_ms=1000,
+            fresh=True,
+            path_correction=0.2,
+            path_viable=True,
+            pose_x_m=0.0,
+            pose_y_m=0.0,
+            pose_yaw_rad=0.0,
+        ),
+    )
+    state = manager.tick(snapshot, FsmState.GETTING_CLOSE, 1000)
+    assert state.path_viable is False
+    assert state.envelope_source == "none"
+    assert state.safe_steering_min == 0.0
+    assert state.safe_steering_max == 0.0
+
+
+def test_manager_stale_costmap_fails_closed():
+    from cat_follow.navigation.steering_envelope import OccupancyGridSnapshot
+
+    transport = FakeTransport()
+    cfg = TargetRuntimeConfig(
+        envelope_provider="costmap_sweep",
+        envelope_stale_ttl_ms=100,
+    )
+    stale = OccupancyGridSnapshot(
+        width=10,
+        height=10,
+        resolution=0.05,
+        origin_x=-0.25,
+        origin_y=-0.25,
+        origin_yaw=0.0,
+        data=[0] * 100,
+        received_ms=100,
+    )
+    manager = NavigationManager(
+        cfg, transport=transport, costmap_getter=lambda: stale
+    )
+    snapshot = SharedSnapshot(
+        overhead=_overhead(100.0),
+        navigation=NavigationState(
+            received_ms=1000,
+            fresh=True,
+            path_correction=0.0,
+            path_viable=True,
+            pose_x_m=0.0,
+            pose_y_m=0.0,
+            pose_yaw_rad=0.0,
+        ),
+    )
+    state = manager.tick(snapshot, FsmState.GETTING_CLOSE, 1000)
+    assert state.path_viable is False
+    assert state.envelope_source == "none"

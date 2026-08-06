@@ -32,6 +32,11 @@ from cat_follow.navigation.safe_return import (
     home_has_map_pose,
     home_is_valid,
 )
+from cat_follow.navigation.steering_envelope import (
+    OccupancyGridSnapshot,
+    SteeringEnvelopeProvider,
+    make_envelope_provider,
+)
 from cat_follow.target_config import TargetRuntimeConfig
 
 
@@ -42,6 +47,9 @@ DEFAULT_MAX_FAILURES = 2
 # transport that never reports one (detached node, lost server) must not grow
 # the set without bound over a long mission.
 MAX_EXPECTED_REPLACEMENTS = 32
+
+
+CostmapGetter = Callable[[], Optional[OccupancyGridSnapshot]]
 
 
 class NavigationTransport(Protocol):
@@ -96,6 +104,8 @@ class NavigationManager:
         ] = None,
         max_failures: int = DEFAULT_MAX_FAILURES,
         logger=None,
+        envelope_provider: Optional[SteeringEnvelopeProvider] = None,
+        costmap_getter: Optional[CostmapGetter] = None,
     ) -> None:
         if max_failures < 1:
             raise ValueError("max_failures must be >= 1")
@@ -105,6 +115,8 @@ class NavigationManager:
         self._observation_waypoint_provider = observation_waypoint_provider
         self._max_failures = max_failures
         self._logger = logger
+        self._envelope = envelope_provider or make_envelope_provider(config)
+        self._costmap_getter = costmap_getter
         self._lock = threading.RLock()
         self._intent_counter = 0
         self._active: Optional[NavigationGoalIntent] = None
@@ -119,6 +131,10 @@ class NavigationManager:
         self._dwell_started_ms: Optional[int] = None
         self._ignored_late_results = 0
         self._observation_stage_handled = False
+
+    def set_costmap_getter(self, getter: Optional[CostmapGetter]) -> None:
+        with self._lock:
+            self._costmap_getter = getter
 
     @property
     def active_intent(self) -> Optional[NavigationGoalIntent]:
@@ -272,10 +288,54 @@ class NavigationManager:
                     )
                 )
             )
-            safe_min = raw.safe_steering_min
-            safe_max = raw.safe_steering_max
-            if path_viable and safe_min == safe_max == 0.0:
-                safe_min, safe_max = -1.0, 1.0
+            costmap = None
+            has_costmap_source = self._costmap_getter is not None
+            if has_costmap_source:
+                try:
+                    costmap = self._costmap_getter()
+                except Exception as exc:  # noqa: BLE001
+                    costmap = None
+                    if self._logger is not None:
+                        self._logger.log(
+                            event_type=TelemetryEventType.NAVIGATION_RESULT,
+                            severity=TelemetrySeverity.WARNING,
+                            source="NavigationManager",
+                            state=state,
+                            data={
+                                "costmap_getter_error": str(exc),
+                            },
+                        )
+            # Without a costmap subscription (host tests / no ROS), keep an
+            # explicit point envelope.  With a getter wired, costmap_sweep
+            # fails closed when the grid is missing/stale.
+            use_sweep = (
+                has_costmap_source
+                and self._config.envelope_provider == "costmap_sweep"
+            )
+            if use_sweep:
+                env = self._envelope.compute(
+                    path_correction=raw.path_correction,
+                    pose_x_m=raw.pose_x_m,
+                    pose_y_m=raw.pose_y_m,
+                    pose_yaw_rad=raw.pose_yaw_rad,
+                    now_ms=now_ms,
+                    costmap=costmap,
+                )
+                path_viable = bool(path_viable and env.path_viable)
+                safe_min = env.safe_steering_min
+                safe_max = env.safe_steering_max
+                envelope_source = env.envelope_source
+                costmap_age_ms = env.costmap_age_ms
+            else:
+                steer = max(-1.0, min(1.0, raw.path_correction))
+                safe_min = steer
+                safe_max = steer
+                envelope_source = "point"
+                costmap_age_ms = None
+                if not path_viable:
+                    safe_min = 0.0
+                    safe_max = 0.0
+                    envelope_source = "none"
             speed_cap = (
                 raw.speed_cap_mps
                 if raw.speed_cap_mps > 0.0
@@ -289,6 +349,8 @@ class NavigationManager:
                 safe_steering_min=safe_min,
                 safe_steering_max=safe_max,
                 speed_cap_mps=speed_cap,
+                envelope_source=envelope_source,
+                costmap_age_ms=costmap_age_ms,
                 goal_intent=active,
                 last_result=self._last_result,
                 completion_qualified=completion,

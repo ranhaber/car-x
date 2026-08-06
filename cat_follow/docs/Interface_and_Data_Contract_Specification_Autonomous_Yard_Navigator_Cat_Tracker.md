@@ -860,13 +860,37 @@ Nav2 BackUp MUST remain disabled.
   "safe_steering_max": 0.35,
   "speed_cap_mps": 0.25,
   "no_progress": false,
-  "dead_end": false
+  "dead_end": false,
+  "envelope_source": "costmap_sweep",
+  "costmap_age_ms": 42
 }
 ```
 
-`DecisionEngine` applies camera pursuit by clamping the camera steering request into
-the published safe envelope. Camera and Nav2 steering MUST NOT be added or combined
-by weighted sum.
+`envelope_source` MUST be one of `costmap_sweep`, `point`, or `none`.
+Production ROS navigation MUST use `costmap_sweep`. A missing or stale local
+costmap MUST set `path_viable=false` and MUST NOT synthesize a full
+`[-1, 1]` envelope. The legacy point envelope (`min == max == path_correction`)
+is test/fallback only.
+
+Look/drive fusion is defined in `Look_Drive_Path_Design.md`. Summary:
+
+- In `LOOK_AT` / `PATH_FOLLOW`, chassis steering follows `path_correction`
+  inside the envelope; pan may center the bound track.
+- Vision `x_offset_norm` may drive chassis steering only in `BODY_STEER`, and
+  only while pan is within the calibrated-forward deadband (after `PAN_RESET`
+  when leaving look-at).
+- Camera and Nav2 steering MUST NOT be added or combined by weighted sum.
+
+`DecisionOutput` carries an atomic look command alongside chassis output:
+
+```json
+{
+  "look_drive_mode": "LOOK_AT",
+  "pan_deg": 12.0,
+  "pan_forward_deg": 8.0,
+  "look_reason": "track_centerable"
+}
+```
 
 Applied speed policy:
 
@@ -1578,12 +1602,14 @@ include:
    state-specific retained-goal, local-track, and return behavior.
 4. The ROS navigation bridge lacks the required complete `NavigationManager`
    moving-goal output, refresh, cancel, correlation, and completion behavior.
-5. **Partially resolved.** `DecisionEngine._navigation_drive_output` implements the
-   non-additive fusion: in `CHASE` the camera request is clamped to the Nav2
-   `safe_steering_min`/`safe_steering_max` envelope (never summed with
-   `path_correction`), an inverted envelope stops the car, and speed is the
-   minimum of the planner limit and every applied cap. The producer side of that
-   envelope still depends on the `NavigationManager` work in gap 4.
+5. **Resolved (look/drive).** `DecisionEngine` selects a look/drive mode each
+   tick (`Look_Drive_Path_Design.md`). In `LOOK_AT` / `PATH_FOLLOW`, chassis
+   follows `path_correction` inside the Nav2 envelope; vision
+   `x_offset_norm` steers the chassis only in `BODY_STEER` after pan is within
+   the calibrated-forward deadband (never summed with `path_correction`). An
+   inverted envelope stops the car. Speed is the minimum of the planner limit
+   and every applied cap. Envelope provenance is published by
+   `NavigationManager` (`costmap_sweep` in production with ROS nav).
 6. The camera prototype is effectively always active rather than managed by named
    consumers, reference counts, and STREAMOFF/STREAMON readiness.
 7. Detector activation is primarily PhaseMachine/motion-gated rather than

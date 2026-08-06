@@ -75,6 +75,7 @@ from cat_follow.navigation.map_snapshot import (
     publish_scan_overlay,
 )
 from cat_follow.navigation.odom_source import BICYCLE_ODOM_DISABLED_MSG
+from cat_follow.navigation.steering_envelope import OccupancyGridSnapshot
 from cat_follow.navigation.ultrasonic_range import (
     ULTRASONIC_FRAME_ID,
     ULTRASONIC_RANGE_TOPIC,
@@ -233,6 +234,61 @@ def sanitize_odom_pose(
     return float(px), float(py), _yaw_from_quaternion(qx, qy, qz, qw)
 
 
+def overlay_ros_drive_on_navigation(
+    current: NavigationState,
+    *,
+    timestamp_ms: int,
+    drive_received_ms: int,
+    cmd_vel_fresh: bool,
+    heading: float,
+    heading_valid: bool,
+    path_correction: float,
+    speed_limit: float,
+    pose_x_m: float,
+    pose_y_m: float,
+    pose_yaw_rad: float,
+    pose_received_ms: int,
+    odom_received: bool,
+) -> NavigationState:
+    """Merge odom/cmd_vel drive fields without clobbering NavManager policy.
+
+    Preserve ``authority`` / ``path_viable`` when NavigationManager already owns
+    the sample — including fail-closed ``envelope_source="none"`` — so interim
+    odom/cmd_vel overlays cannot reopen viability between manager ticks.
+    Active envelope bands (``costmap_sweep`` / ``point``) are also preserved via
+    ``replace`` (fields not listed here).
+    """
+
+    source = (current.envelope_source or "none").lower()
+    preserve_policy = current.authority == "NavigationManager" or source in {
+        "costmap_sweep",
+        "point",
+    }
+    if preserve_policy:
+        authority = current.authority
+        path_viable = current.path_viable
+    else:
+        authority = "RosBridge"
+        path_viable = bool(cmd_vel_fresh and odom_received)
+    return replace(
+        current,
+        timestamp_ms=timestamp_ms,
+        received_ms=drive_received_ms,
+        fresh=cmd_vel_fresh,
+        authority=authority,
+        heading=heading,
+        heading_valid=heading_valid,
+        speed_limit=speed_limit,
+        path_correction=path_correction,
+        path_viable=path_viable,
+        speed_cap_mps=speed_limit * MAX_PLANNER_SPEED_MPS,
+        pose_x_m=pose_x_m,
+        pose_y_m=pose_y_m,
+        pose_yaw_rad=pose_yaw_rad,
+        pose_received_ms=pose_received_ms,
+    )
+
+
 class ActionGoalRegistry:
     """Track accepted NavigateToPose handles and cancels that arrive early.
 
@@ -324,6 +380,15 @@ if _HAS_ROS:
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
             self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
+            # Local costmap for steering-envelope sweep (Nav2 local_costmap).
+            self.create_subscription(
+                OccupancyGrid,
+                "local_costmap/costmap",
+                self._on_local_costmap,
+                qos_profile_sensor_data,
+            )
+            self._local_costmap: OccupancyGridSnapshot | None = None
+            self._local_costmap_lock = threading.Lock()
 
             # Cached navigation fields updated from separate topics.
             self._heading = 0.0
@@ -390,6 +455,7 @@ if _HAS_ROS:
                 )
             if self._navigation_manager is not None:
                 self._navigation_manager.set_transport(self)
+                self._navigation_manager.set_costmap_getter(self.get_local_costmap)
 
         # ── NavigateToPose transport ────────────────────────────────
 
@@ -683,6 +749,38 @@ if _HAS_ROS:
                 )
             )
 
+        def _on_local_costmap(self, msg) -> None:  # noqa: ANN001
+            info = msg.info
+            origin = info.origin
+            ox = float(origin.position.x)
+            oy = float(origin.position.y)
+            yaw = _yaw_from_quaternion(
+                origin.orientation.x,
+                origin.orientation.y,
+                origin.orientation.z,
+                origin.orientation.w,
+            )
+            resolution = float(info.resolution)
+            if not all(math.isfinite(v) for v in (ox, oy, yaw, resolution)):
+                return
+            snap = OccupancyGridSnapshot(
+                width=int(info.width),
+                height=int(info.height),
+                resolution=resolution,
+                origin_x=ox,
+                origin_y=oy,
+                origin_yaw=yaw,
+                # msg.data is already int8-ish; avoid per-cell int() on ROCK.
+                data=tuple(msg.data),
+                received_ms=now_monotonic_ms(),
+            )
+            with self._local_costmap_lock:
+                self._local_costmap = snap
+
+        def get_local_costmap(self) -> OccupancyGridSnapshot | None:
+            with self._local_costmap_lock:
+                return self._local_costmap
+
         # ── /odom -> NavigationState.heading (+ pose fallback) ───────
 
         def _on_odom(self, msg) -> None:  # noqa: ANN001
@@ -743,29 +841,20 @@ if _HAS_ROS:
 
             current = self._ss.get_navigation()
             self._ss.update_navigation(
-                replace(
+                overlay_ros_drive_on_navigation(
                     current,
                     timestamp_ms=int(time.time() * 1000),
-                    received_ms=drive_received_ms,
-                    fresh=cmd_vel_fresh,
-                    authority="RosBridge",
+                    drive_received_ms=drive_received_ms,
+                    cmd_vel_fresh=cmd_vel_fresh,
                     heading=self._heading,
                     heading_valid=self._heading_valid,
-                    speed_limit=speed_limit,
                     path_correction=path_correction,
-                    path_viable=bool(
-                        cmd_vel_fresh and self._odom_received_ms > 0
-                    ),
-                    # Until a corridor plugin publishes a wider certified
-                    # envelope, the smoothed Nav2 steering command is the sole
-                    # conservative point permitted for camera pursuit.
-                    safe_steering_min=path_correction,
-                    safe_steering_max=path_correction,
-                    speed_cap_mps=speed_limit * MAX_PLANNER_SPEED_MPS,
+                    speed_limit=speed_limit,
                     pose_x_m=self._odom_x,
                     pose_y_m=self._odom_y,
                     pose_yaw_rad=self._heading,
                     pose_received_ms=self._odom_received_ms,
+                    odom_received=self._odom_received_ms > 0,
                 )
             )
 
@@ -951,6 +1040,7 @@ __all__ = [
     "FrontSectorResult",
     "sanitize_cmd_vel",
     "sanitize_odom_pose",
+    "overlay_ros_drive_on_navigation",
     "_front_min_distance_cm",
     "_yaw_from_quaternion",
 ]

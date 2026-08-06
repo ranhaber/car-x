@@ -538,8 +538,19 @@ return home if safe, otherwise enter `FAILSAFE`.
 
 ### 10.4 CHASE fusion
 
-Camera pursuit produces a steering request. Nav2 produces a safe steering
-envelope, speed limit, and path-viability result. Fusion MUST be:
+Normative look/drive modes, pan gating, and steering-envelope provenance are
+defined in `Look_Drive_Path_Design.md`. This section summarizes the required
+behavior.
+
+Nav2 / `NavigationManager` produces a safe steering envelope (costmap sweep in
+production), speed limit, and path-viability result. `DecisionEngine` selects
+exactly one look/drive mode per tick:
+
+- `LOOK_AT` / `PATH_FOLLOW`: chassis follows `path_correction` inside the
+  envelope; pan may track the bound local cat; vision `x_offset_norm` MUST NOT
+  drive the chassis.
+- `PAN_RESET`: pan slews to calibrated forward; chassis vision steer is frozen.
+- `BODY_STEER`: allowed only while pan is within the forward deadband; then
 
 ```text
 applied_steering = clamp(
@@ -547,7 +558,9 @@ applied_steering = clamp(
     nav2_safe_steering_min,
     nav2_safe_steering_max
 )
+```
 
+```text
 applied_speed_mps = min(
     pursuit_speed_request_mps,
     nav2_speed_cap_mps,
@@ -559,7 +572,9 @@ applied_speed_mps = min(
 
 Path viability and every safety veto remain mandatory. Camera and Nav2
 steering MUST NOT be added or combined by weighted sum. `DecisionEngine`
-performs the clamp and remains the sole drivetrain authority.
+remains the sole drivetrain authority and the sole pan command authority.
+Stale or missing costmap MUST fail closed (`path_viable=false`), never widen
+the envelope.
 
 When the local track is lost with valid overhead, transition directly to
 `SEARCH` at `<= 200 cm`, or directly to `GETTING_CLOSE` at `> 200 cm`. A

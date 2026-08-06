@@ -102,6 +102,19 @@ def test_centered_bbox_yields_zero_offset():
     proto.set_bbox((310.0, 200.0, 20.0, 40.0, 1.0))
     state = adapter.update()
     assert state.x_offset_norm == pytest.approx(0.0, abs=1e-6)
+    assert state.x_offset_px == pytest.approx(0.0, abs=1e-6)
+
+
+def test_right_bbox_publishes_x_offset_px_matching_half_width():
+    adapter, proto, _ = _make_adapter(image_width=640)
+    # center_x = 400 → +80 px from center (320), norm = 80/320 = 0.25
+    proto.set_bbox((380.0, 200.0, 40.0, 40.0, 1.0))
+    state = adapter.update()
+    assert state.x_offset_px == pytest.approx(80.0)
+    assert state.x_offset_norm == pytest.approx(0.25)
+    assert state.x_offset_px == pytest.approx(
+        state.x_offset_norm * (640.0 / 2.0)
+    )
 
 
 def test_left_edge_bbox_yields_minus_one_offset():

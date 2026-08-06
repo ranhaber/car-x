@@ -187,6 +187,9 @@ class VisionAdapter:
         #       and received_ms so DecisionEngine's age check can fail closed.
 
         x_offset_norm = self._compute_offset(x, w) if cat_visible else 0.0
+        x_offset_px = (
+            self._compute_offset_px(x, w) if cat_visible else None
+        )
         cat_visible_stable = (
             cat_visible and self._consecutive_visible >= self._stability_frames
         )
@@ -211,6 +214,7 @@ class VisionAdapter:
             cat_visible=cat_visible,
             cat_visible_stable=cat_visible_stable,
             x_offset_norm=x_offset_norm,
+            x_offset_px=x_offset_px,
             confidence=max(0.0, min(1.0, valid)) if cat_visible else 0.0,
             last_seen_ms=self._last_seen_ms,
             observation_sequence=gen,
@@ -278,6 +282,11 @@ class VisionAdapter:
         if offset < -1.0:
             return -1.0
         return offset
+
+    def _compute_offset_px(self, x: float, w: float) -> float:
+        """Horizontal pixel error from frame center (positive = cat right)."""
+
+        return (x + w / 2.0) - (self._image_width / 2.0)
 
     def _log_update(self, state: VisionState) -> None:
         if self._logger is None:

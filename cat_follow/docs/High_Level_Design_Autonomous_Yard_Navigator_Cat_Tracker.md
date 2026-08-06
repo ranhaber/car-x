@@ -168,7 +168,8 @@ Responsibilities:
 - perform sensor arbitration
 - enforce safety precedence
 - compute final speed/steering/brake request
-- clamp camera pursuit steering within the Nav2 safe envelope
+- select look/drive mode (pan look-at vs body vision steer inside Nav2 envelope;
+  see `Look_Drive_Path_Design.md`)
 - manage formal `BRAKE_REVERSE` output and saved-objective restoration
 - emit decision reasons for telemetry
 

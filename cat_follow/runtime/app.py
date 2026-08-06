@@ -352,7 +352,10 @@ def build_app(
         target_runtime_config=target_runtime_config,
     )
     if motor_backend is None:
-        motor_backend = _make_default_backend(use_picarx=use_picarx)
+        motor_backend = _make_default_backend(
+            use_picarx=use_picarx,
+            pan_forward_deg=target_runtime_config.look_pan_forward_deg,
+        )
 
     sink_path = log_path if log_path is not None else default_jsonl_path("logs")
     logger = AsyncLogger(sink=JsonlFileSink(sink_path))
@@ -405,7 +408,11 @@ def build_app(
         },
     )
 
-    motor = MotorInterface(backend=motor_backend, logger=logger)
+    motor = MotorInterface(
+        backend=motor_backend,
+        logger=logger,
+        pan_forward_deg=target_runtime_config.look_pan_forward_deg,
+    )
     control_loop = ControlLoop(
         shared_state=shared_state,
         decision_engine=decision_engine,
@@ -761,7 +768,10 @@ def _try_make_picarx(*, enable_ultrasonic: bool = True) -> Optional[Any]:
 
 
 def _make_default_backend(
-    *, use_picarx: bool, picarx_instance: Optional[Any] = None
+    *,
+    use_picarx: bool,
+    picarx_instance: Optional[Any] = None,
+    pan_forward_deg: float = 0.0,
 ) -> MotorBackend:
     """Return the configured motor backend.
 
@@ -773,7 +783,7 @@ def _make_default_backend(
     """
 
     if not use_picarx:
-        return NoOpMotorBackend()
+        return NoOpMotorBackend(pan_forward_deg=pan_forward_deg)
 
     if picarx_instance is None:
         picarx_instance = _try_make_picarx()
@@ -782,11 +792,11 @@ def _make_default_backend(
             "warning: --picarx requested but Picarx unavailable; "
             "falling back to NoOpMotorBackend\n"
         )
-        return NoOpMotorBackend()
+        return NoOpMotorBackend(pan_forward_deg=pan_forward_deg)
 
     from cat_follow.motion.picarx_backend import PiCarXBackend
 
-    return PiCarXBackend(picarx_instance)
+    return PiCarXBackend(picarx_instance, pan_forward_deg=pan_forward_deg)
 
 
 @dataclass
@@ -1036,9 +1046,13 @@ def main(argv: Optional[list] = None) -> int:
         range_sensor.set_reader(range_source.latest_distance_cm)
         range_read_callback = range_sensor.get_distance_cm
 
+    # Load config before constructing the backend so calibrated pan forward
+    # matches MotorInterface (CLI injects this backend into build_app).
+    cli_target_config = load_target_runtime_config()
     motor_backend = _make_default_backend(
         use_picarx=args.picarx,
         picarx_instance=picarx_instance,
+        pan_forward_deg=cli_target_config.look_pan_forward_deg,
     )
 
     proto = None

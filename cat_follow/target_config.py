@@ -122,6 +122,29 @@ class TargetRuntimeConfig:
     recording_min_free_bytes: int | None = DEFAULT_RECORDING_MIN_FREE_BYTES
     thermal_critical_return_speed_cap_mps: float = 0.08
     thermal_critical_unsafe: bool = False
+    # Look/drive (see Look_Drive_Path_Design.md)
+    look_n_enter_px: float = 40.0
+    look_n_exit_px: float = 80.0
+    look_center_deadband_px: float = 8.0
+    look_pan_slew_deg_s: float = 90.0
+    look_pan_forward_deadband_deg: float = 2.0
+    look_pan_reset_timeout_ms: int = 800
+    look_mode_dwell_ms: int = 400
+    look_control_period_ms: int = 20
+    look_frame_half_width_px: float = 320.0
+    look_px_per_deg: float = 4.0
+    look_path_turn_threshold: float = 0.35
+    look_pan_forward_deg: float = 0.0
+    # Steering envelope
+    envelope_provider: str = "costmap_sweep"  # costmap_sweep | point
+    envelope_lookahead_m: float = 0.6
+    envelope_sample_count: int = 21
+    envelope_stale_ttl_ms: int = 500
+    envelope_max_half_width: float = 0.85
+    envelope_lethal_cost: int = 50
+    envelope_wheelbase_m: float = 0.15
+    envelope_footprint_length_m: float = 0.25
+    envelope_footprint_width_m: float = 0.18
 
     def __post_init__(self) -> None:
         if self.nav_moving_goal_max_hz <= 0.0:
@@ -143,6 +166,22 @@ class TargetRuntimeConfig:
             raise ValueError(
                 "thermal_critical_return_speed_cap_mps must be > 0"
             )
+        if self.look_n_exit_px <= self.look_n_enter_px:
+            raise ValueError("look_n_exit_px must exceed look_n_enter_px")
+        if self.look_pan_slew_deg_s <= 0.0:
+            raise ValueError("look_pan_slew_deg_s must be > 0")
+        if self.look_px_per_deg <= 0.0:
+            raise ValueError("look_px_per_deg must be > 0")
+        if self.envelope_provider not in {"costmap_sweep", "point"}:
+            raise ValueError(
+                "envelope_provider must be 'costmap_sweep' or 'point'"
+            )
+        if self.envelope_sample_count < 3 or self.envelope_sample_count % 2 == 0:
+            raise ValueError("envelope_sample_count must be odd and >= 3")
+        if self.envelope_lookahead_m <= 0.0:
+            raise ValueError("envelope_lookahead_m must be > 0")
+        if not 0.0 < self.envelope_max_half_width <= 1.0:
+            raise ValueError("envelope_max_half_width must be in (0, 1]")
 
     def telemetry_dict(self) -> dict[str, Any]:
         """Return a stable status/telemetry payload with migration metadata."""
@@ -188,6 +227,17 @@ class TargetRuntimeConfig:
                 "recording_min_free_bytes",
                 "nav_ultrasonic_costmap",
                 "thermal_critical_return_speed_cap_mps",
+                "look_n_enter_px",
+                "look_n_exit_px",
+                "look_pan_slew_deg_s",
+                "look_pan_forward_deadband_deg",
+                "look_pan_reset_timeout_ms",
+                "look_mode_dwell_ms",
+                "envelope_provider",
+                "envelope_lookahead_m",
+                "envelope_sample_count",
+                "envelope_stale_ttl_ms",
+                "envelope_max_half_width",
             ],
             "values": values,
             "missing_deployment_required": [
@@ -254,6 +304,33 @@ def load_target_runtime_config() -> TargetRuntimeConfig:
             "THERMAL_CRITICAL_RETURN_SPEED_CAP_MPS", 0.08
         ),
         thermal_critical_unsafe=_bool("THERMAL_CRITICAL_UNSAFE", False),
+        look_n_enter_px=_float("LOOK_N_ENTER_PX", 40.0),
+        look_n_exit_px=_float("LOOK_N_EXIT_PX", 80.0),
+        look_center_deadband_px=_float("LOOK_CENTER_DEADBAND_PX", 8.0),
+        look_pan_slew_deg_s=_float("LOOK_PAN_SLEW_DEG_S", 90.0),
+        look_pan_forward_deadband_deg=_float(
+            "LOOK_PAN_FORWARD_DEADBAND_DEG", 2.0
+        ),
+        look_pan_reset_timeout_ms=_int("LOOK_PAN_RESET_TIMEOUT_MS", 800, minimum=1),
+        look_mode_dwell_ms=_int("LOOK_MODE_DWELL_MS", 400, minimum=0),
+        look_control_period_ms=_int("LOOK_CONTROL_PERIOD_MS", 20, minimum=1),
+        look_frame_half_width_px=_float("LOOK_FRAME_HALF_WIDTH_PX", 320.0),
+        look_px_per_deg=_float("LOOK_PX_PER_DEG", 4.0),
+        look_path_turn_threshold=_float("LOOK_PATH_TURN_THRESHOLD", 0.35),
+        look_pan_forward_deg=_float(
+            "LOOK_PAN_FORWARD_DEG", 0.0, minimum=-90.0
+        ),
+        envelope_provider=(
+            _raw("ENVELOPE_PROVIDER") or "costmap_sweep"
+        ).strip().lower(),
+        envelope_lookahead_m=_float("ENVELOPE_LOOKAHEAD_M", 0.6),
+        envelope_sample_count=_int("ENVELOPE_SAMPLE_COUNT", 21, minimum=3),
+        envelope_stale_ttl_ms=_int("ENVELOPE_STALE_TTL_MS", 500, minimum=1),
+        envelope_max_half_width=_float("ENVELOPE_MAX_HALF_WIDTH", 0.85),
+        envelope_lethal_cost=_int("ENVELOPE_LETHAL_COST", 50, minimum=1),
+        envelope_wheelbase_m=_float("ENVELOPE_WHEELBASE_M", 0.15),
+        envelope_footprint_length_m=_float("ENVELOPE_FOOTPRINT_LENGTH_M", 0.25),
+        envelope_footprint_width_m=_float("ENVELOPE_FOOTPRINT_WIDTH_M", 0.18),
     )
 
 
