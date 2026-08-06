@@ -188,7 +188,15 @@ Output:
   "steering": 0.0,
   "speed_mps": 0.0,
   "normalized_drive": 0.0,
-  "reason": "string"
+  "reason": "string",
+  "look": {
+    "look_drive_mode": "PATH_FOLLOW | LOOK_AT | PAN_RESET | BODY_STEER | HOLD",
+    "pan_deg": 0.0,
+    "pan_forward_deg": 0.0,
+    "look_reason": "string",
+    "pixel_error_px": 0.0,
+    "camera_request": 0.0
+  }
 }
 ```
 

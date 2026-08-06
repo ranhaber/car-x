@@ -879,7 +879,18 @@ Look/drive fusion is defined in `Look_Drive_Path_Design.md`. Summary:
 - Vision `x_offset_norm` may drive chassis steering only in `BODY_STEER`, and
   only while pan is within the calibrated-forward deadband (after `PAN_RESET`
   when leaving look-at).
+- Prefer `VisionState.x_offset_px` for pan pixel error; fallback is
+  `x_offset_norm * look_frame_half_width_px` (default half-width 320).
+  Positive offset = cat right of center; positive pan increases toward right.
 - Camera and Nav2 steering MUST NOT be added or combined by weighted sum.
+- `HOLD` (unusable envelope, pan-reset timeout, hold-motion) MUST expose
+  `LookDriveDecision.steering = 0` and DecisionEngine MUST stop (`speed=0`,
+  `brake=True`). Reasons: `NAVIGATION_PATH_BLOCKED` for
+  `envelope_unusable`; `LOOK_DRIVE_HOLD` for pan-reset timeout and other look
+  HOLDs.
+- RosBridge `overlay_ros_drive_on_navigation` MUST NOT clobber envelope band
+  fields. When `authority` is `NavigationManager` (including fail-closed
+  `envelope_source=none`), it MUST preserve `authority` and `path_viable`.
 
 `DecisionOutput` carries an atomic look command alongside chassis output:
 
@@ -888,7 +899,9 @@ Look/drive fusion is defined in `Look_Drive_Path_Design.md`. Summary:
   "look_drive_mode": "LOOK_AT",
   "pan_deg": 12.0,
   "pan_forward_deg": 8.0,
-  "look_reason": "track_centerable"
+  "look_reason": "look_at",
+  "pixel_error_px": 16.0,
+  "camera_request": 0.05
 }
 ```
 
@@ -1607,9 +1620,13 @@ include:
    follows `path_correction` inside the Nav2 envelope; vision
    `x_offset_norm` steers the chassis only in `BODY_STEER` after pan is within
    the calibrated-forward deadband (never summed with `path_correction`). An
-   inverted envelope stops the car. Speed is the minimum of the planner limit
-   and every applied cap. Envelope provenance is published by
-   `NavigationManager` (`costmap_sweep` in production with ROS nav).
+   inverted/unusable envelope or pan-reset timeout enters `HOLD` with
+   zero steer at the look/drive API and a DecisionEngine hard-stop
+   (`NAVIGATION_PATH_BLOCKED` vs `LOOK_DRIVE_HOLD`). Speed is the minimum of
+   the planner limit and every applied cap. Envelope provenance is published
+   by `NavigationManager` (`costmap_sweep` in production with ROS nav).
+   RosBridge odom/`cmd_vel` overlays preserve NavigationManager
+   `authority`/`path_viable`/envelope fields between manager ticks.
 6. The camera prototype is effectively always active rather than managed by named
    consumers, reference counts, and STREAMOFF/STREAMON readiness.
 7. Detector activation is primarily PhaseMachine/motion-gated rather than

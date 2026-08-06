@@ -424,6 +424,13 @@ picarx_cam_pan_servo = 8
 picarx_cam_tilt_servo = -3
 ```
 
+Look/drive treats commanded pan `0` (after this servo offset) as mechanical
+forward. Runtime `look_pan_forward_deg` carries that calibrated forward into
+`LookDriveController`. Polarity contract: positive `x_offset` / pan = cat /
+camera toward the **right** (matches `stare_at_you` / `bull_fight`); no
+software flip knob unless board evidence contradicts the contract. See
+`Look_Drive_Path_Design.md` §6.1.
+
 The service was successfully started with the real `PiCarXBackend`, observed
 active, and stopped cleanly. It remains deliberately **disabled** until camera
 and floor-drive validation are complete:

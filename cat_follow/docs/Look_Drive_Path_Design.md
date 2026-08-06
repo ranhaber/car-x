@@ -1,7 +1,9 @@
 # Look / Drive / Path Design
 
 **Project:** Autonomous Yard Navigator and Cat Tracker  
-**Status:** Normative addendum for look/drive fusion (v1)  
+**Status:** Normative addendum for look/drive fusion (v1) — **implemented** on
+`main` (`LookDriveController`, DecisionEngine wiring, costmap envelope,
+`MotorInterface.apply_look`, host tests).  
 **Authority:** For look/drive modes, pan gating, and steering-envelope
 provenance, this document supersedes conflicting CHASE-fusion wording in
 `Target_Redesign_FSM_and_Runtime_Autonomous_Yard_Navigator_Cat_Tracker.md`
@@ -40,9 +42,9 @@ Exactly one mode is active per control tick.
 |---|---|---|
 | `PATH_FOLLOW` | Hold or ease to calibrated forward | `path_correction` inside envelope |
 | `LOOK_AT` | Track bound cat to ±N px of frame center | Nav2 path only — **no** vision chassis steer |
-| `PAN_RESET` | Slew to calibrated forward; chassis steer frozen | No new vision steer |
+| `PAN_RESET` | Slew to calibrated forward; chassis steer frozen | Held pre-reset steer only (not new vision) |
 | `BODY_STEER` | Must be within forward deadband | `clamp(x_offset_norm, envelope)` |
-| `HOLD` | Freeze, then forward on exit | Zero motion |
+| `HOLD` | Ease/snap toward calibrated forward | **`steering = 0` at LookDriveDecision API** |
 
 Safety / non-chase exits (`BRAKE_REVERSE`, `FAILSAFE`, `HOME`, `IDLE`, `GOTO`,
 `RETURN_HOME`, `GETTING_CLOSE`, `SEARCH`) force pan to calibrated forward and
@@ -58,6 +60,12 @@ use existing FSM drive policy (`PATH_FOLLOW` or zero).
 5. Pan tracks only the bound `target_id` local track; ambiguity → no look chase.
 6. Mode edges use hysteresis (`N_exit > N_enter`), minimum dwell, and pan
    slew-rate limits.
+7. Every fail-closed `HOLD` entry clears `_held_steer` before returning
+   (`_fail_closed_hold`): `hold_motion`, `envelope_unusable`, and
+   `pan_reset_timeout`. `LookDriveDecision.steering` MUST be `0.0` even if a
+   future consumer ignores DecisionEngine.
+8. `DecisionEngine` hard-stops on `LookDriveMode.HOLD` (`speed=0`, `brake=True`)
+   and does not apply look-drive steering to the motors.
 
 ### 3.2 Mode selection sketch
 
@@ -112,8 +120,12 @@ applied_steering = clamp(path_correction, safe_min, safe_max)
 # BODY_STEER only (pan at forward):
 applied_steering = clamp(x_offset_norm, safe_min, safe_max)
 
-# PAN_RESET / HOLD:
-applied_steering = held_or_zero
+# PAN_RESET (while slewing to forward):
+applied_steering = held_steer   # frozen; not a new camera request
+
+# HOLD (fail-closed):
+applied_steering = 0.0
+# DecisionEngine: speed=0, brake=True
 
 applied_speed_mps = min(
     pursuit_speed_request_mps,
@@ -126,29 +138,73 @@ applied_speed_mps = min(
 
 Camera and Nav2 steering MUST NOT be added or weighted-summed.
 
+### 6.1 Vision pixel contract and pan polarity
+
+- Prefer `VisionState.x_offset_px` when set (`VisionAdapter` publishes it).
+  Fallback: `x_offset_norm * look_frame_half_width_px` (default half-width
+  **320** for 640-wide chase frames).
+- Positive pixel error / positive `x_offset_norm` means cat is **right** of
+  center. Positive pan command increases `pan_deg` toward the right (Picarx
+  `set_cam_pan_angle` / `stare_at_you` / `bull_fight` convention). No runtime
+  flip knob: board cal `picarx_cam_pan_servo` makes commanded `0` ≈ mechanical
+  forward; `look_pan_forward_deg` carries that calibrated forward into
+  look/drive.
+
+### 6.2 HOLD reason codes
+
+| Look reason / trigger | `ReasonCode` |
+|---|---|
+| `envelope_unusable` (inverted / non-viable envelope) | `NAVIGATION_PATH_BLOCKED` |
+| `pan_reset_timeout`, other look HOLDs | `LOOK_DRIVE_HOLD` |
+
+Constraint strings (`look_drive_hold`, `look_pan_reset_timeout`, …) remain the
+fine-grained signal in `active_constraints`.
+
+### 6.3 RosBridge status overlay
+
+`overlay_ros_drive_on_navigation` merges odom/`cmd_vel` pose and drive terms
+into `NavigationState` without clobbering NavigationManager policy:
+
+- Preserve `authority` and `path_viable` when
+  `authority == "NavigationManager"` **or** `envelope_source` is
+  `costmap_sweep` / `point` (includes fail-closed `envelope_source=none` with
+  `path_viable=false`).
+- Envelope band fields (`safe_steering_*`, `envelope_source`, `costmap_age_ms`)
+  are never overwritten by the overlay.
+- ControlLoop still runs `NavigationManager.tick` before `decide`, so actuators
+  are not driven by interim bridge status alone.
+
 ## 7. Configuration (startup-validated)
 
 | Knob | Meaning | Default intent |
 |---|---|---|
-| `look_n_enter_px` | Enter LOOK_AT when \|pixel error\| ≤ this | tighter |
-| `look_n_exit_px` | Exit LOOK_AT when \|pixel error\| ≥ this | `> n_enter` |
-| `look_pan_slew_deg_s` | Max pan rate | hardware-safe |
-| `look_pan_forward_deadband_deg` | Forward gate for BODY_STEER | small |
-| `look_pan_reset_timeout_ms` | PAN_RESET deadline | fail → PATH_FOLLOW/HOLD |
-| `look_mode_dwell_ms` | Min time in a mode before leaving | 300–500 |
+| `look_n_enter_px` | Enter LOOK_AT when \|pixel error\| ≤ this | 40 |
+| `look_n_exit_px` | Exit LOOK_AT when \|pixel error\| ≥ this | 80 (`> n_enter`) |
+| `look_pan_slew_deg_s` | Max pan rate | 90 |
+| `look_pan_forward_deadband_deg` | Forward gate for BODY_STEER | 2 |
+| `look_pan_reset_timeout_ms` | PAN_RESET deadline | 800 → HOLD + zero steer |
+| `look_mode_dwell_ms` | Min time in a mode before leaving | 400 |
+| `look_frame_half_width_px` | Norm→px fallback half-width | **320** (640/2) |
+| `look_px_per_deg` | Pixel error → pan degrees | 4 |
+| `look_center_deadband_px` | Hold pan when nearly centered | 8 |
+| `look_path_turn_threshold` | Prefer PATH_FOLLOW when \|path_correction\| large | 0.35 |
+| `look_pan_forward_deg` | Calibrated mechanical forward | from runtime / cal |
+| `look_control_period_ms` | Slew step dt hint | 20 |
 | `envelope_lookahead_m` | Sweep arc length | ~0.4–0.8 |
 | `envelope_sample_count` | Steer samples in [-1, 1] | odd, ≥9 |
 | `envelope_stale_ttl_ms` | Costmap freshness | fail closed |
 | `envelope_max_half_width` | Cap band half-width | safety |
 
-`pan_forward_deg` is the calibrated pan center (mechanical forward), not raw
-PWM zero.
+`look_pan_forward_deg` / `pan_forward_deg` is the calibrated pan center
+(mechanical forward), not raw PWM zero.
 
 ## 8. Telemetry (every control tick)
 
 Record: `look_drive_mode`, `pan_deg`, `pan_forward_deg`, `pixel_error_px`,
 `camera_request`, `safe_steering_min/max`, `path_correction`, applied chassis
-`steering`, `envelope_source`, `costmap_age_ms`, `look_reason`.
+`steering`, `envelope_source`, `costmap_age_ms`, `look_reason`, decision
+`reason` (`LOOK_DRIVE_HOLD` vs `NAVIGATION_PATH_BLOCKED`), and
+`active_constraints`.
 
 ## 9. Scenario coverage
 
@@ -165,8 +221,9 @@ Record: `look_drive_mode`, `pan_deg`, `pan_forward_deg`, `pixel_error_px`,
 | A7 | PRIMARY_CAT_LEFT match | Stop; handoff IDLE; pan→forward |
 | A8 | Camera/RKNN fatal | GETTING_CLOSE; pan→forward |
 | A9 | Lidar/ultrasonic unhealthy | Existing hold/failsafe; pan freeze→forward |
-| A10 | Costmap/envelope stale | path_viable=false; HOLD |
+| A10 | Costmap/envelope stale | path_viable=false; HOLD; `steering=0`; DE hard-stop |
 | A11 | Localization/geofence lost | Stop / failsafe; pan→forward |
+| A12 | Interim RosBridge odom after NM fail-closed | Overlay keeps `authority`/`path_viable`; no reopen |
 
 ### B — Mission phase
 
@@ -195,8 +252,10 @@ Record: `look_drive_mode`, `pan_deg`, `pan_forward_deg`, `pixel_error_px`,
 | C6 | Envelope forbids needed nudge | Prefer LOOK_AT; else stop/SEARCH |
 | C7 | Cat outside pan FOV | PATH_FOLLOW on overhead or track-loss |
 | C8 | Tilt | Fixed default in v1 |
-| C9 | Stuck pan | Watchdog → PATH_FOLLOW/HOLD |
+| C9 | Stuck pan / PAN_RESET timeout | Watchdog → HOLD; clear held steer; `LOOK_DRIVE_HOLD` |
 | C10 | Calibrated forward | Use pan center cal as forward |
+| C11 | Pixel half-width / `x_offset_px` | Prefer px from vision; default half-width 320 |
+| C12 | HOLD after non-zero body steer | LookDriveDecision.steering == 0 at API |
 
 ## 10. Board validation checklist
 
@@ -223,10 +282,29 @@ for ROCK 4D scenes LOOK-01…LOOK-05 and ENV-01.
 
 | Piece | Location |
 |---|---|
-| Types / LookCommand | `cat_follow/control/types.py` |
-| Mode selector | `cat_follow/control/look_drive.py` |
-| Fusion | `cat_follow/control/decision_engine.py` |
+| Types / `LookCommand` / `LookDriveMode` / `LOOK_DRIVE_HOLD` | `cat_follow/control/types.py` |
+| Mode selector (`_fail_closed_hold`, pan sign, hysteresis) | `cat_follow/control/look_drive.py` |
+| Fusion + HOLD hard-stop + reason split | `cat_follow/control/decision_engine.py` |
 | Pan actuator | `cat_follow/motion/motor_interface.py`, `picarx_backend.py` |
+| `VisionState.x_offset_px` | `cat_follow/perception/vision_adapter.py` |
 | Envelope providers | `cat_follow/navigation/steering_envelope.py` |
-| Costmap ingest | `cat_follow/navigation/ros_bridge.py` |
+| Costmap ingest + `overlay_ros_drive_on_navigation` | `cat_follow/navigation/ros_bridge.py` |
+| Envelope publish / fail-closed | `cat_follow/navigation/manager.py` |
 | Config | `cat_follow/target_config.py` |
+| Host tests | `tests/test_look_drive_mode.py`, `test_decision_navigation_fusion.py`, `test_steering_envelope.py`, `test_navigation_helpers.py` |
+| Board checklist | `Board_Checklist_Look_Drive_Path.md` |
+
+## 13. Host residuals closed (v1 hardening)
+
+These were review findings after the initial land; all are required behavior:
+
+| Topic | Behavior |
+|---|---|
+| PAN_RESET timeout | Clears held steer → HOLD; DE stop; `LOOK_DRIVE_HOLD` |
+| HOLD API fail-open | All HOLD paths via `_fail_closed_hold` (`steering=0`) |
+| Half-width / `x_offset_px` | Default 320; VisionAdapter publishes px |
+| Pan sign | `+` toward positive (cat-right) error |
+| HOLD zero-speed | DecisionEngine stops on HOLD |
+| RosBridge envelope flicker | Overlay does not clobber envelope band fields |
+| RosBridge policy reopen | Preserve NM `authority`/`path_viable` even when `envelope_source=none` |
+| Costmap copy | `tuple(msg.data)` without per-cell `int()` (full copy remains) |

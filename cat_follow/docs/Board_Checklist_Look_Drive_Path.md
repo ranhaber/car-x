@@ -16,6 +16,9 @@ Record telemetry JSONL for each scene (`look_drive_mode`, `pan_deg`,
 | LOOK-05 | Multi-minute soak | No LOOK_AT↔BODY_STEER chatter under dwell/hysteresis | Pending |
 
 Host evidence (not a board pass): `tests/test_look_drive_mode.py`,
-`tests/test_steering_envelope.py`, `tests/test_decision_navigation_fusion.py`.
+`tests/test_steering_envelope.py`, `tests/test_decision_navigation_fusion.py`,
+`tests/test_navigation_helpers.py` (HOLD zero-steer API, reason split,
+`x_offset_px`/half-width, pan polarity, RosBridge policy preserve including
+NM fail-closed `envelope_source=none`).
 
-See also: [`Look_Drive_Path_Design.md`](Look_Drive_Path_Design.md) §10.
+See also: [`Look_Drive_Path_Design.md`](Look_Drive_Path_Design.md) §10 and §13.

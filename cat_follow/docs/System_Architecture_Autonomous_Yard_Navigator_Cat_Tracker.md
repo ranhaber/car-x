@@ -332,8 +332,9 @@ Recording and streaming never authorize motion.
 4. At `<=200 cm` valid overhead distance, enter `SEARCH`.
 5. Three consecutive unambiguous associated local observations bind the local
    track to `target_id` and enter `CHASE`.
-6. In `CHASE`, camera pursuit is clamped inside the Nav2 safe steering envelope
-   (Section 9).
+6. In `CHASE`, look/drive fusion selects pan look-at vs body vision steer
+   inside the Nav2 safe steering envelope (`Look_Drive_Path_Design.md`);
+   vision never steers the chassis until pan is at calibrated forward.
 7. Local track loss with valid overhead transitions directly to `SEARCH`
    (`<=200 cm`) or `GETTING_CLOSE` (`>200 cm`).
 8. Matching `PRIMARY_CAT_LEFT_PERIMETER(target_id)` enters handoff `IDLE` with
@@ -553,8 +554,10 @@ include:
 4. **`NavigationManager`** does not exist; the ROS bridge lacks complete moving
    goal output, refresh, cancel, correlation, safe envelope, and completion
    behavior.
-5. **Chase/navigation authority** is advisory/incomplete and does not implement
-   the non-additive camera-request clamp inside a Nav2 safe steering envelope.
+5. **Chase/navigation look/drive fusion** is implemented
+   (`Look_Drive_Path_Design.md`): non-additive BODY_STEER clamp, LOOK_AT path
+   follow, HOLD fail-closed, and costmap envelope provenance. Broader
+   NavigationManager goal lifecycle remains under item 4.
 6. **Camera lifecycle** is effectively always active rather than managed by
    named consumers, reference counts, and STREAMOFF/STREAMON readiness.
 7. **Detector activation** is primarily PhaseMachine/motion-gated rather than

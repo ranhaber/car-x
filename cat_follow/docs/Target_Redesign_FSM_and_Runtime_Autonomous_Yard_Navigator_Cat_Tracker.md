@@ -560,6 +560,10 @@ applied_steering = clamp(
 )
 ```
 
+- `HOLD`: fail-closed (`steering=0` at look/drive API); DecisionEngine stops
+  with brake. Use `NAVIGATION_PATH_BLOCKED` for unusable envelope and
+  `LOOK_DRIVE_HOLD` for pan-reset timeout / other look holds.
+
 ```text
 applied_speed_mps = min(
     pursuit_speed_request_mps,
@@ -572,9 +576,10 @@ applied_speed_mps = min(
 
 Path viability and every safety veto remain mandatory. Camera and Nav2
 steering MUST NOT be added or combined by weighted sum. `DecisionEngine`
-remains the sole drivetrain authority and the sole pan command authority.
-Stale or missing costmap MUST fail closed (`path_viable=false`), never widen
-the envelope.
+remains the sole drivetrain authority and the sole pan command authority
+(`MotorInterface.apply_look`). Stale or missing costmap MUST fail closed
+(`path_viable=false`), never widen the envelope. Pixel error prefers
+`VisionState.x_offset_px`; positive offset / pan = cat / pan toward right.
 
 When the local track is lost with valid overhead, transition directly to
 `SEARCH` at `<= 200 cm`, or directly to `GETTING_CLOSE` at `> 200 cm`. A
@@ -1042,8 +1047,10 @@ include:
    mission Nav2 goal-output path; it does not provide the required complete
    `NavigationManager` moving-goal output, refresh, cancel, correlation, and
    completion behavior.
-5. Current chase/navigation authority is advisory/incomplete and does not
-   implement the camera-request clamp inside a Nav2 safe steering envelope.
+5. **Resolved (look/drive).** See `Look_Drive_Path_Design.md`: look/drive modes,
+   pan gating, costmap envelope provenance, HOLD fail-closed steer/speed, and
+   RosBridge policy-preserving overlay. Remaining NavigationManager goal
+   lifecycle gaps are tracked under item 4.
 6. The camera prototype is effectively always active rather than managed by
    named consumers, reference counts, and STREAMOFF/STREAMON readiness.
 7. Detector activation is primarily PhaseMachine/motion-gated rather than

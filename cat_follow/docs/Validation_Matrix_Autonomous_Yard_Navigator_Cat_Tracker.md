@@ -40,7 +40,7 @@ ultrasonic-only autonomous motion are outside the supported target.
 | FSM-02 | `IDLE` normal and handoff | Stopped; accepts only valid commands; handoff context/timer observable | Pending |
 | FSM-03 | `GETTING_CLOSE` | Selected overhead `target_id` drives filtered moving Nav2 goals; detector not required | Pending |
 | FSM-04 | `SEARCH` | SEARCH speed; detector continuously required without UI/stream; timeout stage retained | Pending |
-| FSM-05 | `CHASE` | Bound local track; camera steering clamped to Nav2 safe envelope; all vetoes retained | Pending |
+| FSM-05 | `CHASE` | Look/drive fusion: LOOK_AT/PATH_FOLLOW use path_correction; BODY_STEER clamps vision only at calibrated-forward pan; HOLD stops; all vetoes retained | Pending (host: look_drive / fusion tests) |
 | FSM-06 | `BRAKE_REVERSE` | Saved objective/policy, formal phases, attempts, and preemption are observable | Pending |
 | FSM-07 | `GOTO` | Explicit Nav2 destination; YOLO and recording exactly match independent request flags | Pending |
 | FSM-08 | `RETURN_HOME` | Uses mission-frozen durable home and critical-return policy; completes only after qualified dwell | Pending |
@@ -111,15 +111,18 @@ objective and return a committed reason.
 | NAV-15 | Ultrasonic costmap | Valid `sensor_msgs/Range` and RangeSensorLayer integration; disabling layer does not disable direct safety | Pending |
 | NAV-16 | RF2O/startup authority | Seed/validate from overhead once, then local Nav2/SLAM is authoritative; no continuous overwrite or bicycle fallback | Pending |
 | ENV-01 | Costmap sweep envelope | Local costmap sweep publishes contiguous free `[safe_steering_min, max]` containing path_correction when viable; `envelope_source=costmap_sweep` | Pending |
-| ENV-02 | Stale/missing costmap | `path_viable=false`; zero/empty envelope; no silent `[-1,1]` synthesis; no motion on that envelope | Pending |
+| ENV-02 | Stale/missing costmap | `path_viable=false`; zero/empty envelope; no silent `[-1,1]` synthesis; no motion on that envelope | Pending (host: envelope + overlay preserve) |
 | ENV-03 | Point envelope fallback | `envelope_source=point` only when explicitly configured for test/fallback; never production default with ROS nav | Pending |
-| LOOK-01 | LOOK_AT eligibility | CHASE + fresh bound track + error ≤ N_enter + pan can center → LOOK_AT; chassis uses path_correction only | Pending |
-| LOOK-02 | Vision chassis gate | Vision `x_offset_norm` never steers chassis while pan outside forward deadband | Pending |
-| LOOK-03 | PAN_RESET before BODY_STEER | Leaving LOOK_AT for vision body steer always passes through PAN_RESET to calibrated forward | Pending |
-| LOOK-04 | BODY_STEER clamp | With pan at forward, applied steer = clamp(x_offset_norm, envelope); never summed with path_correction | Pending |
-| LOOK-05 | Mode hysteresis | N_exit > N_enter and mode dwell prevent LOOK_AT↔BODY_STEER chatter | Pending |
-| LOOK-06 | Safety pan forward | BRAKE_REVERSE / FAILSAFE / HOME / IDLE / GOTO / RETURN_HOME command pan to calibrated forward | Pending |
+| LOOK-01 | LOOK_AT eligibility | CHASE + fresh bound track + error ≤ N_enter + pan can center → LOOK_AT; chassis uses path_correction only | Pending (host) |
+| LOOK-02 | Vision chassis gate | Vision `x_offset_norm` never steers chassis while pan outside forward deadband | Pending (host) |
+| LOOK-03 | PAN_RESET before BODY_STEER | Leaving LOOK_AT for vision body steer always passes through PAN_RESET to calibrated forward | Pending (host) |
+| LOOK-04 | BODY_STEER clamp | With pan at forward, applied steer = clamp(x_offset_norm, envelope); never summed with path_correction | Pending (host) |
+| LOOK-05 | Mode hysteresis | N_exit > N_enter and mode dwell prevent LOOK_AT↔BODY_STEER chatter | Pending (host) |
+| LOOK-06 | Safety pan forward | BRAKE_REVERSE / FAILSAFE / HOME / IDLE / GOTO / RETURN_HOME command pan to calibrated forward | Pending (host) |
 | LOOK-07 | Ambiguous track | Association ambiguity disables look chase; no pan tracking of unbound boxes | Pending |
+| LOOK-08 | HOLD fail-closed | After non-zero held steer, HOLD exposes steering=0; DE speed=0/brake; timeout → `LOOK_DRIVE_HOLD` | Host pass |
+| LOOK-09 | Pixel / pan polarity | Prefer `x_offset_px`; half-width default 320; positive error pans right | Host pass |
+| LOOK-10 | RosBridge policy preserve | Overlay keeps NM authority/path_viable/envelope including fail-closed `source=none` | Host pass |
 
 ## 7. Safety, dual sensors, thermal, and degraded perception
 

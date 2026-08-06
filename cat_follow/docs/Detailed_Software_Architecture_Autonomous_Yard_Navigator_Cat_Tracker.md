@@ -535,15 +535,25 @@ Authoritative precedence:
 
 `DecisionEngine` owns all final fusion.
 
-In `CHASE`, camera pursuit and Nav2 constraints combine only by clamp and
-minimum speed caps:
+In `CHASE`, look/drive mode selection (`Look_Drive_Path_Design.md`) decides
+whether chassis follow `path_correction` (`LOOK_AT` / `PATH_FOLLOW`) or a
+vision request clamped into the Nav2 envelope (`BODY_STEER`, pan at forward
+only). Modes are mutually exclusive; camera and Nav2 steering MUST NOT be
+added or weighted-summed:
 
 ```text
+# LOOK_AT / PATH_FOLLOW:
+applied_steering = clamp(path_correction, safe_min, safe_max)
+
+# BODY_STEER only:
 applied_steering = clamp(
     camera_steering_request,
     nav2_safe_steering_min,
     nav2_safe_steering_max
 )
+
+# HOLD:
+applied_steering = 0; applied_speed = 0; brake
 
 applied_speed_mps = min(
     pursuit_speed_request_mps,
@@ -554,6 +564,7 @@ applied_speed_mps = min(
 )
 ```
 
+Pan commands ship atomically with chassis output via `MotorInterface.apply_look`.
 Rules:
 
 - camera and Nav2 steering MUST NOT be added or weighted;
@@ -565,8 +576,9 @@ Rules:
   BackUp.
 
 Telemetry MUST record requested physical speed, all applied caps, requested
-steering, Nav2 safe envelope, final normalized/applied commands, calibration
-version, command source, and every zero-motion veto reason.
+steering, Nav2 safe envelope, look/drive mode / pan / pixel error / look reason,
+final normalized/applied commands, calibration version, command source, and
+every zero-motion veto reason.
 
 ## 9. State transition rules
 
